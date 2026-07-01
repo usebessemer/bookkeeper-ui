@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bookkeeper-ui"
+version = "0.1.0"
+description = "Local, open-source thin UI for the Bessemer Bookkeeper agent — Slice 1 foundation: file-based local store (ports), transaction import, config loading."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+keywords = ["bookkeeper", "bessemer", "agent", "local-first", "ports-and-adapters"]
+
+# The Bookkeeper framework (usebessemer/agent-classes) is the one dependency.
+# For DEV, install it editable from the sibling clone *first*, then this repo:
+#     pip install -e ../agent-classes
+#     pip install -e '.[test]'
+# The plain `bookkeeper` requirement below is then already satisfied. For a
+# non-dev install off git, swap it for the commented direct reference.
+dependencies = [
+  "bookkeeper",
+  # "bookkeeper @ git+https://github.com/usebessemer/agent-classes.git",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.24.0",
+]
+
+[tool.setuptools]
+packages = ["bookkeeper_ui"]
+
+# Match the framework's test tooling: pytest + pytest-asyncio in auto mode, so
+# `async def test_*` runs without a per-test decorator.
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]

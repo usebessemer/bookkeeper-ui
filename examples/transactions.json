@@ -1,0 +1,50 @@
+[
+  {
+    "date": "2026-02-14",
+    "vendor": "GitHub",
+    "amount": "21.00",
+    "tax": "0.00",
+    "description": "Team software subscription",
+    "attribution_target_id": "target-002"
+  },
+  {
+    "date": "2026-04-03",
+    "vendor": "Staples",
+    "amount": "82.50",
+    "tax": "6.60",
+    "description": "Office supplies - paper and pens",
+    "attribution_target_id": "target-001"
+  },
+  {
+    "date": "2026-04-15",
+    "vendor": "AWS",
+    "amount": "240.00",
+    "tax": "0.00",
+    "description": "Cloud hosting monthly",
+    "attribution_target_id": "target-001"
+  },
+  {
+    "date": "2026-05-02",
+    "vendor": "Delta Airlines",
+    "amount": "560.00",
+    "tax": "0.00",
+    "description": "Flight to client site",
+    "attribution_target_id": "target-001"
+  },
+  {
+    "date": "2026-05-20",
+    "vendor": "Blue Bottle Coffee",
+    "amount": "18.75",
+    "tax": "1.50",
+    "description": "Client meeting coffee",
+    "attribution_target_id": "target-001"
+  },
+  {
+    "date": "2026-06-10",
+    "vendor": "WeWork",
+    "amount": "800.00",
+    "tax": "64.00",
+    "description": "June office rent",
+    "attribution_target_id": "target-001"
+  }
+]
