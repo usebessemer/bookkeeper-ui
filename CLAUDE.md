@@ -39,7 +39,7 @@ The smallest thing that proves the interaction surface end to end. **Build the i
 
 On launch you are a **dev leaf** for this repo. Your brief lives on the work substrate, not in the human's chat. The human launches you with a bare command + the fixed trigger **"begin"**; they never paste a brief, and you never report progress to them directly — it goes on the PR/issue.
 
-1. **Sync first.** `git fetch origin && git checkout develop && git pull` before branching.
+1. **Sync first — this repo AND the framework.** `git fetch origin && git checkout develop && git pull` before branching. Then the same in **`../agent-classes`** (the framework you `pip install -e` — it must be on `develop`, pulled; a stale or feature-branch checkout there silently changes the contract you build against).
 2. **Fetch your task.** `gh issue list --label dev-ready --state open` → the issue body is your self-contained brief (scope, acceptance criteria, out-of-scope). Build **in issue order** (#1 → #2 → #3); take the lowest-numbered open `dev-ready` issue unless the human names one.
 3. **Work it** on a `feature/<issue-slug>` branch — one change at a time, tests green before each commit.
 4. **Bubble up on the substrate.** Open a PR against `develop` and mirror the issue's acceptance criteria as a checklist in the body. The lead reviews **on the PR**; the human observes, does not relay. Coordinate via PR / issue comments — never by pasting into the human's chat.
