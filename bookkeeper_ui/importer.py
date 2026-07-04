@@ -17,7 +17,10 @@ Expected columns / keys (same names for CSV headers and JSON object keys):
     | description            | no       | Transaction.description ("" if absent) |
 
 Boundary rules (matching the framework's model contract):
-- **Money is `Decimal`, never float** — parsed via `str` so ``"45.99"`` is exact.
+- **Money is `Decimal`, never float** — string amounts go through `str`→`Decimal`
+  (``"45.99"`` exact), and JSON is parsed with ``parse_float=Decimal`` so an
+  *unquoted* numeric amount (``"amount": 45.99``) is exact currency too, never a
+  lossy float.
 - **Absent / blank `tax` coalesces to `Decimal("0")`** — the framework never
   holds None-money (see `Extractor.extract` / `LedgerSource`).
 - **`date` is ISO 8601** (``2026-04-03`` or a full timestamp), via
@@ -46,6 +49,11 @@ from bookkeeper.model import Transaction
 from bookkeeper.ports import LedgerSink
 
 _REQUIRED_FIELDS = ("date", "vendor", "amount", "attribution_target_id")
+
+# csv.DictReader stashes any values past the header row under this key. A row that
+# has them is ragged (an unquoted comma / stray column); it is rejected with a
+# named error rather than letting a `None` restkey crash artifact serialization.
+_CSV_RESTKEY = "__extra_columns__"
 
 
 class TransactionImportError(ValueError):
@@ -118,25 +126,68 @@ def _rows_to_transactions(rows: Sequence[Mapping[str, object]]) -> list[Transact
 
 
 def _parse_csv(text: str) -> list[Transaction]:
-    """Parse CSV text (headers = the module's columns) → models, in file order."""
-    return _rows_to_transactions(list(csv.DictReader(io.StringIO(text))))
+    """Parse CSV text (headers = the module's columns) → models, in file order.
+
+    Read through ``io.StringIO(text, newline="")`` — the csv module's required
+    newline handling — so a quoted field with an embedded newline parses intact,
+    and the path and bytes import paths agree byte-for-byte on the same file (see
+    `import_csv` / `import_bytes`). A ragged row (more values than headers) is a
+    `TransactionImportError` naming the row, not a downstream crash.
+    """
+    reader = csv.DictReader(io.StringIO(text, newline=""), restkey=_CSV_RESTKEY)
+    transactions: list[Transaction] = []
+    for index, row in enumerate(reader, start=1):
+        if row.get(_CSV_RESTKEY):
+            raise TransactionImportError(
+                f"row {index}: more values than headers — check for an unquoted "
+                f"comma or a stray column"
+            )
+        transactions.append(row_to_transaction(row, index))
+    return transactions
 
 
 def _parse_json(text: str) -> list[Transaction]:
-    """Parse JSON text → models. Accepts a top-level list or a ``{"transactions":
-    [...]}`` wrapper; keys match the CSV columns (see module docstring)."""
-    data = json.loads(text)
-    rows: Sequence[Mapping[str, object]]
+    """Parse JSON text → models. Accepts a top-level list of row objects or a
+    ``{"transactions": [...]}`` wrapper; keys match the CSV columns.
+
+    Numbers are parsed with ``parse_float=Decimal`` so an *unquoted* amount
+    (``"amount": 45.99``) is exact currency, never a lossy float. A malformed
+    document, a wrapper missing its ``transactions`` key, or a non-object row is a
+    `TransactionImportError` naming the problem — never a 500 or a silent drop.
+    """
+    try:
+        data = json.loads(text, parse_float=Decimal)
+    except ValueError as exc:  # JSONDecodeError is a ValueError
+        raise TransactionImportError(f"not valid JSON — {exc}") from exc
+
     if isinstance(data, Mapping):
-        rows = data.get("transactions", [])  # type: ignore[assignment]
+        if "transactions" not in data:
+            raise TransactionImportError(
+                "JSON object is missing a 'transactions' key — expected a "
+                '{"transactions": [...]} wrapper or a top-level list of rows'
+            )
+        rows = data["transactions"]
     else:
         rows = data
+
+    if not isinstance(rows, list):
+        raise TransactionImportError(
+            "expected a list of transaction rows (a JSON array)"
+        )
+    for index, row in enumerate(rows, start=1):
+        if not isinstance(row, Mapping):
+            raise TransactionImportError(
+                f"row {index}: expected a JSON object, got {type(row).__name__}"
+            )
     return _rows_to_transactions(rows)
 
 
 def import_csv(path: str | Path) -> list[Transaction]:
     """Read a CSV of transactions (see module docstring for columns) → models."""
-    return _parse_csv(Path(path).read_text(encoding="utf-8"))
+    # newline="" (not read_text) so csv sees raw line endings — matches the bytes
+    # path in `import_bytes` and keeps embedded-newline quoted fields intact.
+    with Path(path).open("r", encoding="utf-8", newline="") as handle:
+        return _parse_csv(handle.read())
 
 
 def import_json(path: str | Path) -> list[Transaction]:

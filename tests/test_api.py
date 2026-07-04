@@ -118,6 +118,8 @@ async def test_import_categorize_resolve_ledger_end_to_end(api: ApiHarness):
         assert staples["account"] == "5000-office-supplies"
         assert staples["source"] == "chart-match"
         assert staples["confidence"] == pytest.approx(0.9)
+        # Wire money is an exact string, trailing zero intact (never a lossy float).
+        assert staples["transaction"]["amount"] == "82.50"
 
         blue_bottle = entries["Blue Bottle Coffee"]
         assert blue_bottle["status"] == "flagged"
@@ -212,3 +214,34 @@ async def test_json_import_equivalent_to_csv(api: ApiHarness):
         resp = await client.get("/ledger", params={"period": "2026-Q2"})
         vendors = [e["transaction"]["vendor"] for e in resp.json()["entries"]]
         assert vendors == ["Staples", "AWS", "Delta Airlines", "Blue Bottle Coffee", "WeWork"]
+
+
+async def test_import_malformed_json_is_400(api: ApiHarness):
+    """A malformed JSON upload is the 400 the route's docstring promises, not a 500 (B2)."""
+    async with _client(api.app) as client:
+        resp = await client.post(
+            "/import",
+            files={"file": ("bad.json", b"{not valid json", "application/json")},
+        )
+        assert resp.status_code == 400
+    assert not api.ledger_path.exists()  # all-or-nothing: nothing persisted
+
+
+async def test_import_json_number_amount_survives_to_ledger_exact(api: ApiHarness):
+    """An unquoted JSON amount reaches /ledger as the exact string, not a float (B1)."""
+    body = (
+        b'[{"date": "2026-05-02", "vendor": "Numeric Vendor", '
+        b'"amount": 82.50, "attribution_target_id": "target-001"}]'
+    )
+    async with _client(api.app) as client:
+        resp = await client.post(
+            "/import", files={"file": ("nums.json", body, "application/json")}
+        )
+        assert resp.status_code == 200
+
+        resp = await client.get("/ledger", params={"period": "2026-Q2"})
+        entry = next(
+            e for e in resp.json()["entries"]
+            if e["transaction"]["vendor"] == "Numeric Vendor"
+        )
+        assert entry["transaction"]["amount"] == "82.50"
