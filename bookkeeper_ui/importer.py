@@ -34,6 +34,7 @@ nothing — it only builds models.
 from __future__ import annotations
 
 import csv
+import io
 import json
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -111,14 +112,31 @@ def row_to_transaction(row: Mapping[str, object], row_index: int = 0) -> Transac
     )
 
 
+def _rows_to_transactions(rows: Sequence[Mapping[str, object]]) -> list[Transaction]:
+    """Map rows to `Transaction`s in order, numbering each for error messages."""
+    return [row_to_transaction(row, index) for index, row in enumerate(rows, start=1)]
+
+
+def _parse_csv(text: str) -> list[Transaction]:
+    """Parse CSV text (headers = the module's columns) → models, in file order."""
+    return _rows_to_transactions(list(csv.DictReader(io.StringIO(text))))
+
+
+def _parse_json(text: str) -> list[Transaction]:
+    """Parse JSON text → models. Accepts a top-level list or a ``{"transactions":
+    [...]}`` wrapper; keys match the CSV columns (see module docstring)."""
+    data = json.loads(text)
+    rows: Sequence[Mapping[str, object]]
+    if isinstance(data, Mapping):
+        rows = data.get("transactions", [])  # type: ignore[assignment]
+    else:
+        rows = data
+    return _rows_to_transactions(rows)
+
+
 def import_csv(path: str | Path) -> list[Transaction]:
     """Read a CSV of transactions (see module docstring for columns) → models."""
-    with Path(path).open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        return [
-            row_to_transaction(row, index)
-            for index, row in enumerate(reader, start=1)
-        ]
+    return _parse_csv(Path(path).read_text(encoding="utf-8"))
 
 
 def import_json(path: str | Path) -> list[Transaction]:
@@ -127,13 +145,33 @@ def import_json(path: str | Path) -> list[Transaction]:
     Accepts either a top-level list of row objects, or a ``{"transactions":
     [...]}`` wrapper. Keys match the CSV columns (see module docstring).
     """
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    rows: Sequence[Mapping[str, object]]
-    if isinstance(data, Mapping):
-        rows = data.get("transactions", [])  # type: ignore[assignment]
-    else:
-        rows = data
-    return [row_to_transaction(row, index) for index, row in enumerate(rows, start=1)]
+    return _parse_json(Path(path).read_text(encoding="utf-8"))
+
+
+def import_bytes(data: bytes, filename: str) -> list[Transaction]:
+    """Import an uploaded CSV/JSON blob → models, dispatched by `filename` suffix.
+
+    The upload counterpart to `import_file`: same columns, same boundary rules
+    (exact `Decimal` money, blank tax → 0, ISO dates), but sourced from a
+    request body rather than a path — so the API's `POST /import` reuses the one
+    import boundary rather than re-deriving the coercions. Raises
+    `TransactionImportError` on an unsupported suffix, non-UTF-8 bytes, or any
+    bad row (naming it).
+    """
+    suffix = Path(filename).suffix.lower()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise TransactionImportError(
+            f"{filename!r} is not valid UTF-8 text — expected a CSV or JSON file"
+        ) from exc
+    if suffix == ".csv":
+        return _parse_csv(text)
+    if suffix == ".json":
+        return _parse_json(text)
+    raise TransactionImportError(
+        f"unsupported import format {suffix!r} — expected .csv or .json"
+    )
 
 
 def import_file(path: str | Path) -> list[Transaction]:
