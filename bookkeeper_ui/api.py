@@ -40,16 +40,17 @@ from bookkeeper_ui.confirmations import (
     FileConfirmationStore,
 )
 from bookkeeper_ui.importer import TransactionImportError, import_bytes
-from bookkeeper_ui.ledger_store import FileLedgerStore, transaction_key
+from bookkeeper_ui.ledger_store import FileLedgerStore
 from bookkeeper_ui.schemas import (
     CategorizationReportOut,
     ConfirmationOut,
     ImportResultOut,
-    LedgerEntryOut,
     LedgerOut,
     ResolveRequest,
     TransactionOut,
 )
+from bookkeeper_ui.views import build_ledger
+from bookkeeper_ui.web import register_ui
 
 
 def create_app(
@@ -149,59 +150,25 @@ def create_app(
         `confirmed` (resolved account), `proposed` (agent trust trail), or
         `flagged` (needs a human).
 
-        Re-runs `categorize` for the pending proposals/flags (it writes nothing)
-        and overlays the confirmation store's latest decision per transaction, so
-        a resolved transaction shows `confirmed` even if it was first flagged.
+        Delegates to `views.build_ledger` — the single projection the #3 UI shares,
+        so JSON and HTML render the same standing per transaction.
         """
-        report = await categorize(ledger_store, config, period)
-        transactions = await ledger_store.fetch_for_period(period)
-        proposals = {transaction_key(p.transaction): p for p in report.proposals}
-        flags = {transaction_key(f.transaction): f for f in report.flagged}
-        confirmed = await confirmation_store.latest_by_transaction()
+        return await build_ledger(
+            config=config,
+            ledger_store=ledger_store,
+            confirmation_store=confirmation_store,
+            period=period,
+        )
 
-        entries: list[LedgerEntryOut] = []
-        for transaction in transactions:
-            txn_id = transaction_key(transaction)
-            out = TransactionOut.from_model(transaction)
-
-            confirmation = confirmed.get(txn_id)
-            if confirmation is not None:
-                entries.append(
-                    LedgerEntryOut(
-                        transaction=out,
-                        status="confirmed",
-                        account=confirmation.account,
-                        source=confirmation.source,
-                    )
-                )
-                continue
-
-            proposal = proposals.get(txn_id)
-            if proposal is not None:
-                entries.append(
-                    LedgerEntryOut(
-                        transaction=out,
-                        status="proposed",
-                        account=proposal.proposed_account,
-                        confidence=proposal.confidence,
-                        source=proposal.source,
-                    )
-                )
-                continue
-
-            # Every fetched transaction is partitioned into proposals ∪ flagged by
-            # categorize, so this is the flagged branch; the fallback reason is a
-            # defensive belt in case a hand-edited ledger drifts from the report.
-            flag = flags.get(txn_id)
-            entries.append(
-                LedgerEntryOut(
-                    transaction=out,
-                    status="flagged",
-                    reason=flag.reason if flag is not None else "Uncategorized.",
-                )
-            )
-
-        return LedgerOut(period=period, entries=entries)
+    # #3 — the thin UI (Jinja + htmx) over these same stores, mounted on this app
+    # so `uvicorn bookkeeper_ui.api:build_app_from_env --factory` serves both the
+    # JSON API (root paths) and the HTML surface (GET / and the /ui/* routes).
+    register_ui(
+        app,
+        config=config,
+        ledger_store=ledger_store,
+        confirmation_store=confirmation_store,
+    )
 
     return app
 

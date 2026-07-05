@@ -1,0 +1,4 @@
+{# The /ui/resolve response. The only rendered element is an out-of-band swap of
+   the live pending counter; the empty remainder is what swaps into the card
+   target (hx-swap="outerHTML"), so the resolved card leaves the queue. #}
+<span id="pending-count" hx-swap-oob="true">{{ pending }}</span>
