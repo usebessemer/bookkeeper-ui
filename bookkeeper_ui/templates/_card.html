@@ -1,0 +1,63 @@
+{# One confirm-queue card. `entry` is a LedgerEntryOut (status proposed | flagged).
+   Both actions post to /ui/resolve and target this card for an outerHTML swap, so
+   a resolved card leaves the queue with no full-page reload. `period` and
+   `chart_of_accounts` come from the queue page's context. #}
+<div class="card {{ entry.status }}" id="card-{{ entry.transaction.id }}">
+  <div class="txn">
+    <span class="date">{{ entry.transaction.date[:10] }}</span>
+    <span class="vendor">{{ entry.transaction.vendor }}</span>
+    <span class="amount">${{ entry.transaction.amount }}</span>
+    {% if entry.transaction.description %}
+    <p class="desc">{{ entry.transaction.description }}</p>
+    {% endif %}
+  </div>
+
+  {% if entry.status == "proposed" %}
+  {# The trust trail — what the agent proposed, how sure, and which rule fired. #}
+  <div class="trail">
+    <span class="tag account">{{ entry.account }}</span>
+    <span class="tag confidence">{{ (entry.confidence * 100) | round | int }}% confident</span>
+    <span class="tag source source-{{ entry.source }}">{{ entry.source }}</span>
+  </div>
+  <div class="actions">
+    <form hx-post="/ui/resolve" hx-target="#card-{{ entry.transaction.id }}" hx-swap="outerHTML">
+      <input type="hidden" name="transaction_id" value="{{ entry.transaction.id }}">
+      <input type="hidden" name="period" value="{{ period }}">
+      <input type="hidden" name="account" value="{{ entry.account }}">
+      <button type="submit" class="confirm">Confirm &mdash; {{ entry.account }}</button>
+    </form>
+    <form class="pick" hx-post="/ui/resolve" hx-target="#card-{{ entry.transaction.id }}" hx-swap="outerHTML">
+      <input type="hidden" name="transaction_id" value="{{ entry.transaction.id }}">
+      <input type="hidden" name="period" value="{{ period }}">
+      <label>Pick another
+        <select name="account">
+          {% for account in chart_of_accounts %}
+          <option value="{{ account }}"{% if account == entry.account %} selected{% endif %}>{{ account }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button type="submit">Save</button>
+    </form>
+  </div>
+  {% else %}
+  {# Flagged: no confident proposal — the reason, and a pick-an-account action. #}
+  <div class="trail flagged">
+    <span class="tag needs">Needs categorization</span>
+    <p class="reason">{{ entry.reason }}</p>
+  </div>
+  <div class="actions">
+    <form class="pick" hx-post="/ui/resolve" hx-target="#card-{{ entry.transaction.id }}" hx-swap="outerHTML">
+      <input type="hidden" name="transaction_id" value="{{ entry.transaction.id }}">
+      <input type="hidden" name="period" value="{{ period }}">
+      <label>Categorize as
+        <select name="account">
+          {% for account in chart_of_accounts %}
+          <option value="{{ account }}">{{ account }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button type="submit">Save</button>
+    </form>
+  </div>
+  {% endif %}
+</div>

@@ -6,7 +6,7 @@ you confirm/correct → confirmations persist. Local-first, single-user,
 file-based. Depends on the [`agent-classes`](https://github.com/usebessemer/agent-classes)
 `bookkeeper` framework (the contract) and never modifies it.
 
-## What's built (Slice 1, so far)
+## What's built (Slice 1 — complete)
 
 - **#1 Foundation** — the layer *under* the API: the local file store, transaction
   import, and config loading.
@@ -21,8 +21,12 @@ file-based. Depends on the [`agent-classes`](https://github.com/usebessemer/agen
 - **#2 API** — the FastAPI (async) read/write API the thin UI talks to: run the
   agent, read the trust trail, submit resolutions, read the categorized ledger.
   See [The API](#the-api-2) below.
+- **#3 Thin UI** — the visible surface: import, the confirm queue rendering the
+  full trust trail, and the categorized-ledger view. Server-rendered Jinja + htmx
+  (no Node/build step), served by the same FastAPI app. See
+  [The UI](#the-ui-3) below.
 
-The UI (#3) is next.
+Slice 1 (standalone categorize-and-confirm) is complete.
 
 ## Install & test (dev)
 
@@ -127,9 +131,45 @@ curl 'localhost:8000/ledger?period=2026-Q2'
 
 Embedding the API in a process instead? `create_app(config=…, ledger_store=…,
 confirmation_store=…)` builds it over injected stores (this is what the tests and
-#3 use).
+the UI use).
 
-The UI that renders this trust trail is issue #3.
+## The UI (#3)
+
+The visible surface — **import → confirm queue → categorized ledger** — rendered
+server-side with **Jinja templates + htmx** and served by the *same* FastAPI app
+as the JSON API (the pages live at `/` and under `/ui/*`; the JSON API keeps its
+root paths). **No Node, no build step**; htmx is vendored under
+`bookkeeper_ui/static/` so it runs fully local and offline.
+
+| page                   | what it does                                                            |
+|------------------------|------------------------------------------------------------------------|
+| `GET /`                | **Import** — upload a CSV/JSON and choose the period to review          |
+| `GET /ui/queue?period=`| **Confirm queue** — a card per proposal showing the full **trust trail** (proposed account · confidence · the rule that fired), plus flagged items with their reason. Confirm / Pick-another → `/ui/resolve`; htmx swaps the resolved card out (no full-page reload) |
+| `GET /ui/ledger?period=`| **Categorized ledger** — the confirmed transactions with their accounts, plus the count still pending |
+
+### Run it
+
+Install (see [Install & test](#install--test-dev) — the UI's `jinja2` / `uvicorn`
+deps come with `pip install -e '.[test]'`), then start the server:
+
+```bash
+uvicorn bookkeeper_ui.api:build_app_from_env --factory --reload
+```
+
+Open **http://localhost:8000** and:
+
+1. **Import** the sample data — pick `examples/transactions.csv` (or
+   `examples/transactions.json`), leave the period as `2026-Q2`, and submit.
+2. Follow **“Review the confirm queue”** — each card shows the agent's proposed
+   account, how confident it is, and which rule fired (`owner-rule` vs
+   `chart-match`); flagged rows show why they need a human. **Confirm** in one tap
+   or **Pick another** account; the card leaves the queue as you go.
+3. Open the **Categorized ledger** to see the confirmed transactions and how many
+   are still pending.
+
+Configured by the same env vars as the API (`BOOKKEEPER_UI_CONFIG`,
+`BOOKKEEPER_UI_DATA_DIR`; both optional). The API and its interactive docs
+(`/docs`) are served alongside the UI on the same port.
 
 ## Scope & conventions
 

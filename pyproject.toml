@@ -19,13 +19,17 @@ keywords = ["bookkeeper", "bessemer", "agent", "local-first", "ports-and-adapter
 # non-dev install off git, swap it for the commented direct reference.
 #
 # FastAPI is the async web layer (matches the framework's async contract, serves
-# the #3 UI); python-multipart backs the `/import` file upload. The framework
-# dataclasses stay pure — pydantic serialization lives only at this API boundary.
+# the #3 UI); python-multipart backs the `/import` + confirm/correct form posts;
+# Jinja2 renders the #3 templates; uvicorn is the local ASGI server the README
+# runs. The framework dataclasses stay pure — pydantic serialization lives only at
+# this API boundary; htmx is vendored under `static/` (no runtime CDN dependency).
 dependencies = [
   "bookkeeper",
   # "bookkeeper @ git+https://github.com/usebessemer/agent-classes.git",
   "fastapi>=0.110",
   "python-multipart>=0.0.9",
+  "jinja2>=3.1",
+  "uvicorn[standard]>=0.30",
 ]
 
 [project.optional-dependencies]
@@ -38,6 +42,12 @@ test = [
 
 [tool.setuptools]
 packages = ["bookkeeper_ui"]
+
+# The #3 UI ships its Jinja templates and static assets (vendored htmx + css) as
+# package data, so a non-editable `pip install` bundles them too (editable dev
+# reads them straight from the tree).
+[tool.setuptools.package-data]
+bookkeeper_ui = ["templates/*.html", "static/*"]
 
 # Match the framework's test tooling: pytest + pytest-asyncio in auto mode, so
 # `async def test_*` runs without a per-test decorator.
