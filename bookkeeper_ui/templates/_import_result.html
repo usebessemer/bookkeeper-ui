@@ -1,0 +1,25 @@
+{# Partial swapped into #import-result after an upload. On a bad file this renders
+   the error for the human (a 200 body htmx swaps in); nothing was persisted. #}
+{% if error %}
+<div class="result error">
+  <p><strong>Import failed.</strong> {{ error }}</p>
+  <p>Nothing was saved — fix the file and try again.</p>
+</div>
+{% else %}
+<div class="result ok">
+  <p><strong>Imported {{ imported }} transaction{{ "" if imported == 1 else "s" }}.</strong></p>
+  <p>
+    <a class="button" href="/ui/queue?period={{ period }}">
+      Review the confirm queue for {{ period }} &rarr;
+    </a>
+  </p>
+  {% if detected %}
+  <p class="detected">
+    Periods in this file:
+    {% for detected_period, count in detected %}
+      <a href="/ui/queue?period={{ detected_period }}">{{ detected_period }} ({{ count }})</a>{% if not loop.last %} &middot; {% endif %}
+    {% endfor %}
+  </p>
+  {% endif %}
+</div>
+{% endif %}

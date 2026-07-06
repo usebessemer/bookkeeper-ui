@@ -1,0 +1,25 @@
+{# The shared layout: nav + htmx (vendored, no CDN) + the page's content block.
+   `nav_period` carries the current period across the nav links; it falls back to
+   the import form's default so the links work from the import screen too. #}
+{% set nav_period = period | default(default_period | default("2026-Q2")) %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Bookkeeper{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js"></script>
+</head>
+<body>
+  <nav>
+    <span class="brand">Bookkeeper</span>
+    <a href="/">Import</a>
+    <a href="/ui/queue?period={{ nav_period }}">Confirm queue</a>
+    <a href="/ui/ledger?period={{ nav_period }}">Ledger</a>
+  </nav>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

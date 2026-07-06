@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Import — Bookkeeper{% endblock %}
+{% block content %}
+<h1>Import transactions</h1>
+<p class="lead">
+  Upload a CSV or JSON of transactions. The agent then proposes a chart-of-accounts
+  category for each — you confirm or correct, and the confirmations persist.
+</p>
+
+{# htmx posts the multipart form and swaps the outcome into #import-result — no
+   full-page reload. hx-encoding is htmx's flag for a file upload. #}
+<form class="import-form"
+      hx-post="/ui/import"
+      hx-target="#import-result"
+      hx-swap="innerHTML"
+      hx-encoding="multipart/form-data">
+  <label>Transactions file
+    <input type="file" name="file" accept=".csv,.json" required>
+  </label>
+  <label>Period to review
+    <input type="text" name="period" value="{{ default_period }}" placeholder="2026-Q2">
+    <small>The quarter to open in the confirm queue (e.g. <code>2026-Q2</code>).</small>
+  </label>
+  <button type="submit">Import</button>
+</form>
+
+<div id="import-result"></div>
+{% endblock %}

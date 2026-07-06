@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Ledger — Bookkeeper{% endblock %}
+{% block content %}
+<h1>Categorized ledger &mdash; {{ period }}</h1>
+<p class="lead">
+  {{ confirmed | length }} confirmed &middot; <strong>{{ pending }}</strong> still pending{% if total %} of {{ total }} in this period{% endif %}.
+  {% if pending %}<a href="/ui/queue?period={{ period }}">Review the queue &rarr;</a>{% endif %}
+</p>
+
+{% if confirmed %}
+<table class="ledger">
+  <thead>
+    <tr><th>Date</th><th>Vendor</th><th class="amount">Amount</th><th>Account</th><th>By</th></tr>
+  </thead>
+  <tbody>
+    {% for entry in confirmed %}
+    <tr>
+      <td>{{ entry.transaction.date[:10] }}</td>
+      <td>{{ entry.transaction.vendor }}</td>
+      <td class="amount">${{ entry.transaction.amount }}</td>
+      <td>{{ entry.account }}</td>
+      <td>{{ entry.source }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty-state">
+  No confirmed transactions yet in {{ period }}.
+  <a href="/ui/queue?period={{ period }}">Start with the confirm queue &rarr;</a>
+</p>
+{% endif %}
+{% endblock %}

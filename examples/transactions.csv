@@ -1,0 +1,7 @@
+date,vendor,amount,tax,description,attribution_target_id
+2026-02-14,GitHub,21.00,0.00,Team software subscription,target-002
+2026-04-03,Staples,82.50,6.60,Office supplies - paper and pens,target-001
+2026-04-15,AWS,240.00,0.00,Cloud hosting monthly,target-001
+2026-05-02,Delta Airlines,560.00,0.00,Flight to client site,target-001
+2026-05-20,Blue Bottle Coffee,18.75,1.50,Client meeting coffee,target-001
+2026-06-10,WeWork,800.00,64.00,June office rent,target-001

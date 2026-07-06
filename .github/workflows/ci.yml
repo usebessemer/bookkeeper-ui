@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [develop]
+  push:
+    branches: [develop]
+
+jobs:
+  test:
+    name: pytest (py3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Single canonical install path (see #10). The `bookkeeper` framework has
+      # no PyPI release; pyproject now pins it as a git direct reference
+      # (`bookkeeper @ git+…/agent-classes.git@v0.1.0`), so this one install
+      # resolves the framework straight from git — no separate framework step,
+      # and pip never consults PyPI for the squatted, unrelated `bookkeeper`
+      # package there. The [test] extra pins pytest + pytest-asyncio (+ httpx
+      # for the ASGI tests); asyncio_mode = auto is in pyproject, so the async
+      # suite runs self-contained with no extra config.
+      - name: Install
+        run: pip install -e ".[test]"
+
+      - name: Run tests
+        run: pytest

@@ -1,0 +1,147 @@
+/* bookkeeper-ui — clean, legible styling for the thin UI. Deliberately plain:
+   the scope is "clean and legible", no framework, no build step. */
+
+:root {
+  --ink: #1f2328;
+  --muted: #656d76;
+  --line: #d0d7de;
+  --bg: #f6f8fa;
+  --card: #ffffff;
+  --accent: #0969da;
+  --ok: #1a7f37;
+  --ok-bg: #dafbe1;
+  --warn: #9a6700;
+  --warn-bg: #fff8c5;
+  --err: #cf222e;
+  --err-bg: #ffebe9;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+}
+
+nav {
+  display: flex;
+  gap: 1.25rem;
+  align-items: baseline;
+  padding: 0.9rem 1.5rem;
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
+}
+nav .brand { font-weight: 700; margin-right: 0.5rem; }
+nav a { color: var(--accent); text-decoration: none; }
+nav a:hover { text-decoration: underline; }
+
+main {
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+h1 { font-size: 1.5rem; margin: 0.5rem 0 0.75rem; }
+.lead { color: var(--muted); margin-top: 0; }
+code { background: var(--bg); padding: 0.05rem 0.3rem; border-radius: 4px; }
+
+/* --- Import form ------------------------------------------------------- */
+.import-form {
+  display: grid;
+  gap: 1rem;
+  max-width: 460px;
+  padding: 1.25rem;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.import-form label { display: grid; gap: 0.35rem; font-weight: 600; }
+.import-form small { font-weight: 400; color: var(--muted); }
+input[type="text"], input[type="file"], select {
+  font: inherit;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+}
+
+button {
+  font: inherit;
+  font-weight: 600;
+  padding: 0.5rem 0.95rem;
+  border: 1px solid var(--accent);
+  border-radius: 7px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+button:hover { filter: brightness(1.05); }
+.actions .pick button { background: #fff; color: var(--accent); }
+
+.button {
+  display: inline-block;
+  padding: 0.5rem 0.95rem;
+  border-radius: 7px;
+  background: var(--accent);
+  color: #fff;
+  text-decoration: none;
+  font-weight: 600;
+}
+
+/* --- Import result ----------------------------------------------------- */
+.result { margin-top: 1.25rem; padding: 1rem 1.15rem; border-radius: 9px; }
+.result.ok { background: var(--ok-bg); border: 1px solid #aceebb; }
+.result.error { background: var(--err-bg); border: 1px solid #ffc1bc; }
+.result .detected { color: var(--muted); font-size: 0.9rem; }
+
+/* --- Confirm queue cards ---------------------------------------------- */
+#queue { display: grid; gap: 1rem; }
+.card {
+  padding: 1rem 1.15rem;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--line);
+  border-radius: 10px;
+}
+.card.proposed { border-left-color: var(--accent); }
+.card.flagged { border-left-color: var(--warn); }
+
+.txn { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.6rem; }
+.txn .date { color: var(--muted); font-variant-numeric: tabular-nums; }
+.txn .vendor { font-weight: 700; font-size: 1.05rem; }
+.txn .amount { margin-left: auto; font-weight: 700; font-variant-numeric: tabular-nums; }
+.txn .desc { flex-basis: 100%; margin: 0.1rem 0 0; color: var(--muted); }
+
+.trail { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; margin: 0.85rem 0; }
+.trail.flagged { display: block; }
+.tag {
+  display: inline-block;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  border: 1px solid var(--line);
+  background: var(--bg);
+}
+.tag.account { background: #ddf4ff; border-color: #b6e3ff; color: #0a3069; }
+.tag.confidence { background: #fff; color: var(--muted); }
+.tag.source { text-transform: none; }
+.tag.source-owner-rule { background: #fbefff; border-color: #e9c8ff; color: #6639ba; }
+.tag.source-chart-match { background: var(--bg); color: var(--muted); }
+.tag.needs { background: var(--warn-bg); border-color: #eddf8f; color: var(--warn); }
+.reason { margin: 0.5rem 0 0; color: var(--muted); }
+
+.actions { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 1rem; }
+.actions .pick { display: flex; align-items: flex-end; gap: 0.5rem; }
+.actions .pick label { display: grid; gap: 0.25rem; font-size: 0.85rem; color: var(--muted); }
+
+/* --- Ledger table ------------------------------------------------------ */
+table.ledger { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+table.ledger th, table.ledger td { text-align: left; padding: 0.55rem 0.75rem; border-bottom: 1px solid var(--line); }
+table.ledger th { background: var(--bg); font-size: 0.85rem; color: var(--muted); }
+table.ledger tr:last-child td { border-bottom: none; }
+table.ledger .amount { text-align: right; font-variant-numeric: tabular-nums; }
+
+.empty-state { padding: 1.25rem; background: var(--card); border: 1px dashed var(--line); border-radius: 10px; color: var(--muted); }

@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Confirm queue — Bookkeeper{% endblock %}
+{% block content %}
+<h1>Confirm queue &mdash; {{ period }}</h1>
+<p class="lead">
+  <span id="pending-count">{{ entries | length }}</span> awaiting your review{% if total %} of {{ total }} in this period{% endif %}.
+  <a href="/ui/ledger?period={{ period }}">Categorized ledger &rarr;</a>
+</p>
+
+<div id="queue">
+  {% for entry in entries %}
+    {% include "_card.html" %}
+  {% endfor %}
+</div>
+
+{% if not entries %}
+<p class="empty-state">
+  Nothing awaiting review in {{ period }}.
+  <a href="/ui/ledger?period={{ period }}">View the ledger &rarr;</a>
+</p>
+{% endif %}
+{% endblock %}
