@@ -227,6 +227,42 @@ async def test_import_malformed_json_is_400(api: ApiHarness):
     assert not api.ledger_path.exists()  # all-or-nothing: nothing persisted
 
 
+@pytest.mark.parametrize(
+    "filename, body",
+    [
+        (  # JSON number literal — json's parse_constant path
+            "inf.json",
+            b'[{"date": "2026-05-02", "vendor": "V", '
+            b'"amount": Infinity, "attribution_target_id": "t"}]',
+        ),
+        (  # JSON string form
+            "nan.json",
+            b'[{"date": "2026-05-02", "vendor": "V", '
+            b'"amount": "NaN", "attribution_target_id": "t"}]',
+        ),
+        (  # CSV value
+            "nan.csv",
+            b"date,vendor,amount,attribution_target_id\n2026-05-02,V,NaN,t\n",
+        ),
+        (  # non-finite tax, finite amount — tax is coerced at the same boundary
+            "tax.json",
+            b'[{"date": "2026-05-02", "vendor": "V", "amount": "10.00", '
+            b'"tax": "Infinity", "attribution_target_id": "t"}]',
+        ),
+    ],
+)
+async def test_import_rejects_non_finite_money(api: ApiHarness, filename: str, body: bytes):
+    """AC (#8): every import path rejects Infinity/NaN money with a named 400,
+    and nothing is persisted on rejection."""
+    async with _client(api.app) as client:
+        resp = await client.post(
+            "/import", files={"file": (filename, body, "application/octet-stream")}
+        )
+        assert resp.status_code == 400
+        assert "finite" in resp.json()["detail"]
+    assert not api.ledger_path.exists()  # all-or-nothing: nothing persisted
+
+
 async def test_import_json_number_amount_survives_to_ledger_exact(api: ApiHarness):
     """An unquoted JSON amount reaches /ledger as the exact string, not a float (B1)."""
     body = (

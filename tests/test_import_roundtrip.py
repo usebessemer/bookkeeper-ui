@@ -93,6 +93,34 @@ def test_bad_amount_raises():
         )
 
 
+@pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
+def test_non_finite_amount_raises(bad):
+    """Decimal accepts "Infinity"/"NaN" strings — the importer must not (#8)."""
+    with pytest.raises(TransactionImportError, match="finite"):
+        row_to_transaction(
+            {
+                "date": "2026-04-03",
+                "vendor": "Staples",
+                "amount": bad,
+                "attribution_target_id": "target-001",
+            }
+        )
+
+
+def test_non_finite_tax_raises():
+    """`tax` goes through the same coercion — non-finite is rejected there too (#8)."""
+    with pytest.raises(TransactionImportError, match="tax .* finite"):
+        row_to_transaction(
+            {
+                "date": "2026-04-03",
+                "vendor": "Staples",
+                "amount": "10.00",
+                "tax": "NaN",
+                "attribution_target_id": "target-001",
+            }
+        )
+
+
 async def test_reimport_is_idempotent(examples_dir, tmp_path):
     """Importing the same file twice does not duplicate rows (idempotent sink)."""
     store = FileLedgerStore(tmp_path / "ledger.jsonl")
@@ -128,6 +156,17 @@ def test_import_bytes_json_number_amount_is_exact_decimal():
         "u.json",
     )
     assert half.amount == Decimal("82.50")
+
+
+def test_import_bytes_json_infinity_literal_raises():
+    """A bare JSON `Infinity` literal (json's parse_constant path, not
+    parse_float) must be rejected, not stored as `Decimal('Infinity')` (#8)."""
+    with pytest.raises(TransactionImportError, match="finite"):
+        import_bytes(
+            b'[{"date": "2026-04-03", "vendor": "X", '
+            b'"amount": Infinity, "attribution_target_id": "t"}]',
+            "u.json",
+        )
 
 
 def test_import_bytes_malformed_json_raises():
