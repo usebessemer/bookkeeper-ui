@@ -12,11 +12,20 @@ license = { text = "MIT" }
 keywords = ["bookkeeper", "bessemer", "agent", "local-first", "ports-and-adapters"]
 
 # The Bookkeeper framework (usebessemer/agent-classes) is the framework dependency.
-# For DEV, install it editable from the sibling clone *first*, then this repo:
-#     pip install -e ../agent-classes
+# It has no PyPI release, so we pin the git direct reference at the tag below as the
+# shipped default: a plain `bookkeeper` requirement resolves off PyPI to an
+# unrelated, squatted third-party package ("GNU Stow with steroids"), giving a
+# non-sibling user a green install of the wrong code and a broken app (see #10).
+# The `@v0.1.0` tag pins the contract — a bare git URL would float on the
+# framework's default branch and silently move the contract we build against.
+#
+# For DEV against a live sibling clone, install this repo first (which pulls the
+# pinned framework), then override with the editable sibling *last* so it wins —
+# a direct URL requirement is not satisfied by an already-installed editable, so
+# installing the sibling first and this repo second would re-fetch the pinned tag
+# and clobber the editable checkout:
 #     pip install -e '.[test]'
-# The plain `bookkeeper` requirement below is then already satisfied. For a
-# non-dev install off git, swap it for the commented direct reference.
+#     pip install -e ../agent-classes   # editable override — must come last
 #
 # FastAPI is the async web layer (matches the framework's async contract, serves
 # the #3 UI); python-multipart backs the `/import` + confirm/correct form posts;
@@ -24,8 +33,7 @@ keywords = ["bookkeeper", "bessemer", "agent", "local-first", "ports-and-adapter
 # runs. The framework dataclasses stay pure — pydantic serialization lives only at
 # this API boundary; htmx is vendored under `static/` (no runtime CDN dependency).
 dependencies = [
-  "bookkeeper",
-  # "bookkeeper @ git+https://github.com/usebessemer/agent-classes.git",
+  "bookkeeper @ git+https://github.com/usebessemer/agent-classes.git@v0.1.0",
   "fastapi>=0.110",
   "python-multipart>=0.0.9",
   "jinja2>=3.1",
