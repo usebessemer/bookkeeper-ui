@@ -281,3 +281,40 @@ async def test_import_json_number_amount_survives_to_ledger_exact(api: ApiHarnes
             if e["transaction"]["vendor"] == "Numeric Vendor"
         )
         assert entry["transaction"]["amount"] == "82.50"
+
+
+async def test_import_tax_survives_to_ledger_exact_and_id_stable(api: ApiHarness):
+    """Imported tax reaches /ledger as the exact string, and the id /import
+    handed back still identifies the row on /ledger (M5).
+
+    Guards the store's `_to_record`: a `float(transaction.tax)` there would drop
+    the trailing zero, so tax `'98.70'` comes back `'98.7'` on the /ledger wire
+    and — because the id is the `transaction_key` over exact money — the /ledger
+    id (recomputed from the lossy read-back) would no longer equal the id /import
+    returned, silently breaking a client that resolves by that id. Decimal
+    numeric equality can't see this (`Decimal('98.7') == Decimal('98.70')`); the
+    wire string and the id both can. The amount leg has this coverage above; tax
+    did not.
+    """
+    body = (
+        b'[{"date": "2026-05-02", "vendor": "Taxed Vendor", "amount": "240.00", '
+        b'"tax": "98.70", "attribution_target_id": "target-001"}]'
+    )
+    async with _client(api.app) as client:
+        resp = await client.post(
+            "/import", files={"file": ("taxed.json", body, "application/json")}
+        )
+        assert resp.status_code == 200
+        (imported,) = resp.json()["transactions"]
+        assert imported["tax"] == "98.70"  # exact on the /import wire
+        import_id = imported["id"]
+
+        resp = await client.get("/ledger", params={"period": "2026-Q2"})
+        entry = next(
+            e for e in resp.json()["entries"]
+            if e["transaction"]["vendor"] == "Taxed Vendor"
+        )
+        # The trailing zero survives the store round-trip (not a lossy float)...
+        assert entry["transaction"]["tax"] == "98.70"
+        # ...and the id the client got from /import still resolves this same row.
+        assert entry["transaction"]["id"] == import_id
