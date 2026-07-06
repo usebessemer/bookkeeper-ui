@@ -20,7 +20,8 @@ Boundary rules (matching the framework's model contract):
 - **Money is `Decimal`, never float** — string amounts go through `str`→`Decimal`
   (``"45.99"`` exact), and JSON is parsed with ``parse_float=Decimal`` so an
   *unquoted* numeric amount (``"amount": 45.99``) is exact currency too, never a
-  lossy float.
+  lossy float. Money must also be *finite* — ``Infinity``/``NaN`` (JSON literal,
+  string, or CSV value) is rejected with a named error, never stored.
 - **Absent / blank `tax` coalesces to `Decimal("0")`** — the framework never
   holds None-money (see `Extractor.extract` / `LedgerSource`).
 - **`date` is ISO 8601** (``2026-04-03`` or a full timestamp), via
@@ -72,11 +73,19 @@ def _clean(value: object) -> str:
 def _parse_decimal(value: object, field: str, row_index: int) -> Decimal:
     text = _clean(value)
     try:
-        return Decimal(text)
+        parsed = Decimal(text)
     except (InvalidOperation, ValueError) as exc:
         raise TransactionImportError(
             f"row {row_index}: {field} {text!r} is not a valid decimal amount"
         ) from exc
+    # Decimal accepts "Infinity"/"NaN" (and json turns the bare literals into
+    # floats that stringify back to them) — non-finite money would poison
+    # downstream summing/sorting, so reject it here at the one coercion point.
+    if not parsed.is_finite():
+        raise TransactionImportError(
+            f"row {row_index}: {field} {text!r} must be a finite number"
+        )
+    return parsed
 
 
 def _parse_date(value: object, row_index: int) -> datetime:
