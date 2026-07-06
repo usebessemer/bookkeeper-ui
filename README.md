@@ -30,13 +30,26 @@ Slice 1 (standalone categorize-and-confirm) is complete.
 
 ## Install & test (dev)
 
-The framework is a sibling clone at `../agent-classes`. Install it editable
-first, then this repo:
+The `bookkeeper` framework has no PyPI release, so `pyproject.toml` pins it as a
+git direct reference (`bookkeeper @ git+…/agent-classes.git@v0.1.0`). A plain
+install pulls the framework from git at that tag — no PyPI (a squatted, unrelated
+`bookkeeper` package lives there; see #10) and no sibling clone required:
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e ../agent-classes      # the bookkeeper framework
-pip install -e '.[test]'             # this package + pytest
+pip install -e '.[test]'             # this package + framework (from git) + pytest
+pytest
+```
+
+**Dev override — editable framework from a sibling clone.** To work against a
+live `../agent-classes` checkout, install the editable sibling **last** so it
+wins. A direct-URL requirement is *not* satisfied by an already-installed
+editable, so doing it the other way round (sibling first, then this repo) would
+re-fetch the pinned tag and clobber your editable checkout:
+
+```bash
+pip install -e '.[test]'             # this package (pulls the pinned framework)
+pip install -e ../agent-classes      # override: editable framework — must be last
 pytest
 ```
 
