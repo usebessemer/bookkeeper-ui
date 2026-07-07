@@ -19,15 +19,26 @@ The `bookkeeper` package in **`usebessemer/agent-classes`** (headless, dependenc
 - `bookkeeper/config.py` — `BookkeeperConfig` (`chart_of_accounts`, `categorize_threshold()`); you load one from a file.
 - `bookkeeper/skills/categorize.py` — `categorize(ledger_source, config, period) -> CategorizationReport` (async). Returns `proposals` (transaction + `proposed_account` + `confidence` + `source`/rule that fired) and `flagged` (transaction + `reason`). **Called as-is; never auto-assigns — the human confirm/correct step is the point of this app.**
 
-## Slice 1 — standalone categorize-and-confirm
+**Slice 2 (reconcile) additions — same package, read before building Slice 2:**
 
-The smallest thing that proves the interaction surface end to end. **Build the issues in order, one issue per PR:**
+- `bookkeeper/ports.py` — `StatementSource.fetch_statement(period) -> list[StatementLine]` (async, read-only). No statement *writer* port exists; do not invent one.
+- `bookkeeper/model.py` — `StatementLine(statement_ref, date, amount, description)`.
+- `bookkeeper/skills/reconcile.py` — `reconcile_account(ledger_source, statement_source, config, period) -> ReconciliationReport` (async, detection-only, writes nothing): `matched` (no score/reason) · `to_confirm` (carries `vendor_similarity` + `reason`) · `gaps` (three `GapKind`s; signed `delta` on `amount_mismatch`). Deterministic order — preserve it in every surface. **Called as-is.**
+- `bookkeeper/config.py` — `reconcile_date_window()` (default 3, not a section-5 boundary) and `reconcile_vendor_threshold() -> float | None` (**a section-5 boundary: `None` = inert**; `DEFAULT_RECONCILE_VENDOR_FLOOR = 0.7`). Display-only; never re-implement the matching.
 
-1. **#1 Foundation** — file store implementing the ports · CSV/JSON import · config loading.
-2. **#2 API** — run `categorize` · submit confirm/correct resolutions · read the categorized ledger.
-3. **#3 Thin UI** — import · the confirm-queue rendering the full **trust trail** (proposed account + confidence + the rule that fired) · the categorized-ledger view.
+The `v0.1.0` pin and the `develop` clone are byte-identical on the reconcile files, so build to what these say.
 
-**Slice boundaries:** categorize-only; **no `agent-classes` changes**; single-user, local, file-based. Later slices (not now): reconcile / close-and-sign / package preview / anomalies queue.
+## Build slices
+
+**Slice 1 — categorize-and-confirm: SHIPPED** (released `v0.3.0` to `main`, 2026-07-06). The smallest end-to-end proof — import · confirm-queue (the full trust trail: proposed account + confidence + the rule that fired) · categorized-ledger — over a file store implementing the ports. Issues `#1`/`#2`/`#3` merged; do not re-open.
+
+**Slice 2 — reconcile: ACTIVE.** Import the authoritative bank/card statement for a period → run `reconcile_account` **as-is** against the books the app already holds → work a **reconcile queue** (confirm/reject the pairs the skill surfaced, acknowledge the gaps) with every resolution persisted append-only. The app never adjusts a ledger entry — a discrepancy is surfaced, never auto-fixed (section 5.5). Three `dev-ready` issues, build **in order**, one PR each:
+
+1. **A** — statement store + statement import (`StatementSource` over JSONL).
+2. **B** — reconcile API + resolution store (`reconcile_account`, persisted resolutions, the one overlaid projection).
+3. **C** — reconcile queue UI + ledger fold.
+
+**Slice boundaries (all slices):** the app implements the framework's ports and calls its skills **as-is**; **no `agent-classes` changes**; single-user, local, file-based; nothing leaves the machine. Money is exact `Decimal` — strings on the wire and in files, never `float`. Later slices (not now): close-and-sign / package preview / anomalies.
 
 ## Tests
 
@@ -40,7 +51,7 @@ The smallest thing that proves the interaction surface end to end. **Build the i
 On launch you are a **dev leaf** for this repo. Your brief lives on the work substrate, not in the human's chat. The human launches you with a bare command + the fixed trigger **"begin"**; they never paste a brief, and you never report progress to them directly — it goes on the PR/issue.
 
 1. **Sync first — this repo AND the framework.** `git fetch origin && git checkout develop && git pull` before branching. Then the same in **`../agent-classes`** (the framework you `pip install -e` — it must be on `develop`, pulled; a stale or feature-branch checkout there silently changes the contract you build against).
-2. **Fetch your task.** `gh issue list --label dev-ready --state open` → the issue body is your self-contained brief (scope, acceptance criteria, out-of-scope). Build **in issue order** (#1 → #2 → #3); take the lowest-numbered open `dev-ready` issue unless the human names one.
+2. **Fetch your task.** `gh issue list --label dev-ready --state open` → the issue body is your self-contained brief (scope, acceptance criteria, out-of-scope). Take the **lowest-numbered open `dev-ready` issue** unless the human names one, and build the slice **in issue order** (its issues are titled `A` → `B` → `C`).
 3. **Work it** on a `feature/<issue-slug>` branch — one change at a time, tests green before each commit.
 4. **Bubble up on the substrate.** Open a PR against `develop` and mirror the issue's acceptance criteria as a checklist in the body. The lead reviews **on the PR**; the human observes, does not relay. Coordinate via PR / issue comments — never by pasting into the human's chat.
 5. **Never self-merge.** The lead (Consulting stream) merges `feature → develop` on a green, AC-passing review. The release boundary (`develop → main`) is the human's gate.
