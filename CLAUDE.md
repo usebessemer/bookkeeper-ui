@@ -38,6 +38,8 @@ The `v0.1.0` pin and the `develop` clone are byte-identical on the reconcile fil
 2. **B** — reconcile API + resolution store (`reconcile_account`, persisted resolutions, the one overlaid projection).
 3. **C** — reconcile queue UI + ledger fold.
 
+**One decided quick fix leads the queue:** issue **#21** (N1: strict **404** on `/resolve` for an unknown transaction id, plus its UI twin) is the lowest-numbered `dev-ready`, so you take it **first**. It establishes the strict-404 resolve rule that Slice 2's `/reconcile/resolve` then mirrors (see issue B). Issue **#5** (identity/dedupe, normalize+count) is deliberately **after** Slice 2 — it sweeps the transaction and statement keys together.
+
 **Slice boundaries (all slices):** the app implements the framework's ports and calls its skills **as-is**; **no `agent-classes` changes**; single-user, local, file-based; nothing leaves the machine. Money is exact `Decimal` — strings on the wire and in files, never `float`. Later slices (not now): close-and-sign / package preview / anomalies.
 
 ## Tests
