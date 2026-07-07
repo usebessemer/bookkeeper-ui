@@ -5,8 +5,9 @@ Four operations over the #1 foundation, plus the serialization boundary:
 - ``POST /import``            — upload a CSV/JSON → persist via the `LedgerSink`.
 - ``POST /categorize?period`` — call the framework's `categorize` **unmodified**
   → return the `CategorizationReport` (proposals = the trust trail; flagged).
-- ``POST /resolve``           — record a confirm/correct decision (validated
-  against `chart_of_accounts`) to the confirmation store.
+- ``POST /resolve``           — record a confirm/correct decision (account
+  validated against `chart_of_accounts`; transaction id must be one the ledger
+  holds — a strict 404 otherwise, never an orphan) to the confirmation store.
 - ``GET  /ledger?period``     — the categorized ledger: every transaction with
   its resolved account (if confirmed) or its pending status (proposed / flagged).
 
@@ -119,10 +120,17 @@ def create_app(
     async def resolve(request: ResolveRequest) -> ConfirmationOut:
         """Record one human confirm/correct decision into the confirmation store.
 
-        Rejects (422) an `account` not in `config.chart_of_accounts` — §5.2 holds
-        even for a human-through-the-API decision: never file an invented
-        category. Append-only: a correction is a new row the ledger view collapses
-        to last-write-wins.
+        Two guards, both write nothing on rejection:
+
+        - **422** an `account` not in `config.chart_of_accounts` — §5.2 holds even
+          for a human-through-the-API decision: never file an invented category.
+        - **404** a `transaction_id` no stored transaction carries — §5-conservative
+          (N1, decided 2026-07-06): a confirmation must never dangle against
+          nothing, so a typo'd id is refused rather than persisted as an orphan.
+
+        The account guard runs first: an invented category is rejected before the
+        transaction is even looked up. Append-only: a correction is a new row the
+        ledger view collapses to last-write-wins.
         """
         if request.account not in config.chart_of_accounts:
             raise HTTPException(
@@ -131,6 +139,16 @@ def create_app(
                     f"account {request.account!r} is not in chart_of_accounts — "
                     f"choose one of the configured accounts (§5.2: never invent a "
                     f"category)."
+                ),
+            )
+
+        if not await ledger_store.contains(request.transaction_id):
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"transaction {request.transaction_id!r} is not in the ledger — "
+                    f"a confirmation must never dangle against nothing (N1, "
+                    f"§5-conservative: typo-safe)."
                 ),
             )
 

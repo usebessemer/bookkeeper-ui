@@ -120,7 +120,9 @@ class ResolveRequest(BaseModel):
 
     `account` must be one already in `config.chart_of_accounts` — the API rejects
     anything else (§5.2: never invent a category, even by human hand through the
-    API). `transaction_id` is the `TransactionOut.id` the decision resolves.
+    API). `transaction_id` is the `TransactionOut.id` the decision resolves; it
+    must be one the ledger holds, or the API returns a strict 404 (N1: a
+    confirmation must never dangle against nothing) rather than persist an orphan.
     """
 
     transaction_id: str

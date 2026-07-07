@@ -18,9 +18,12 @@ under ``static/`` (no CDN dependency — this runs local and offline).
 
 The UI import/resolve handlers render an **error into the page** (a 200 partial the
 user reads) rather than a JSON 4xx: on this surface the message is for a human, and
-htmx swaps a 2xx body in place. The JSON API still returns the machine 4xx. The one
-exception is `/ui/resolve` with an off-chart account (unreachable from the rendered
-select) — a defensive 422, mirroring the API's §5.2 guard.
+htmx swaps a 2xx body in place. The JSON API still returns the machine 4xx. The
+exceptions are the two `/ui/resolve` states unreachable from the rendered queue —
+an off-chart account (a defensive **422**, mirroring the API's §5.2 guard) and an
+unknown transaction id (a strict **404**, mirroring the API's N1 guard: a
+confirmation must never dangle against nothing). Both are machine 4xx defensive
+guards because a human at the screen can reach neither.
 """
 
 from __future__ import annotations
@@ -157,11 +160,14 @@ def register_ui(
     ) -> HTMLResponse:
         """Record one confirm/correct decision, then swap the resolved card out.
 
-        Rejects (422) an account not in `chart_of_accounts` — §5.2 holds for a
-        human decision through the UI too (unreachable from the rendered select; a
-        defensive guard). On success the response body is only an out-of-band
-        counter update: the empty remainder swaps into the card target, so the card
-        leaves the queue with no full-page reload.
+        Mirrors the JSON `/resolve` guards, both defensive here (unreachable from
+        the rendered queue): a **422** for an account not in `chart_of_accounts`
+        (§5.2: never invent a category), and a **404** for a transaction id the
+        ledger does not hold (N1: a confirmation must never dangle against
+        nothing). The account guard runs first, exactly as the API orders them. On
+        success the response body is only an out-of-band counter update: the empty
+        remainder swaps into the card target, so the card leaves the queue with no
+        full-page reload.
         """
         if account not in config.chart_of_accounts:
             raise HTTPException(
@@ -169,6 +175,15 @@ def register_ui(
                 detail=(
                     f"account {account!r} is not in chart_of_accounts — §5.2: never "
                     f"invent a category."
+                ),
+            )
+
+        if not await ledger_store.contains(transaction_id):
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"transaction {transaction_id!r} is not in the ledger — a "
+                    f"confirmation must never dangle against nothing (N1: typo-safe)."
                 ),
             )
 
