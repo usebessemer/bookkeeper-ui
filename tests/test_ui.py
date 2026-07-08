@@ -175,6 +175,25 @@ async def test_resolve_rejects_off_chart_account(ui: UiHarness):
     assert not ui.confirmations_path.exists()
 
 
+async def test_resolve_unknown_transaction_is_404(ui: UiHarness):
+    """AC (#21 / N1): /ui/resolve mirrors the API — an unknown transaction id is a
+    strict 404 (unreachable from the rendered queue; a defensive guard), and
+    persists nothing. A valid account isolates the txn-existence guard so the 404
+    is what fires, not the §5.2 account 422."""
+    async with _client(ui.app) as client:
+        await _import_csv(client, ui.examples_dir / "transactions.csv")
+        resp = await client.post(
+            "/ui/resolve",
+            data={
+                "transaction_id": "not-a-real-transaction-id",
+                "account": "5200-travel",
+                "period": "2026-Q2",
+            },
+        )
+        assert resp.status_code == 404
+    assert not ui.confirmations_path.exists()  # no orphan confirmation
+
+
 async def test_ledger_shows_confirmed_and_pending_count(ui: UiHarness):
     """AC: after a resolve the ledger view shows the confirmed item with its account
     and who decided, plus the remaining pending count."""

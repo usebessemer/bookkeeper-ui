@@ -138,6 +138,19 @@ class FileLedgerStore(LedgerSink, LedgerSource):
             handle.write(json.dumps(_to_record(transaction, key)) + "\n")
         self._keys.add(key)
 
+    async def contains(self, transaction_id: str) -> bool:
+        """True if a stored transaction carries this stable key (its `transaction_key`).
+
+        The confirm/correct write path checks this before recording a resolution,
+        so a confirmation can never dangle against a transaction that was never
+        imported (issue #21 / N1: strict 404, typo-safe). Reuses the same on-disk
+        key set the idempotent `store` already relies on — no period is needed, a
+        resolution is keyed on the transaction alone.
+        """
+        if self._keys is None:
+            self._keys = self._load_keys()
+        return transaction_id in self._keys
+
     async def fetch_for_period(self, period: str) -> list[Transaction]:
         """Return `period`'s stored transactions in deterministic (insertion) order."""
         results: list[Transaction] = []
