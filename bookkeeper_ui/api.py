@@ -1,6 +1,7 @@
 """The Tier-2 read/write API the thin UI talks to (FastAPI, async).
 
-Four operations over the #1 foundation, plus the serialization boundary:
+Slice 1 (categorize) and Slice 2 (reconcile) operations over the #1 foundation,
+plus the serialization boundary:
 
 - ``POST /import``            — upload a CSV/JSON → persist via the `LedgerSink`.
 - ``POST /categorize?period`` — call the framework's `categorize` **unmodified**
@@ -9,13 +10,24 @@ Four operations over the #1 foundation, plus the serialization boundary:
   validated against `chart_of_accounts`; transaction id must be one the ledger
   holds — a strict 404 otherwise, never an orphan) to the confirmation store.
 - ``GET  /ledger?period``     — the categorized ledger: every transaction with
-  its resolved account (if confirmed) or its pending status (proposed / flagged).
+  its resolved account (if confirmed) or its pending status (proposed / flagged),
+  plus its Slice 2 `reconciliation` fold.
+- ``POST /statements/import`` — upload a CSV/JSON statement → persist its lines.
+- ``GET  /statements?period`` — the stored statement lines (a truth surface).
+- ``POST /reconcile?period``  — call `reconcile_account` **unmodified** → the raw
+  report (matched / to_confirm / gaps). Detection-only; writes nothing.
+- ``POST /reconcile/resolve`` — record a confirm/reject/acknowledge resolution
+  (server-validated: 422 on a bad shape, 404 on an unknown id) — the *only*
+  reconcile write path, into the reconciliation store alone.
+- ``GET  /reconcile/view?period`` — the overlaid projection: the report annotated
+  with each item's resolution status (the one truth the UI + ledger fold share).
 
 **Async on purpose** — it matches the framework's async ports/skills contract and
 serves the #3 UI. **The framework stays pure**: this module and `schemas.py` own
 all the web/pydantic surface; nothing here is pushed back into `../agent-classes`.
-**Writes only through the #1 stores** — `categorize` writes nothing; the sole
-write path is a human resolution into the confirmation store via `/resolve`.
+**Writes only through its own stores** — `categorize` and `reconcile_account`
+write nothing; the sole write paths are a human confirmation via `/resolve` and a
+human reconcile resolution via `/reconcile/resolve`.
 
 The app is built by `create_app(...)` with its config + stores **injected**, so a
 test drives it over a tmp-path ledger. `build_app_from_env()` is the runnable
@@ -33,6 +45,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 
 from bookkeeper.config import BookkeeperConfig
 from bookkeeper.skills.categorize import categorize
+from bookkeeper.skills.reconcile import reconcile_account
 
 from bookkeeper_ui.config_loader import load_config
 from bookkeeper_ui.confirmations import (
@@ -42,15 +55,32 @@ from bookkeeper_ui.confirmations import (
 )
 from bookkeeper_ui.importer import TransactionImportError, import_bytes
 from bookkeeper_ui.ledger_store import FileLedgerStore
+from bookkeeper_ui.reconciliations import (
+    NOTE_REQUIRED_DECISIONS,
+    PAIR_DECISIONS,
+    VALID_DECISIONS,
+    FileReconciliationStore,
+    Reconciliation,
+)
 from bookkeeper_ui.schemas import (
     CategorizationReportOut,
     ConfirmationOut,
     ImportResultOut,
     LedgerOut,
+    ReconcileResolutionOut,
+    ReconciliationReportOut,
+    ReconciliationViewOut,
+    ResolveReconcileRequest,
     ResolveRequest,
+    StatementImportResultOut,
+    StatementLineOut,
+    StatementLinesOut,
     TransactionOut,
 )
-from bookkeeper_ui.views import build_ledger
+from bookkeeper_ui.statement_importer import StatementImportError
+from bookkeeper_ui.statement_importer import import_bytes as import_statement_bytes
+from bookkeeper_ui.statement_store import FileStatementStore
+from bookkeeper_ui.views import build_ledger, build_reconciliation
 from bookkeeper_ui.web import register_ui
 
 
@@ -59,13 +89,17 @@ def create_app(
     config: BookkeeperConfig,
     ledger_store: FileLedgerStore,
     confirmation_store: FileConfirmationStore,
+    statement_store: FileStatementStore,
+    reconciliation_store: FileReconciliationStore,
 ) -> FastAPI:
-    """Build the API over an injected config + ledger/confirmation stores.
+    """Build the API over an injected config + the four #1/Slice-2 stores.
 
     Dependencies are passed in (not read from a global) so a test can drive the
-    app over a temp-path ledger and a fresh confirmation trail, and #3 can wire
-    the real local paths. The stores are the *only* things the routes write
-    through — the framework `categorize` is called read-only.
+    app over a temp-path ledger, statement, confirmation, and reconciliation trail,
+    and #3 can wire the real local paths. The stores are the *only* things the
+    routes write through — `categorize` and `reconcile_account` are called
+    read-only, and the sole reconcile write path is `/reconcile/resolve` (into the
+    reconciliation store alone).
     """
     app = FastAPI(
         title="bookkeeper-ui API",
@@ -169,12 +203,187 @@ def create_app(
         `flagged` (needs a human).
 
         Delegates to `views.build_ledger` — the single projection the #3 UI shares,
-        so JSON and HTML render the same standing per transaction.
+        so JSON and HTML render the same standing per transaction. The reconcile
+        stores are passed too, so every entry also carries its `reconciliation`
+        fold (null when no statement was imported for the period) — the same
+        `build_reconciliation` result `GET /reconcile/view` serializes, so the two
+        surfaces always agree.
         """
         return await build_ledger(
             config=config,
             ledger_store=ledger_store,
             confirmation_store=confirmation_store,
+            period=period,
+            statement_store=statement_store,
+            reconciliation_store=reconciliation_store,
+        )
+
+    # --- Slice 2: reconcile — statement import + the detection-only skill + the
+    # sole human write path (a resolution) + the overlaid view. `reconcile_account`
+    # is called as-is; the only reconcile write is `/reconcile/resolve`.
+
+    @app.post(
+        "/statements/import",
+        response_model=StatementImportResultOut,
+        summary="Import & persist statement lines",
+    )
+    async def import_statement(file: UploadFile = File(...)) -> StatementImportResultOut:
+        """Upload a CSV/JSON bank/card statement → persist each line via the store.
+
+        The reconcile counterpart to `/import`: format dispatched by the filename
+        suffix, the store idempotent (a re-import adds no duplicate rows), a
+        malformed file a 400 naming the problem — nothing partially imported.
+        """
+        data = await file.read()
+        try:
+            lines = import_statement_bytes(data, file.filename or "")
+        except StatementImportError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        for line in lines:
+            await statement_store.store(line)
+
+        return StatementImportResultOut(
+            imported=len(lines),
+            lines=[StatementLineOut.from_model(line) for line in lines],
+        )
+
+    @app.get("/statements", response_model=StatementLinesOut, summary="The stored statement lines")
+    async def statements(period: str) -> StatementLinesOut:
+        """The period's stored statement lines, in read order — a truth surface for
+        tests/inspection (the statement side of the reconcile input)."""
+        lines = await statement_store.fetch_statement(period)
+        return StatementLinesOut(
+            period=period,
+            lines=[StatementLineOut.from_model(line) for line in lines],
+        )
+
+    @app.post(
+        "/reconcile",
+        response_model=ReconciliationReportOut,
+        summary="Run reconcile_account → the raw report (matched/to_confirm/gaps)",
+    )
+    async def reconcile(period: str) -> ReconciliationReportOut:
+        """Call the framework's `reconcile_account(ledger, statement, config, period)`
+        **as-is** and serialize the raw report (the analog of `POST /categorize`).
+
+        Writes nothing — detection-only (§5.5). Unlike `/reconcile/view` it does
+        **not** short-circuit on an empty statement: it returns whatever the skill
+        truthfully reports (an empty statement → every transaction surfaces as an
+        `unmatched_on_statement` gap). The no-statement product guard lives on the
+        view surface, not here.
+        """
+        report = await reconcile_account(ledger_store, statement_store, config, period)
+        return ReconciliationReportOut.from_model(report)
+
+    @app.post(
+        "/reconcile/resolve",
+        response_model=ReconcileResolutionOut,
+        summary="Record one validated reconcile resolution",
+    )
+    async def reconcile_resolve(request: ResolveReconcileRequest) -> ReconcileResolutionOut:
+        """Record one human confirm/reject/acknowledge into the reconciliation store.
+
+        Guards, ordered per the #21 review — every **422** shape check first, and a
+        both-ids-null request refused before any existence check (never `contains()`
+        a null id), then the **404** existence checks:
+
+        - **422** an unknown `decision`; both ids null (resolves nothing); a
+          `confirm`/`reject` (a pair decision) missing either id; a `reject`/
+          `acknowledge` with a blank required `note`.
+        - **404** a supplied `transaction_id` absent from the ledger store, or a
+          supplied `statement_line_id` absent from the statement store — N1
+          (decided): a resolution must never dangle against nothing, so a typo'd id
+          is refused rather than persisted as an orphan. Mirrors `/resolve`'s rule.
+
+        Append-only: a correction is a new row the view collapses to last-write-wins.
+        """
+        decision = request.decision
+        txn_id = request.transaction_id
+        stmt_id = request.statement_line_id
+
+        # --- 422 shape guards (all before any existence check) ---
+        if decision not in VALID_DECISIONS:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"unknown decision {decision!r} — must be one of "
+                    f"{sorted(VALID_DECISIONS)}."
+                ),
+            )
+        # Both-ids-null first, so no `contains()` is ever called on a null id.
+        if txn_id is None and stmt_id is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "a resolution must target at least one id (transaction_id "
+                    "and/or statement_line_id) — both null resolves nothing."
+                ),
+            )
+        if decision in PAIR_DECISIONS and (txn_id is None or stmt_id is None):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"decision {decision!r} resolves a to_confirm pair — both "
+                    f"transaction_id and statement_line_id are required."
+                ),
+            )
+        if decision in NOTE_REQUIRED_DECISIONS and not request.note.strip():
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"decision {decision!r} requires a non-blank note recording the "
+                    f"human's disposition."
+                ),
+            )
+
+        # --- 404 existence guards (N1: never dangle against nothing) ---
+        if txn_id is not None and not await ledger_store.contains(txn_id):
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"transaction {txn_id!r} is not in the ledger — a resolution "
+                    f"must never dangle against nothing (N1, §5-conservative)."
+                ),
+            )
+        if stmt_id is not None and not await statement_store.contains(stmt_id):
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"statement line {stmt_id!r} is not in the statement store — a "
+                    f"resolution must never dangle against nothing (N1, §5-conservative)."
+                ),
+            )
+
+        reconciliation = Reconciliation(
+            transaction_id=txn_id,
+            statement_line_id=stmt_id,
+            decision=decision,
+            note=request.note,
+            source=SOURCE_HUMAN,
+            decided_at=datetime.now(timezone.utc),
+        )
+        await reconciliation_store.record(reconciliation)
+        return ReconcileResolutionOut.from_model(reconciliation)
+
+    @app.get(
+        "/reconcile/view",
+        response_model=ReconciliationViewOut,
+        summary="The overlaid reconcile view (report + resolution status per item)",
+    )
+    async def reconcile_view(period: str) -> ReconciliationViewOut:
+        """The overlaid reconcile projection for `period` — `reconcile_account`
+        overlaid with the latest human resolution per item, each carrying a status.
+
+        Delegates to `views.build_reconciliation` — the single projection the queue
+        UI (issue C) and the ledger fold also read, so all three agree. Honours the
+        no-statement guard (zero lines → the explicit empty view, never all-gaps).
+        """
+        return await build_reconciliation(
+            config=config,
+            ledger_store=ledger_store,
+            statement_store=statement_store,
+            reconciliation_store=reconciliation_store,
             period=period,
         )
 
@@ -198,12 +407,16 @@ def build_app_from_env() -> FastAPI:
 
     - ``BOOKKEEPER_UI_CONFIG``   — path to the `BookkeeperConfig` JSON
                                    (default ``examples/config.json``).
-    - ``BOOKKEEPER_UI_DATA_DIR`` — directory for the ledger + confirmation files
-                                   (default ``data``); created on first write.
+    - ``BOOKKEEPER_UI_DATA_DIR`` — directory for the ledger + statement +
+                                   confirmation + reconciliation files (default
+                                   ``data``); each created on first write.
 
     The wiring is deliberately thin: #3 (the UI) owns the real run surface. This
-    exists so the API is runnable on its own for local development and #2's tests
-    exercise `create_app` directly with injected temp paths.
+    exists so the API is runnable on its own for local development and the tests
+    exercise `create_app` directly with injected temp paths. The four files
+    (`ledger.jsonl` / `statements.jsonl` / `confirmations.jsonl` /
+    `reconciliations.jsonl`) stay distinct — a resolution never touches the ledger
+    or the statement it resolves.
     """
     config_path = os.environ.get("BOOKKEEPER_UI_CONFIG", "examples/config.json")
     data_dir = Path(os.environ.get("BOOKKEEPER_UI_DATA_DIR", "data"))
@@ -211,4 +424,6 @@ def build_app_from_env() -> FastAPI:
         config=load_config(config_path),
         ledger_store=FileLedgerStore(data_dir / "ledger.jsonl"),
         confirmation_store=FileConfirmationStore(data_dir / "confirmations.jsonl"),
+        statement_store=FileStatementStore(data_dir / "statements.jsonl"),
+        reconciliation_store=FileReconciliationStore(data_dir / "reconciliations.jsonl"),
     )

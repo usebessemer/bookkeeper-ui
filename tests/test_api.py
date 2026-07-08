@@ -19,6 +19,8 @@ from bookkeeper_ui.api import create_app
 from bookkeeper_ui.config_loader import load_config
 from bookkeeper_ui.confirmations import FileConfirmationStore
 from bookkeeper_ui.ledger_store import FileLedgerStore
+from bookkeeper_ui.reconciliations import FileReconciliationStore
+from bookkeeper_ui.statement_store import FileStatementStore
 
 
 @dataclass
@@ -26,6 +28,8 @@ class ApiHarness:
     app: FastAPI
     ledger_path: Path
     confirmations_path: Path
+    statements_path: Path
+    reconciliations_path: Path
     examples_dir: Path
 
 
@@ -33,12 +37,23 @@ class ApiHarness:
 def api(tmp_path, examples_dir) -> ApiHarness:
     ledger_path = tmp_path / "ledger.jsonl"
     confirmations_path = tmp_path / "confirmations.jsonl"
+    statements_path = tmp_path / "statements.jsonl"
+    reconciliations_path = tmp_path / "reconciliations.jsonl"
     app = create_app(
         config=load_config(examples_dir / "config.json"),
         ledger_store=FileLedgerStore(ledger_path),
         confirmation_store=FileConfirmationStore(confirmations_path),
+        statement_store=FileStatementStore(statements_path),
+        reconciliation_store=FileReconciliationStore(reconciliations_path),
     )
-    return ApiHarness(app, ledger_path, confirmations_path, examples_dir)
+    return ApiHarness(
+        app,
+        ledger_path,
+        confirmations_path,
+        statements_path,
+        reconciliations_path,
+        examples_dir,
+    )
 
 
 def _client(app: FastAPI) -> httpx.AsyncClient:
