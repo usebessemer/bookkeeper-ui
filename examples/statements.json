@@ -1,0 +1,32 @@
+[
+  {
+    "statement_ref": "STMT-2026Q2-001",
+    "date": "2026-04-03",
+    "amount": "82.50",
+    "description": "STAPLES 00123 OFFICE SUP"
+  },
+  {
+    "statement_ref": "STMT-2026Q2-002",
+    "date": "2026-04-15",
+    "amount": "240.00",
+    "description": "AWS CLOUD EMEA"
+  },
+  {
+    "statement_ref": "STMT-2026Q2-003",
+    "date": "2026-05-02",
+    "amount": "560.00",
+    "description": "DELTA AIR 0062 SFO-JFK"
+  },
+  {
+    "statement_ref": "STMT-2026Q2-004",
+    "date": "2026-05-20",
+    "amount": "18.75",
+    "description": "SQ *BLUE BOTTLE COFFEE"
+  },
+  {
+    "statement_ref": "STMT-2026Q2-005",
+    "date": "2026-06-10",
+    "amount": "800.00",
+    "description": "WEWORK MEMBERSHIP JUN"
+  }
+]
