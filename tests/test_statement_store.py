@@ -107,6 +107,23 @@ async def test_persists_across_new_store_instances(tmp_path):
     assert len(await reopened.fetch_statement("2026-Q2")) == 1
 
 
+async def test_contains_tracks_stored_keys(tmp_path):
+    """`contains(statement_line_key)` is the N1 statement-side existence check —
+    true only for a line actually filed, across a fresh instance (keys reloaded)."""
+    path = tmp_path / "statements.jsonl"
+    line = make_stmt_line(statement_ref="BANK-1", amount="10.00", description="X")
+    key = statement_line_key(line)
+
+    store = FileStatementStore(path)
+    assert not await store.contains(key)  # nothing filed yet
+    await store.store(line)
+    assert await store.contains(key)
+    assert not await store.contains("not-a-real-key")
+
+    # A fresh instance rebuilds the key set from disk.
+    assert await FileStatementStore(path).contains(key)
+
+
 def test_statement_line_key_is_stable_and_natural():
     """The same logical line keys identically; a changed field keys differently."""
     base = make_stmt_line(statement_ref="BANK-1", amount="10.00", description="X")

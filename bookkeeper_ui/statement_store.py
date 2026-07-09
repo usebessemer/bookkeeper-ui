@@ -123,6 +123,20 @@ class FileStatementStore(StatementSource):
             handle.write(json.dumps(_to_record(line, key)) + "\n")
         self._keys.add(key)
 
+    async def contains(self, statement_line_id: str) -> bool:
+        """True if a stored line carries this stable key (its `statement_line_key`).
+
+        The reconcile resolve path checks this before recording a resolution whose
+        `statement_line_id` is non-null, so a resolution can never dangle against a
+        statement line that was never imported (issue #21 / N1: strict 404,
+        typo-safe — the statement-side twin of `FileLedgerStore.contains`). Reuses
+        the same on-disk key set the idempotent `store` already relies on; no
+        period is needed, a resolution is keyed on the line alone.
+        """
+        if self._keys is None:
+            self._keys = self._load_keys()
+        return statement_line_id in self._keys
+
     async def fetch_statement(self, period: str) -> list[StatementLine]:
         """Return `period`'s stored statement lines in deterministic (insertion) order."""
         results: list[StatementLine] = []

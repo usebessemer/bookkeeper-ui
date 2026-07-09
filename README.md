@@ -113,12 +113,19 @@ stable `id` (the ledger `transaction_key`) so the UI can post it back to
 | `POST /import`             | upload a `.csv`/`.json` of transactions → persist via the file store   |
 | `POST /categorize?period=` | run the framework's `categorize` **as-is** → `proposals[]` (the trust trail: `proposed_account` + `confidence` + `source`) and `flagged[]` (`reason`) |
 | `POST /resolve`            | record a confirm/correct decision (`{transaction_id, account}`); rejects an account not in `chart_of_accounts` |
-| `GET  /ledger?period=`     | the categorized ledger: each transaction with its `confirmed` account, or its pending `proposed` / `flagged` status |
+| `GET  /ledger?period=`     | the categorized ledger: each transaction with its `confirmed` account, or its pending `proposed` / `flagged` status, plus its `reconciliation` fold |
+| `POST /statements/import`  | upload a `.csv`/`.json` bank/card statement → persist its lines via the file store |
+| `GET  /statements?period=` | the stored statement lines for the period (a truth surface for inspection) |
+| `POST /reconcile?period=`  | run the framework's `reconcile_account` **as-is** → the raw report (`matched[]` / `to_confirm[]` / `gaps[]`). Detection-only — writes nothing |
+| `POST /reconcile/resolve`  | record a `confirm`/`reject`/`acknowledge` resolution; 422 on a bad shape (unknown decision, missing note, wrong id-shape), 404 on an unknown id |
+| `GET  /reconcile/view?period=` | the overlaid reconcile view: the report annotated with each item's resolution status (the one truth the queue UI + ledger fold share) |
 | `GET  /health`             | liveness check                                                         |
 
-`categorize` writes nothing (proposals-only); the one write path is a human
-resolution into the confirmation store via `/resolve`. Interactive docs are at
-`/docs` when the server is running.
+`categorize` and `reconcile_account` write nothing; the two write paths are a
+human confirm/correct into the confirmation store via `/resolve` and a human
+reconcile resolution into the reconciliation store via `/reconcile/resolve`. A
+reconcile resolution never adjusts a ledger entry or a statement line (§5.5).
+Interactive docs are at `/docs` when the server is running.
 
 ### Run it
 
@@ -129,7 +136,7 @@ uvicorn bookkeeper_ui.api:build_app_from_env --factory --reload
 Configured by env vars (both optional):
 
 - `BOOKKEEPER_UI_CONFIG` — path to the config JSON (default `examples/config.json`).
-- `BOOKKEEPER_UI_DATA_DIR` — dir for the ledger + confirmation files (default `data`).
+- `BOOKKEEPER_UI_DATA_DIR` — dir for the ledger + statement + confirmation + reconciliation files (default `data`).
 
 A quick end-to-end pass with the sample data:
 
@@ -143,8 +150,8 @@ curl 'localhost:8000/ledger?period=2026-Q2'
 ```
 
 Embedding the API in a process instead? `create_app(config=…, ledger_store=…,
-confirmation_store=…)` builds it over injected stores (this is what the tests and
-the UI use).
+confirmation_store=…, statement_store=…, reconciliation_store=…)` builds it over
+injected stores (this is what the tests and the UI use).
 
 ## The UI (#3)
 

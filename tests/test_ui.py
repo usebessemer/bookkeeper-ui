@@ -21,6 +21,8 @@ from bookkeeper_ui.api import create_app
 from bookkeeper_ui.config_loader import load_config
 from bookkeeper_ui.confirmations import FileConfirmationStore
 from bookkeeper_ui.ledger_store import FileLedgerStore
+from bookkeeper_ui.reconciliations import FileReconciliationStore
+from bookkeeper_ui.statement_store import FileStatementStore
 
 # One card per (status, transaction id, vendor) in a rendered queue — the card id
 # is the transaction id the UI posts back to /ui/resolve.
@@ -47,6 +49,8 @@ def ui(tmp_path, examples_dir) -> UiHarness:
         config=load_config(examples_dir / "config.json"),
         ledger_store=FileLedgerStore(ledger_path),
         confirmation_store=FileConfirmationStore(confirmations_path),
+        statement_store=FileStatementStore(tmp_path / "statements.jsonl"),
+        reconciliation_store=FileReconciliationStore(tmp_path / "reconciliations.jsonl"),
     )
     return UiHarness(app, ledger_path, confirmations_path, examples_dir)
 
