@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bookkeeper-ui"
-version = "0.3.0"
-description = "Local, open-source thin UI for the Bessemer Bookkeeper agent — Slice 1: file store (ports) + import + config, and the FastAPI read/write API (categorize, resolve, ledger)."
+version = "0.4.0"
+description = "Local, open-source thin UI for the Bessemer Bookkeeper agent — categorize-and-confirm (Slice 1) and bank reconciliation (Slice 2): file stores (ports) + import + config, the FastAPI read/write API (categorize, resolve, reconcile, ledger), and the htmx trust-trail UI."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
