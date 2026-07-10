@@ -1,29 +1,40 @@
 """The thin UI (#3) — Jinja templates + htmx, mounted on the same FastAPI app.
 
-Three screens over the #2 stores, server-rendered, **no Node/build step**:
+Slice 1 (categorize) and Slice 2 (reconcile) screens over the #2 stores,
+server-rendered, **no Node/build step**:
 
-- ``GET  /``            — **import**: upload a CSV/JSON, pick the period to review.
-- ``GET  /ui/queue``    — the **confirm queue** (the core): one card per proposal
-  rendering the full **trust trail** (proposed account · confidence · the rule
-  that fired), plus flagged transactions with their reason. Confirm / Pick-another
-  post to ``/ui/resolve``; htmx swaps the resolved card out — no full-page reload.
+- ``GET  /``            — **import**: upload a transactions CSV/JSON *and* a
+  statement CSV/JSON, pick the period to review.
+- ``GET  /ui/queue``    — the **confirm queue** (Slice 1 core): one card per
+  proposal rendering the full **trust trail** (proposed account · confidence ·
+  the rule that fired), plus flagged transactions with their reason. Confirm /
+  Pick-another post to ``/ui/resolve``; htmx swaps the resolved card out.
+- ``GET  /ui/reconcile`` — the **reconcile queue** (Slice 2 core): the overlaid
+  ``build_reconciliation`` projection rendered as to-confirm cards (both sides +
+  vendor similarity + the report reason), gap cards (grouped by kind, with the
+  signed delta on an amount mismatch), a read-only matched trail, and a resolved
+  audit trail. Confirm / Reject / Acknowledge post to ``/ui/reconcile/resolve``;
+  htmx swaps the resolved card out.
 - ``GET  /ui/ledger``   — the **categorized ledger**: the confirmed transactions
-  with their accounts, plus the count still pending.
+  with their accounts and their Slice-2 reconciliation standing, plus the count
+  still pending and a reconcile summary line.
 
 The HTML surface is deliberately separate from the JSON API (which keeps its root
-paths, `/import` … `/ledger`, so #2's clients and tests are untouched): the pages
-live at ``/`` and under ``/ui/*``, and both read through the *same* stores and the
-*same* `views.build_ledger` projection the JSON `/ledger` returns. htmx is vendored
-under ``static/`` (no CDN dependency — this runs local and offline).
+paths, `/import` … `/reconcile/view`, so #2's clients and tests are untouched):
+the pages live at ``/`` and under ``/ui/*``, and both read through the *same*
+stores and the *same* `views.build_ledger` / `views.build_reconciliation`
+projections the JSON routes return. htmx is vendored under ``static/`` (no CDN
+dependency — this runs local and offline).
 
-The UI import/resolve handlers render an **error into the page** (a 200 partial the
-user reads) rather than a JSON 4xx: on this surface the message is for a human, and
-htmx swaps a 2xx body in place. The JSON API still returns the machine 4xx. The
-exceptions are the two `/ui/resolve` states unreachable from the rendered queue —
-an off-chart account (a defensive **422**, mirroring the API's §5.2 guard) and an
-unknown transaction id (a strict **404**, mirroring the API's N1 guard: a
-confirmation must never dangle against nothing). Both are machine 4xx defensive
-guards because a human at the screen can reach neither.
+The UI import/resolve handlers render an **error into the page** (a 200 partial
+the user reads) rather than a JSON 4xx: on this surface the message is for a
+human, and htmx swaps a 2xx body in place. The JSON API still returns the machine
+4xx. The exceptions are the resolve states **unreachable** from the rendered
+queue — an off-chart account / an unknown decision or id-shape (a defensive
+**422**, mirroring the API's §5.2 / issue-B guards) and an unknown transaction /
+statement id (a strict **404**, mirroring the API's N1 guard: a resolution must
+never dangle against nothing). Those stay machine 4xx because a human at the
+screen can reach none of them — the same convention #21 set for `/ui/resolve`.
 """
 
 from __future__ import annotations
@@ -42,7 +53,17 @@ from bookkeeper_ui.confirmations import SOURCE_HUMAN, Confirmation, FileConfirma
 from bookkeeper_ui.importer import TransactionImportError, import_bytes
 from bookkeeper_ui.ledger_store import FileLedgerStore
 from bookkeeper_ui.periods import period_of
-from bookkeeper_ui.views import build_ledger
+from bookkeeper_ui.reconciliations import (
+    NOTE_REQUIRED_DECISIONS,
+    PAIR_DECISIONS,
+    VALID_DECISIONS,
+    FileReconciliationStore,
+    Reconciliation,
+)
+from bookkeeper_ui.statement_importer import StatementImportError
+from bookkeeper_ui.statement_importer import import_bytes as import_statement_bytes
+from bookkeeper_ui.statement_store import FileStatementStore
+from bookkeeper_ui.views import build_ledger, build_reconciliation
 
 _HERE = Path(__file__).resolve().parent
 TEMPLATES_DIR = _HERE / "templates"
@@ -60,32 +81,39 @@ def register_ui(
     config: BookkeeperConfig,
     ledger_store: FileLedgerStore,
     confirmation_store: FileConfirmationStore,
+    statement_store: FileStatementStore,
+    reconciliation_store: FileReconciliationStore,
 ) -> None:
     """Mount the HTML UI on `app`, reading through the same injected stores as #2.
 
-    Adds ``GET /``, the ``/ui/*`` routes, and the ``/static`` mount. Kept a
-    separate registration (not inlined in `create_app`) so `api.py` stays the JSON
-    surface and this module owns the templates/htmx surface — one app, two seams.
+    Adds ``GET /``, the ``/ui/*`` routes (Slice 1 confirm + Slice 2 reconcile),
+    and the ``/static`` mount. Kept a separate registration (not inlined in
+    `create_app`) so `api.py` stays the JSON surface and this module owns the
+    templates/htmx surface — one app, two seams. All four Slice-1/Slice-2 stores
+    are injected so the reconcile queue, the resolve path, and the ledger fold all
+    read/write through the *same* files the JSON API uses.
     """
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
     @app.get("/", response_class=HTMLResponse, summary="Import screen (home)")
     async def home(request: Request) -> HTMLResponse:
-        """The import screen: upload a CSV/JSON and choose the period to review."""
+        """The import screen: upload a transactions and/or a statement file, choose
+        the period to review."""
         return templates.TemplateResponse(
             request,
             "import.html",
             {"default_period": _DEFAULT_PERIOD},
         )
 
-    @app.post("/ui/import", response_class=HTMLResponse, summary="Handle an upload (htmx)")
+    @app.post("/ui/import", response_class=HTMLResponse, summary="Handle a transactions upload (htmx)")
     async def ui_import(
         request: Request,
         file: UploadFile,
         period: str = Form(_DEFAULT_PERIOD),
     ) -> HTMLResponse:
-        """Import the uploaded file, persist each transaction, render the outcome.
+        """Import the uploaded transactions file, persist each transaction, render
+        the outcome.
 
         Renders the error *into the page* (a 200 partial htmx swaps in) on a bad
         file rather than a JSON 4xx — the message is for the human at the screen;
@@ -120,6 +148,54 @@ def register_ui(
             "_import_result.html",
             {
                 "imported": len(transactions),
+                "period": period,
+                "detected": detected,
+            },
+        )
+
+    @app.post(
+        "/ui/statements/import",
+        response_class=HTMLResponse,
+        summary="Handle a statement upload (htmx)",
+    )
+    async def ui_import_statement(
+        request: Request,
+        file: UploadFile,
+        period: str = Form(_DEFAULT_PERIOD),
+    ) -> HTMLResponse:
+        """Import the uploaded statement file, persist each line, render the outcome.
+
+        The reconcile counterpart to `ui_import`: same all-or-nothing discipline
+        (a malformed file raises before any `store`, and renders the error into the
+        page as a 200 partial), but the success partial links to the *reconcile*
+        queue rather than the confirm queue. The store is idempotent, so a
+        re-import adds no duplicate lines.
+        """
+        data = await file.read()
+        try:
+            lines = import_statement_bytes(data, file.filename or "")
+        except StatementImportError as exc:
+            return templates.TemplateResponse(
+                request,
+                "_statement_import_result.html",
+                {"error": str(exc)},
+            )
+
+        for line in lines:
+            await statement_store.store(line)
+
+        counts: dict[str, int] = {}
+        for line in lines:
+            key = period_of(line.date)
+            counts[key] = counts.get(key, 0) + 1
+        detected = sorted(counts.items())
+
+        period = period.strip() or _DEFAULT_PERIOD
+        return templates.TemplateResponse(
+            request,
+            "_statement_import_result.html",
+            {
+                "imported": len(lines),
                 "period": period,
                 "detected": detected,
             },
@@ -211,17 +287,194 @@ def register_ui(
             {"period": period, "pending": pending},
         )
 
+    @app.get("/ui/reconcile", response_class=HTMLResponse, summary="The reconcile queue")
+    async def ui_reconcile(request: Request, period: str = _DEFAULT_PERIOD) -> HTMLResponse:
+        """The reconcile queue for `period`: the overlaid `build_reconciliation`
+        projection, never a second computation.
+
+        The template partitions the one projection by status: open `to_confirm`
+        pairs and open gaps are worked as cards; confident `matched` pairs are a
+        read-only trail; resolved items (confirmed / rejected / acknowledged) are
+        the audit trail. The header renders the config boundary honestly — the date
+        window and the `reconcile_vendor` floor, or its inert truth when unset. A
+        zero-statement view (the no-statement guard) renders the empty state, never
+        a page of fake gap cards.
+        """
+        view = await build_reconciliation(
+            config=config,
+            ledger_store=ledger_store,
+            statement_store=statement_store,
+            reconciliation_store=reconciliation_store,
+            period=period,
+        )
+        open_count = sum(1 for p in view.to_confirm if p.status == "to_confirm") + sum(
+            1 for g in view.gaps if g.status == "gap_open"
+        )
+        return templates.TemplateResponse(
+            request,
+            "reconcile.html",
+            {
+                "period": period,
+                "statement_lines": view.statement_lines,
+                "matched": view.matched,
+                "to_confirm": view.to_confirm,
+                "gaps": view.gaps,
+                "open_count": open_count,
+                "date_window": config.reconcile_date_window(),
+                "vendor_floor": config.reconcile_vendor_threshold(),
+            },
+        )
+
+    @app.post(
+        "/ui/reconcile/resolve",
+        response_class=HTMLResponse,
+        summary="Confirm/reject/acknowledge a reconcile item (htmx)",
+    )
+    async def ui_reconcile_resolve(
+        request: Request,
+        decision: str = Form(...),
+        transaction_id: str = Form(""),
+        statement_line_id: str = Form(""),
+        note: str = Form(""),
+        period: str = Form(_DEFAULT_PERIOD),
+    ) -> HTMLResponse:
+        """Record one reconcile resolution, then swap the resolved card out.
+
+        The form counterpart of JSON `/reconcile/resolve`, with the **identical**
+        server-side guards in the identical order — every 422 shape check first
+        (never `contains()` a null id), then the 404 existence checks. All are
+        defensive here: the rendered queue's forms carry fixed hidden decision/id
+        values and mark the note `required`, so a human at the screen can reach
+        none of the bad states — the same machine-4xx convention #21 set for
+        `/ui/resolve`. On success the response is only an out-of-band open-items
+        counter update; the empty remainder swaps into the card target, so the card
+        leaves the queue with no full-page reload.
+
+        An empty hidden id posts as ``""`` (a one-sided gap card leaves the absent
+        side blank); it is normalized to `None` here so the both-ids-null guard and
+        the existence checks see a true absence, never the string ``""``.
+        """
+        txn_id = transaction_id.strip() or None
+        stmt_id = statement_line_id.strip() or None
+
+        # --- 422 shape guards (all before any existence check) ---
+        if decision not in VALID_DECISIONS:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"unknown decision {decision!r} — must be one of "
+                    f"{sorted(VALID_DECISIONS)}."
+                ),
+            )
+        if txn_id is None and stmt_id is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "a resolution must target at least one id (transaction_id "
+                    "and/or statement_line_id) — both null resolves nothing."
+                ),
+            )
+        if decision in PAIR_DECISIONS and (txn_id is None or stmt_id is None):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"decision {decision!r} resolves a to_confirm pair — both "
+                    f"transaction_id and statement_line_id are required."
+                ),
+            )
+        if decision in NOTE_REQUIRED_DECISIONS and not note.strip():
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"decision {decision!r} requires a non-blank note recording the "
+                    f"human's disposition."
+                ),
+            )
+
+        # --- 404 existence guards (N1: never dangle against nothing) ---
+        if txn_id is not None and not await ledger_store.contains(txn_id):
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"transaction {txn_id!r} is not in the ledger — a resolution "
+                    f"must never dangle against nothing (N1, §5-conservative)."
+                ),
+            )
+        if stmt_id is not None and not await statement_store.contains(stmt_id):
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"statement line {stmt_id!r} is not in the statement store — a "
+                    f"resolution must never dangle against nothing (N1, §5-conservative)."
+                ),
+            )
+
+        await reconciliation_store.record(
+            Reconciliation(
+                transaction_id=txn_id,
+                statement_line_id=stmt_id,
+                decision=decision,
+                note=note,
+                source=SOURCE_HUMAN,
+                decided_at=datetime.now(timezone.utc),
+            )
+        )
+
+        # Recompute the open-items count off the same projection, so the live
+        # counter and the "all reconciled" empty state stay honest as cards leave.
+        view = await build_reconciliation(
+            config=config,
+            ledger_store=ledger_store,
+            statement_store=statement_store,
+            reconciliation_store=reconciliation_store,
+            period=period,
+        )
+        open_count = sum(1 for p in view.to_confirm if p.status == "to_confirm") + sum(
+            1 for g in view.gaps if g.status == "gap_open"
+        )
+        return templates.TemplateResponse(
+            request,
+            "_reconcile_resolved.html",
+            {"period": period, "open_count": open_count},
+        )
+
     @app.get("/ui/ledger", response_class=HTMLResponse, summary="The categorized ledger")
     async def ui_ledger(request: Request, period: str = _DEFAULT_PERIOD) -> HTMLResponse:
-        """The categorized ledger for `period`: the confirmed rows + the pending count."""
+        """The categorized ledger for `period`: the confirmed rows (each with its
+        reconciliation badge) + the pending count + a reconcile summary line.
+
+        Passes the reconcile stores to `build_ledger`, so every entry carries its
+        Slice-2 `reconciliation` fold (null when no statement was imported). The
+        summary line reads the *same* `build_reconciliation` projection the queue
+        and the JSON view read, so the three surfaces always agree (AC1).
+        """
         ledger = await build_ledger(
             config=config,
             ledger_store=ledger_store,
             confirmation_store=confirmation_store,
             period=period,
+            statement_store=statement_store,
+            reconciliation_store=reconciliation_store,
         )
         confirmed = [e for e in ledger.entries if e.status == "confirmed"]
         pending = sum(1 for e in ledger.entries if e.status != "confirmed")
+
+        # The reconcile summary — off the shared projection, so its counts match
+        # the reconcile queue exactly. `statement_lines == 0` is the no-statement
+        # guard: render "no statement imported" rather than an all-zero tally.
+        view = await build_reconciliation(
+            config=config,
+            ledger_store=ledger_store,
+            statement_store=statement_store,
+            reconciliation_store=reconciliation_store,
+            period=period,
+        )
+        reconcile_summary = {
+            "has_statement": view.statement_lines > 0,
+            "matched": len(view.matched),
+            "awaiting": sum(1 for p in view.to_confirm if p.status == "to_confirm"),
+            "gaps_open": sum(1 for g in view.gaps if g.status == "gap_open"),
+        }
         return templates.TemplateResponse(
             request,
             "ledger.html",
@@ -230,5 +483,6 @@ def register_ui(
                 "confirmed": confirmed,
                 "pending": pending,
                 "total": len(ledger.entries),
+                "reconcile_summary": reconcile_summary,
             },
         )

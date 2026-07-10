@@ -1,0 +1,199 @@
+{% extends "base.html" %}
+{% block title %}Reconcile — Bookkeeper{% endblock %}
+{% block content %}
+{# Human-readable titles for the framework's three GapKind values. The raw kind
+   is kept on the card class (`gap {{ g.kind }}`) for styling and testability. #}
+{% set kind_labels = {
+  "amount_mismatch": "Amount mismatch",
+  "unmatched_in_ledger": "Missing from the books",
+  "unmatched_on_statement": "Not on the statement"
+} %}
+<h1>Reconcile &mdash; {{ period }}</h1>
+
+{% if statement_lines == 0 %}
+{# The no-statement guard fired: never render every transaction as a discrepancy
+   when no feed was imported. The empty state, not a page of fake gap cards. #}
+<p class="empty-state">
+  No statement imported for {{ period }}.
+  <a href="/">Import a statement &rarr;</a>
+</p>
+{% else %}
+
+<p class="lead">
+  <span id="recon-open-count">{{ open_count }}</span> awaiting your review
+  &middot; {{ matched | length }} matched
+  &middot; {{ gaps | length }} gap{{ "" if gaps | length == 1 else "s" }} surfaced.
+  <a href="/ui/ledger?period={{ period }}">Categorized ledger &rarr;</a>
+</p>
+
+{# The boundary, rendered honestly — the live config knobs `reconcile_account`
+   actually ran with. The floor line prints its configured value, or, when unset,
+   the inert truth verbatim: nothing is auto-matched. #}
+<div class="recon-config">
+  <span class="tag window">date window: ±{{ date_window }} days</span>
+  {% if vendor_floor is not none %}
+  <span class="tag floor">vendor floor: {{ "%.2f" | format(vendor_floor) }}</span>
+  {% else %}
+  <span class="tag floor inert">vendor floor: not configured - every linked pair surfaces for confirmation, nothing is auto-matched (section 5)</span>
+  {% endif %}
+</div>
+
+<div id="reconcile-queue">
+  {# --- To-confirm cards: the core interaction. Both sides side by side, the
+     vendor similarity (NOT a match confidence), the report reason verbatim.
+     Only the still-open pairs are cards; resolved ones drop to the trail below. #}
+  {% for p in to_confirm if p.status == "to_confirm" %}
+  <div class="recon-item card to-confirm">
+    <div class="sides">
+      <div class="side ledger-side">
+        <span class="side-label">Ledger</span>
+        <span class="date">{{ p.transaction.date[:10] }}</span>
+        <span class="vendor">{{ p.transaction.vendor }}</span>
+        <span class="amount">${{ p.transaction.amount }}</span>
+        {% if p.transaction.description %}<p class="desc">{{ p.transaction.description }}</p>{% endif %}
+      </div>
+      <div class="side statement-side">
+        <span class="side-label">Statement</span>
+        <span class="date">{{ p.statement_line.date[:10] }}</span>
+        <span class="ref">{{ p.statement_line.statement_ref }}</span>
+        <span class="amount">${{ p.statement_line.amount }}</span>
+        {% if p.statement_line.description %}<p class="desc">{{ p.statement_line.description }}</p>{% endif %}
+      </div>
+    </div>
+    <div class="trail">
+      <span class="tag similarity">{{ (p.vendor_similarity * 100) | round | int }}% vendor similarity</span>
+      <small class="similarity-note">Vendor-name similarity — not a match confidence.</small>
+    </div>
+    <p class="reason">{{ p.reason }}</p>
+    <div class="actions">
+      <form hx-post="/ui/reconcile/resolve" hx-target="closest .recon-item" hx-swap="outerHTML">
+        <input type="hidden" name="decision" value="confirm">
+        <input type="hidden" name="transaction_id" value="{{ p.transaction.id }}">
+        <input type="hidden" name="statement_line_id" value="{{ p.statement_line.id }}">
+        <input type="hidden" name="period" value="{{ period }}">
+        <button type="submit" class="confirm">Confirm match</button>
+      </form>
+      <form class="reject" hx-post="/ui/reconcile/resolve" hx-target="closest .recon-item" hx-swap="outerHTML">
+        <input type="hidden" name="decision" value="reject">
+        <input type="hidden" name="transaction_id" value="{{ p.transaction.id }}">
+        <input type="hidden" name="statement_line_id" value="{{ p.statement_line.id }}">
+        <input type="hidden" name="period" value="{{ period }}">
+        <label>Why not — required
+          <input type="text" name="note" required placeholder="Not the same charge">
+        </label>
+        <button type="submit">Reject &mdash; not the same charge</button>
+      </form>
+    </div>
+  </div>
+  {% endfor %}
+
+  {# --- Gap cards: grouped by kind in report order (the framework already returns
+     them grouped amount_mismatch → unmatched_in_ledger → unmatched_on_statement).
+     amount_mismatch carries both amounts + the signed delta, rendered as-is. #}
+  {% for g in gaps if g.status == "gap_open" %}
+  <div class="recon-item card gap {{ g.kind }}">
+    <div class="gap-head">
+      <span class="tag kind">{{ kind_labels[g.kind] }}</span>
+    </div>
+    <div class="sides">
+      {% if g.transaction %}
+      <div class="side ledger-side">
+        <span class="side-label">Ledger</span>
+        <span class="date">{{ g.transaction.date[:10] }}</span>
+        <span class="vendor">{{ g.transaction.vendor }}</span>
+        <span class="amount">${{ g.transaction.amount }}</span>
+        {% if g.transaction.description %}<p class="desc">{{ g.transaction.description }}</p>{% endif %}
+      </div>
+      {% endif %}
+      {% if g.statement_line %}
+      <div class="side statement-side">
+        <span class="side-label">Statement</span>
+        <span class="date">{{ g.statement_line.date[:10] }}</span>
+        <span class="ref">{{ g.statement_line.statement_ref }}</span>
+        <span class="amount">${{ g.statement_line.amount }}</span>
+        {% if g.statement_line.description %}<p class="desc">{{ g.statement_line.description }}</p>{% endif %}
+      </div>
+      {% endif %}
+    </div>
+    {% if g.kind == "amount_mismatch" %}
+    <p class="delta">
+      Ledger ${{ g.transaction.amount }} vs statement ${{ g.statement_line.amount }}
+      &mdash; delta {{ g.delta }}
+    </p>
+    {% endif %}
+    <p class="reason">{{ g.reason }}</p>
+    <div class="actions">
+      <form class="acknowledge" hx-post="/ui/reconcile/resolve" hx-target="closest .recon-item" hx-swap="outerHTML">
+        <input type="hidden" name="decision" value="acknowledge">
+        <input type="hidden" name="transaction_id" value="{{ g.transaction.id if g.transaction else '' }}">
+        <input type="hidden" name="statement_line_id" value="{{ g.statement_line.id if g.statement_line else '' }}">
+        <input type="hidden" name="period" value="{{ period }}">
+        <label>Disposition — required
+          <input type="text" name="note" required placeholder="What you found / did">
+        </label>
+        <button type="submit">Acknowledge</button>
+      </form>
+    </div>
+    <p class="disclaimer">Acknowledging records your disposition — it does not change the books.</p>
+  </div>
+  {% endfor %}
+</div>
+
+{% if open_count == 0 %}
+<p class="empty-state">
+  Nothing awaiting reconciliation in {{ period }}.
+  <a href="/ui/ledger?period={{ period }}">View the ledger &rarr;</a>
+</p>
+{% endif %}
+
+{# --- Matched trail: the confident pairs, collapsed and read-only. NO confidence
+   number is shown (the framework MatchedPair carries none), and no action is
+   offered — overturning a confident match is out of scope this slice. #}
+{% if matched %}
+<details class="matched-trail">
+  <summary>{{ matched | length }} matched pair{{ "" if matched | length == 1 else "s" }} (confident &mdash; read only)</summary>
+  <table class="matched">
+    <thead><tr><th>Ledger vendor</th><th class="amount">Amount</th><th>Statement ref</th></tr></thead>
+    <tbody>
+      {% for m in matched %}
+      <tr>
+        <td>{{ m.transaction.vendor }}</td>
+        <td class="amount">${{ m.transaction.amount }}</td>
+        <td>{{ m.statement_line.statement_ref }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</details>
+{% endif %}
+
+{# --- Resolved trail: confirmed / rejected / acknowledged items with their notes
+   and timestamps — the queue page doubles as the audit view. #}
+{% set resolved_pairs = to_confirm | rejectattr("status", "equalto", "to_confirm") | list %}
+{% set resolved_gaps = gaps | selectattr("status", "equalto", "gap_acknowledged") | list %}
+{% if resolved_pairs or resolved_gaps %}
+<section class="resolved-trail">
+  <h2>Resolved</h2>
+  <ul>
+    {% for p in resolved_pairs %}
+    <li>
+      <span class="tag status-{{ p.status }}">{{ p.status }}</span>
+      {{ p.transaction.vendor }} &harr; {{ p.statement_line.statement_ref }}
+      {% if p.note %}&mdash; <span class="note">{{ p.note }}</span>{% endif %}
+      {% if p.decided_at %}<span class="ts">{{ p.decided_at[:19] }}</span>{% endif %}
+    </li>
+    {% endfor %}
+    {% for g in resolved_gaps %}
+    <li>
+      <span class="tag status-{{ g.status }}">{{ g.status }}</span>
+      {{ kind_labels[g.kind] }}{% if g.transaction %} — {{ g.transaction.vendor }}{% endif %}{% if g.statement_line %} — {{ g.statement_line.statement_ref }}{% endif %}
+      {% if g.note %}&mdash; <span class="note">{{ g.note }}</span>{% endif %}
+      {% if g.decided_at %}<span class="ts">{{ g.decided_at[:19] }}</span>{% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% endif %}
+{% endblock %}

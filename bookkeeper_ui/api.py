@@ -395,6 +395,8 @@ def create_app(
         config=config,
         ledger_store=ledger_store,
         confirmation_store=confirmation_store,
+        statement_store=statement_store,
+        reconciliation_store=reconciliation_store,
     )
 
     return app

@@ -33,6 +33,7 @@ from bookkeeper_ui.reconciliations import (
 )
 from bookkeeper_ui.schemas import (
     GapItemOut,
+    GapOut,
     LedgerEntryOut,
     LedgerOut,
     MatchedItemOut,
@@ -236,6 +237,10 @@ async def build_reconciliation(
     # `gaps` — overlay acknowledge; anything else leaves it open. Either side of a
     # gap's key may be null (a one-sided gap carries only its one id), unlike a
     # to_confirm pair which always carries both — hence the distinct key names.
+    # The report→wire mapping (sides + the signed `delta` string) reuses
+    # `GapOut.from_model`, so the view delta shares the *one* delta code path the
+    # raw `POST /reconcile` uses — no second `str(gap.delta)` to drift (issue #24
+    # AC8 / #31).
     gaps: list[GapItemOut] = []
     for gap in report.gaps:
         gap_txn_id = transaction_key(gap.transaction) if gap.transaction is not None else None
@@ -252,21 +257,14 @@ async def build_reconciliation(
             gap_status = "gap_acknowledged"
             gap_note = resolution.note
             gap_decided_at = resolution.decided_at.isoformat()
+        base = GapOut.from_model(gap)
         gaps.append(
             GapItemOut(
-                kind=gap.kind.value,
-                reason=gap.reason,
-                transaction=(
-                    TransactionOut.from_model(gap.transaction)
-                    if gap.transaction is not None
-                    else None
-                ),
-                statement_line=(
-                    StatementLineOut.from_model(gap.statement_line)
-                    if gap.statement_line is not None
-                    else None
-                ),
-                delta=str(gap.delta) if gap.delta is not None else None,
+                kind=base.kind,
+                reason=base.reason,
+                transaction=base.transaction,
+                statement_line=base.statement_line,
+                delta=base.delta,
                 status=gap_status,  # type: ignore[arg-type]
                 note=gap_note,
                 decided_at=gap_decided_at,
