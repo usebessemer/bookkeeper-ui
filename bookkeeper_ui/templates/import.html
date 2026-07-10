@@ -25,4 +25,29 @@
 </form>
 
 <div id="import-result"></div>
+
+<h1>Import a statement</h1>
+<p class="lead">
+  Upload the authoritative bank / card statement CSV or JSON for a period. The
+  agent reconciles it against the books you already imported — you confirm the
+  linked pairs and acknowledge the gaps. A discrepancy is surfaced, never
+  auto-fixed.
+</p>
+
+<form class="import-form"
+      hx-post="/ui/statements/import"
+      hx-target="#statement-import-result"
+      hx-swap="innerHTML"
+      hx-encoding="multipart/form-data">
+  <label>Statement file
+    <input type="file" name="file" accept=".csv,.json" required>
+  </label>
+  <label>Period to reconcile
+    <input type="text" name="period" value="{{ default_period }}" placeholder="2026-Q2">
+    <small>The quarter to open in the reconcile queue (e.g. <code>2026-Q2</code>).</small>
+  </label>
+  <button type="submit">Import statement</button>
+</form>
+
+<div id="statement-import-result"></div>
 {% endblock %}

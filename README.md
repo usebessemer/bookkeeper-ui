@@ -81,9 +81,15 @@ from its date (`period_of`), and `fetch_for_period` answers consistently.
 Runnable sample dataset under [`examples/`](examples/):
 
 - `config.json` — a full `BookkeeperConfig` (chart of accounts, a live
-  `categorize` threshold, owner category rules).
+  `categorize` threshold, the recommended `reconcile_vendor` floor `0.7`, owner
+  category rules).
 - `transactions.csv` / `transactions.json` — the same six transactions in both
   import formats (one in `2026-Q1`, five in `2026-Q2`).
+- `statements.csv` / `statements.json` — a purely-matching `2026-Q2` statement
+  (the store round-trip fixture).
+- `reconcile-demo.csv` / `reconcile-demo.json` — a hand-built `2026-Q2` statement
+  whose one reconcile run against `transactions.*` surfaces **every** bucket at
+  once: two confident matches, a divergent `to_confirm`, and all three gap kinds.
 
 ```python
 import asyncio
@@ -113,12 +119,19 @@ stable `id` (the ledger `transaction_key`) so the UI can post it back to
 | `POST /import`             | upload a `.csv`/`.json` of transactions → persist via the file store   |
 | `POST /categorize?period=` | run the framework's `categorize` **as-is** → `proposals[]` (the trust trail: `proposed_account` + `confidence` + `source`) and `flagged[]` (`reason`) |
 | `POST /resolve`            | record a confirm/correct decision (`{transaction_id, account}`); rejects an account not in `chart_of_accounts` |
-| `GET  /ledger?period=`     | the categorized ledger: each transaction with its `confirmed` account, or its pending `proposed` / `flagged` status |
+| `GET  /ledger?period=`     | the categorized ledger: each transaction with its `confirmed` account, or its pending `proposed` / `flagged` status, plus its `reconciliation` fold |
+| `POST /statements/import`  | upload a `.csv`/`.json` bank/card statement → persist its lines via the file store |
+| `GET  /statements?period=` | the stored statement lines for the period (a truth surface for inspection) |
+| `POST /reconcile?period=`  | run the framework's `reconcile_account` **as-is** → the raw report (`matched[]` / `to_confirm[]` / `gaps[]`). Detection-only — writes nothing |
+| `POST /reconcile/resolve`  | record a `confirm`/`reject`/`acknowledge` resolution; 422 on a bad shape (unknown decision, missing note, wrong id-shape), 404 on an unknown id |
+| `GET  /reconcile/view?period=` | the overlaid reconcile view: the report annotated with each item's resolution status (the one truth the queue UI + ledger fold share) |
 | `GET  /health`             | liveness check                                                         |
 
-`categorize` writes nothing (proposals-only); the one write path is a human
-resolution into the confirmation store via `/resolve`. Interactive docs are at
-`/docs` when the server is running.
+`categorize` and `reconcile_account` write nothing; the two write paths are a
+human confirm/correct into the confirmation store via `/resolve` and a human
+reconcile resolution into the reconciliation store via `/reconcile/resolve`. A
+reconcile resolution never adjusts a ledger entry or a statement line (§5.5).
+Interactive docs are at `/docs` when the server is running.
 
 ### Run it
 
@@ -129,7 +142,7 @@ uvicorn bookkeeper_ui.api:build_app_from_env --factory --reload
 Configured by env vars (both optional):
 
 - `BOOKKEEPER_UI_CONFIG` — path to the config JSON (default `examples/config.json`).
-- `BOOKKEEPER_UI_DATA_DIR` — dir for the ledger + confirmation files (default `data`).
+- `BOOKKEEPER_UI_DATA_DIR` — dir for the ledger + statement + confirmation + reconciliation files (default `data`).
 
 A quick end-to-end pass with the sample data:
 
@@ -143,22 +156,23 @@ curl 'localhost:8000/ledger?period=2026-Q2'
 ```
 
 Embedding the API in a process instead? `create_app(config=…, ledger_store=…,
-confirmation_store=…)` builds it over injected stores (this is what the tests and
-the UI use).
+confirmation_store=…, statement_store=…, reconciliation_store=…)` builds it over
+injected stores (this is what the tests and the UI use).
 
 ## The UI (#3)
 
-The visible surface — **import → confirm queue → categorized ledger** — rendered
-server-side with **Jinja templates + htmx** and served by the *same* FastAPI app
-as the JSON API (the pages live at `/` and under `/ui/*`; the JSON API keeps its
-root paths). **No Node, no build step**; htmx is vendored under
+The visible surface — **import → confirm queue → reconcile queue → categorized
+ledger** — rendered server-side with **Jinja templates + htmx** and served by the
+*same* FastAPI app as the JSON API (the pages live at `/` and under `/ui/*`; the
+JSON API keeps its root paths). **No Node, no build step**; htmx is vendored under
 `bookkeeper_ui/static/` so it runs fully local and offline.
 
 | page                   | what it does                                                            |
 |------------------------|------------------------------------------------------------------------|
-| `GET /`                | **Import** — upload a CSV/JSON and choose the period to review          |
+| `GET /`                | **Import** — upload a transactions CSV/JSON *and* a statement CSV/JSON, choose the period to review |
 | `GET /ui/queue?period=`| **Confirm queue** — a card per proposal showing the full **trust trail** (proposed account · confidence · the rule that fired), plus flagged items with their reason. Confirm / Pick-another → `/ui/resolve`; htmx swaps the resolved card out (no full-page reload) |
-| `GET /ui/ledger?period=`| **Categorized ledger** — the confirmed transactions with their accounts, plus the count still pending |
+| `GET /ui/reconcile?period=`| **Reconcile queue** — the overlaid `build_reconciliation` projection: to-confirm cards (both sides + vendor similarity, *not* a match confidence + the report reason), gap cards (grouped by kind, with the signed delta on an amount mismatch), a read-only matched trail, and a resolved audit trail. Confirm / Reject / Acknowledge → `/ui/reconcile/resolve`; htmx swaps the resolved card out. The header renders the config boundary honestly (date window + the `reconcile_vendor` floor, or its inert truth when unset) |
+| `GET /ui/ledger?period=`| **Categorized ledger** — the confirmed transactions with their accounts and their per-row reconciliation badge, plus the count still pending and a reconcile summary line |
 
 ### Run it
 
@@ -172,13 +186,19 @@ uvicorn bookkeeper_ui.api:build_app_from_env --factory --reload
 Open **http://localhost:8000** and:
 
 1. **Import** the sample data — pick `examples/transactions.csv` (or
-   `examples/transactions.json`), leave the period as `2026-Q2`, and submit.
+   `examples/transactions.json`), leave the period as `2026-Q2`, and submit. Then
+   import a statement — pick `examples/reconcile-demo.csv` for the all-buckets demo
+   — with the same period.
 2. Follow **“Review the confirm queue”** — each card shows the agent's proposed
    account, how confident it is, and which rule fired (`owner-rule` vs
    `chart-match`); flagged rows show why they need a human. **Confirm** in one tap
    or **Pick another** account; the card leaves the queue as you go.
-3. Open the **Categorized ledger** to see the confirmed transactions and how many
-   are still pending.
+3. Follow **“Review the reconcile queue”** — confirm or reject the divergent-vendor
+   pairs (both sides side by side, with the vendor similarity and the report's
+   reason) and acknowledge the gaps (acknowledging records your disposition — it
+   does not change the books). Confident matches sit in a read-only trail.
+4. Open the **Categorized ledger** to see the confirmed transactions, their
+   reconciliation standing, and how many are still pending.
 
 Configured by the same env vars as the API (`BOOKKEEPER_UI_CONFIG`,
 `BOOKKEEPER_UI_DATA_DIR`; both optional). The API and its interactive docs
@@ -186,6 +206,7 @@ Configured by the same env vars as the API (`BOOKKEEPER_UI_CONFIG`,
 
 ## Scope & conventions
 
-Categorize-and-confirm only; **no `agent-classes` changes**; single-user, local,
-file-based. Branches: `feature/<slug>` off `develop`; PRs target `develop`.
+Categorize-and-confirm and reconcile; **no `agent-classes` changes**; single-user,
+local, file-based. A discrepancy is surfaced, never auto-fixed (§5.5). Branches:
+`feature/<slug>` off `develop`; PRs target `develop`.
 `pytest` green before every commit.

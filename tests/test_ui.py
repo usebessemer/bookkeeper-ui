@@ -21,6 +21,8 @@ from bookkeeper_ui.api import create_app
 from bookkeeper_ui.config_loader import load_config
 from bookkeeper_ui.confirmations import FileConfirmationStore
 from bookkeeper_ui.ledger_store import FileLedgerStore
+from bookkeeper_ui.reconciliations import FileReconciliationStore
+from bookkeeper_ui.statement_store import FileStatementStore
 
 # One card per (status, transaction id, vendor) in a rendered queue — the card id
 # is the transaction id the UI posts back to /ui/resolve.
@@ -47,6 +49,8 @@ def ui(tmp_path, examples_dir) -> UiHarness:
         config=load_config(examples_dir / "config.json"),
         ledger_store=FileLedgerStore(ledger_path),
         confirmation_store=FileConfirmationStore(confirmations_path),
+        statement_store=FileStatementStore(tmp_path / "statements.jsonl"),
+        reconciliation_store=FileReconciliationStore(tmp_path / "reconciliations.jsonl"),
     )
     return UiHarness(app, ledger_path, confirmations_path, examples_dir)
 
@@ -173,6 +177,25 @@ async def test_resolve_rejects_off_chart_account(ui: UiHarness):
         )
         assert resp.status_code == 422
     assert not ui.confirmations_path.exists()
+
+
+async def test_resolve_unknown_transaction_is_404(ui: UiHarness):
+    """AC (#21 / N1): /ui/resolve mirrors the API — an unknown transaction id is a
+    strict 404 (unreachable from the rendered queue; a defensive guard), and
+    persists nothing. A valid account isolates the txn-existence guard so the 404
+    is what fires, not the §5.2 account 422."""
+    async with _client(ui.app) as client:
+        await _import_csv(client, ui.examples_dir / "transactions.csv")
+        resp = await client.post(
+            "/ui/resolve",
+            data={
+                "transaction_id": "not-a-real-transaction-id",
+                "account": "5200-travel",
+                "period": "2026-Q2",
+            },
+        )
+        assert resp.status_code == 404
+    assert not ui.confirmations_path.exists()  # no orphan confirmation
 
 
 async def test_ledger_shows_confirmed_and_pending_count(ui: UiHarness):

@@ -19,6 +19,8 @@ from bookkeeper_ui.api import create_app
 from bookkeeper_ui.config_loader import load_config
 from bookkeeper_ui.confirmations import FileConfirmationStore
 from bookkeeper_ui.ledger_store import FileLedgerStore
+from bookkeeper_ui.reconciliations import FileReconciliationStore
+from bookkeeper_ui.statement_store import FileStatementStore
 
 
 @dataclass
@@ -26,6 +28,8 @@ class ApiHarness:
     app: FastAPI
     ledger_path: Path
     confirmations_path: Path
+    statements_path: Path
+    reconciliations_path: Path
     examples_dir: Path
 
 
@@ -33,12 +37,23 @@ class ApiHarness:
 def api(tmp_path, examples_dir) -> ApiHarness:
     ledger_path = tmp_path / "ledger.jsonl"
     confirmations_path = tmp_path / "confirmations.jsonl"
+    statements_path = tmp_path / "statements.jsonl"
+    reconciliations_path = tmp_path / "reconciliations.jsonl"
     app = create_app(
         config=load_config(examples_dir / "config.json"),
         ledger_store=FileLedgerStore(ledger_path),
         confirmation_store=FileConfirmationStore(confirmations_path),
+        statement_store=FileStatementStore(statements_path),
+        reconciliation_store=FileReconciliationStore(reconciliations_path),
     )
-    return ApiHarness(app, ledger_path, confirmations_path, examples_dir)
+    return ApiHarness(
+        app,
+        ledger_path,
+        confirmations_path,
+        statements_path,
+        reconciliations_path,
+        examples_dir,
+    )
 
 
 def _client(app: FastAPI) -> httpx.AsyncClient:
@@ -138,6 +153,35 @@ async def test_resolve_rejects_account_not_in_chart(api: ApiHarness):
         assert "chart_of_accounts" in resp.json()["detail"]
     # Nothing was written — a rejected resolution never touches the store.
     assert not api.confirmations_path.exists()
+
+
+async def test_resolve_unknown_transaction_is_404(api: ApiHarness):
+    """AC (#21 / N1, decided): /resolve refuses an unknown transaction id with a
+    strict 404 — a confirmation must never dangle against nothing. A valid account
+    isolates the txn-existence guard (the §5.2 account check passes), so the 404 is
+    what fires; nothing is written. A genuinely-stored id still resolves (200),
+    proving the guard admits known transactions, not just rejects unknown ones."""
+    async with _client(api.app) as client:
+        # Populate the ledger so "unknown" is tested against a non-empty store.
+        await _import_csv(client, api.examples_dir / "transactions.csv")
+
+        # A typo'd id + a valid account → strict 404, and no orphan confirmation.
+        resp = await client.post(
+            "/resolve",
+            json={"transaction_id": "not-a-real-transaction-id", "account": "5200-travel"},
+        )
+        assert resp.status_code == 404
+        assert "not in the ledger" in resp.json()["detail"]
+        assert not api.confirmations_path.exists()  # nothing dangled against nothing
+
+        # A real stored id (from /ledger) + a valid account still records fine.
+        resp = await client.get("/ledger", params={"period": "2026-Q2"})
+        known_id = resp.json()["entries"][0]["transaction"]["id"]
+        resp = await client.post(
+            "/resolve", json={"transaction_id": known_id, "account": "5200-travel"}
+        )
+        assert resp.status_code == 200
+        assert api.confirmations_path.exists()
 
 
 async def test_categorize_writes_nothing(api: ApiHarness):

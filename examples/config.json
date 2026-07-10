@@ -17,7 +17,8 @@
   "intake_channel": "manual-import",
   "confidence_thresholds": {
     "attribution": 0.9,
-    "categorize": 0.6
+    "categorize": 0.6,
+    "reconcile_vendor": 0.7
   },
   "materiality_floor": "1000.00",
   "owner_policies": {
