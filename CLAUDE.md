@@ -28,19 +28,30 @@ The `bookkeeper` package in **`usebessemer/agent-classes`** (headless, dependenc
 
 The `v0.1.0` pin and the `develop` clone are byte-identical on the reconcile files, so build to what these say.
 
+**Slice 3 (close + sign) additions — same package, read before building Slice 3:**
+
+- `bookkeeper/skills/close_period.py` — `close_period(reconciliation, tax_summary, categorization, config, period) -> CloseReport` (**sync, pure, port-free, writes nothing** — the caller runs the other skills and hands the reports in). `CloseStatus` is `READY | BLOCKED` **only** (no CLOSED/SIGNED — the signed state is entirely the app's artifact). Five preconditions, fixed order: `period_closeable` (vs `config.prior_period_state`, parses `YYYY-Qn`/`YYYY-MM`, fail-safe BLOCK on unparseable/mixed), `period_coherent` (every input report's `.period` == the closing period), `reconciliation_clean` (no gaps/to_confirm), `categorization_complete` (no `flagged`; **proposals do NOT block**), `tax_clean`. **Anomalies are not a precondition** — that gate is the app's.
+- `bookkeeper/skills/track_tax.py` — `track_tax(ledger_source, config, period) -> TaxSummary` (**async**, read-only). `select_regime` **fail-fasts** `UnknownTaxRegime` on any regime but `HST` (case-insensitive) — surface it, never swallow.
+- `bookkeeper/skills/flag_anomaly.py` — `flag_anomaly(ledger_source, config, period) -> AnomalyReport` (**async**, advisory, writes nothing, never gates a skill). Flags carry **no id** (the app derives one). `over_materiality` is inert when `materiality_floor` is unset.
+- **The v1 pin only** applies (`v0.1.0` == `v0.2.0` on all bookkeeper source except `py.typed`). **Zero `agent-classes` changes** — construct only framework-public dataclasses for the effective inputs; the signed/close state, anomaly ids, and reopen are all the app's, never the framework's.
+
 ## Build slices
 
 **Slice 1 — categorize-and-confirm: SHIPPED** (released `v0.3.0` to `main`, 2026-07-06). The smallest end-to-end proof — import · confirm-queue (the full trust trail: proposed account + confidence + the rule that fired) · categorized-ledger — over a file store implementing the ports. Issues `#1`/`#2`/`#3` merged; do not re-open.
 
-**Slice 2 — reconcile: ACTIVE.** Import the authoritative bank/card statement for a period → run `reconcile_account` **as-is** against the books the app already holds → work a **reconcile queue** (confirm/reject the pairs the skill surfaced, acknowledge the gaps) with every resolution persisted append-only. The app never adjusts a ledger entry — a discrepancy is surfaced, never auto-fixed (section 5.5). Three `dev-ready` issues, build **in order**, one PR each:
+**Slice 2 — reconcile: SHIPPED** (released `v0.4.0` to `main`, 2026-07-10). Statement import → `reconcile_account` as-is → the reconcile queue (confirm/reject/acknowledge) with every resolution persisted append-only; the app never adjusts a ledger entry. Issues `#21`/`#22`/`#23`/`#24` merged; do not re-open.
 
-1. **A** — statement store + statement import (`StatementSource` over JSONL).
-2. **B** — reconcile API + resolution store (`reconcile_account`, persisted resolutions, the one overlaid projection).
-3. **C** — reconcile queue UI + ledger fold.
+**Slice 3 — close review + sign: ACTIVE.** The integrator. Build a **close-review screen** that renders the framework's real close checklist (`close_period`'s `CloseReport`) over **effective reports** (the raw skill output with each persisted human resolution applied), plus the period's anomalies (`flag_anomaly`) and tax summary (`track_tax`), and a **SIGN action** (the section 5.7 human sign-off) that writes a durable, append-only, **self-contained** close record — after which the period renders closed everywhere and its books are write-guarded. **Five `dev-ready` issues (`#35`–`#39`), build in order, one PR each:**
 
-**One decided quick fix leads the queue:** issue **#21** (N1: strict **404** on `/resolve` for an unknown transaction id, plus its UI twin) is the lowest-numbered `dev-ready`, so you take it **first**. It establishes the strict-404 resolve rule that Slice 2's `/reconcile/resolve` then mirrors (see issue B). Issue **#5** (identity/dedupe, normalize+count) is deliberately **after** Slice 2 — it sweeps the transaction and statement keys together.
+1. **A** (`#35`) — foundation: the three stores (`FileCloseStore` / `FileAnomalyReviewStore` / `FileWaiverStore`), the `examples/config.json` `tax_regime` fix (`standard` → `HST`, or `track_tax` fail-fasts), and the **closed-period write guards** on the existing write paths + the `create_app`/`register_ui`/`build_app_from_env` wiring.
+2. **B** — the composition: the effective-`CategorizationReport` + effective-`ReconciliationReport` constructors, `views.build_close_review` (the one shared close projection, incl. the effective-prior-state D4 substitution + the app gates), the `build_ledger`/`LedgerOut` `closed` extension, and the read-only `GET /close`.
+3. **C** — the thin write endpoints: `POST /anomalies/review` + `POST /reconciliation/waive`.
+4. **D** — the **SIGN action**: `POST /sign` (in-handler re-verification + the period precondition + closed-guard) and the durable self-contained close record. The correctness core (the #14 immutability lesson) — the review-heaviest issue.
+5. **E** — the UI: the close-review screen, the htmx acknowledge/waive/sign twins, and closed banners on the existing screens.
 
-**Slice boundaries (all slices):** the app implements the framework's ports and calls its skills **as-is**; **no `agent-classes` changes**; single-user, local, file-based; nothing leaves the machine. Money is exact `Decimal` — strings on the wire and in files, never `float`. Later slices (not now): close-and-sign / package preview / anomalies.
+Take the **lowest-numbered open `dev-ready` issue** first; each issue body is a self-contained brief with the grounded `v0.1.0` contract + acceptance criteria + out-of-scope inline. The dependency chain is A → B → {C, D} → E (C and D both depend on A+B; neither on the other). **The effective reports are Slice 3's own constructors** — Slice 2 ships only the status-annotated `ReconciliationViewOut`, never an effective `ReconciliationReport`.
+
+**Slice boundaries (all slices):** the app implements the framework's ports and calls its skills **as-is**; **no `agent-classes` changes**; single-user, local, file-based; nothing leaves the machine. Money is exact `Decimal` — strings on the wire and in files, never `float`. Later slices (not now): package preview / receipt-ingest.
 
 ## Tests
 
@@ -53,7 +64,7 @@ The `v0.1.0` pin and the `develop` clone are byte-identical on the reconcile fil
 On launch you are a **dev leaf** for this repo. Your brief lives on the work substrate, not in the human's chat. The human launches you with a bare command + the fixed trigger **"begin"**; they never paste a brief, and you never report progress to them directly — it goes on the PR/issue.
 
 1. **Sync first — this repo AND the framework.** `git fetch origin && git checkout develop && git pull` before branching. Then the same in **`../agent-classes`** (the framework you `pip install -e` — it must be on `develop`, pulled; a stale or feature-branch checkout there silently changes the contract you build against).
-2. **Fetch your task.** `gh issue list --label dev-ready --state open` → the issue body is your self-contained brief (scope, acceptance criteria, out-of-scope). Take the **lowest-numbered open `dev-ready` issue** unless the human names one, and build the slice **in issue order** (its issues are titled `A` → `B` → `C`).
+2. **Fetch your task.** `gh issue list --label dev-ready --state open` → the issue body is your self-contained brief (scope, acceptance criteria, out-of-scope). Take the **lowest-numbered open `dev-ready` issue** unless the human names one, and build the slice **in issue order** (Slice 3's issues are titled `A` → `B` → `C` → `D` → `E`).
 3. **Work it** on a `feature/<issue-slug>` branch — one change at a time, tests green before each commit.
 4. **Bubble up on the substrate.** Open a PR against `develop` and mirror the issue's acceptance criteria as a checklist in the body. The lead reviews **on the PR**; the human observes, does not relay. Coordinate via PR / issue comments — never by pasting into the human's chat.
 5. **Never self-merge.** The lead (Consulting stream) merges `feature → develop` on a green, AC-passing review. The release boundary (`develop → main`) is the human's gate.
