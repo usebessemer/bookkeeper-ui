@@ -7,10 +7,25 @@
   {% if pending %}<a href="/ui/queue?period={{ period }}">Review the queue &rarr;</a>{% endif %}
 </p>
 
+{# The reconcile fold — the summary line off the same build_reconciliation
+   projection the reconcile queue reads, so the two agree. `no statement imported`
+   is the no-statement guard (never an all-zero tally that reads as "reconciled"). #}
+<p class="reconcile-summary">
+  {% if reconcile_summary.has_statement %}
+  Reconcile: {{ reconcile_summary.matched }} matched &middot;
+  {{ reconcile_summary.awaiting }} awaiting confirmation &middot;
+  {{ reconcile_summary.gaps_open }} gap{{ "" if reconcile_summary.gaps_open == 1 else "s" }} open.
+  <a href="/ui/reconcile?period={{ period }}">Reconcile queue &rarr;</a>
+  {% else %}
+  Reconcile: no statement imported.
+  <a href="/">Import a statement &rarr;</a>
+  {% endif %}
+</p>
+
 {% if confirmed %}
 <table class="ledger">
   <thead>
-    <tr><th>Date</th><th>Vendor</th><th class="amount">Amount</th><th>Account</th><th>By</th></tr>
+    <tr><th>Date</th><th>Vendor</th><th class="amount">Amount</th><th>Account</th><th>By</th><th>Reconciliation</th></tr>
   </thead>
   <tbody>
     {% for entry in confirmed %}
@@ -20,6 +35,7 @@
       <td class="amount">${{ entry.transaction.amount }}</td>
       <td>{{ entry.account }}</td>
       <td>{{ entry.source }}</td>
+      <td><span class="recon-badge recon-{{ entry.reconciliation or 'none' }}">{{ entry.reconciliation or "—" }}</span></td>
     </tr>
     {% endfor %}
   </tbody>

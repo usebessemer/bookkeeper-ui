@@ -1,0 +1,32 @@
+[
+  {
+    "statement_ref": "STMT-DEMO-001",
+    "date": "2026-05-20",
+    "amount": "18.75",
+    "description": "SQ *BLUE BOTTLE COFFEE"
+  },
+  {
+    "statement_ref": "STMT-DEMO-002",
+    "date": "2026-06-10",
+    "amount": "800.00",
+    "description": "WEWORK 0210"
+  },
+  {
+    "statement_ref": "STMT-DEMO-003",
+    "date": "2026-05-02",
+    "amount": "560.00",
+    "description": "AMAZON MKTP US"
+  },
+  {
+    "statement_ref": "STMT-DEMO-004",
+    "date": "2026-04-03",
+    "amount": "85.00",
+    "description": "STAPLES STORE 0123"
+  },
+  {
+    "statement_ref": "STMT-DEMO-005",
+    "date": "2026-05-12",
+    "amount": "42.00",
+    "description": "MYSTERY CHARGE CO"
+  }
+]
