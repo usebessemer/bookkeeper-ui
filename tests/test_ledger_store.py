@@ -44,6 +44,30 @@ async def test_store_is_idempotent_on_stable_key(tmp_path):
     assert len(fetched) == 1
 
 
+async def test_re_store_writes_no_second_physical_row(tmp_path):
+    """A re-store appends no second row to `ledger.jsonl` — write-side idempotency (LedgerSink).
+
+    Asserts on the raw on-disk rows, not through `fetch_for_period`, whose
+    read-side dedup would mask a `store` that duplicated the row. Pins that the
+    write path itself never appends an already-filed key (the sibling of the
+    read-side pin above, which stays green even if write-side dedup is removed).
+    """
+    import json
+
+    path = tmp_path / "ledger.jsonl"
+    store = FileLedgerStore(path)
+    txn = make_txn(vendor="Acme")
+    key = transaction_key(txn)
+
+    await store.store(txn)
+    await store.store(txn)  # exact re-store
+    await store.store(make_txn(vendor="Acme"))  # equal-by-value, same stable key
+
+    rows = [json.loads(r) for r in path.read_text(encoding="utf-8").splitlines() if r.strip()]
+    assert [r["key"] for r in rows].count(key) == 1  # exactly one physical row for the key
+    assert len(rows) == 1
+
+
 async def test_fetch_filters_by_period(tmp_path):
     store = _store(tmp_path)
     await store.store(make_txn(vendor="Q1 txn", date=datetime(2026, 2, 14)))
