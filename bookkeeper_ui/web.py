@@ -49,6 +49,14 @@ from fastapi.templating import Jinja2Templates
 
 from bookkeeper.config import BookkeeperConfig
 
+from bookkeeper_ui.anomaly_reviews import FileAnomalyReviewStore
+from bookkeeper_ui.closes import (
+    FileCloseStore,
+    closed_import_refusal,
+    closed_periods,
+    statement_line_in_closed_period,
+    transaction_in_closed_period,
+)
 from bookkeeper_ui.confirmations import SOURCE_HUMAN, Confirmation, FileConfirmationStore
 from bookkeeper_ui.importer import TransactionImportError, import_bytes
 from bookkeeper_ui.ledger_store import FileLedgerStore
@@ -64,6 +72,7 @@ from bookkeeper_ui.statement_importer import StatementImportError
 from bookkeeper_ui.statement_importer import import_bytes as import_statement_bytes
 from bookkeeper_ui.statement_store import FileStatementStore
 from bookkeeper_ui.views import build_ledger, build_reconciliation
+from bookkeeper_ui.waivers import FileWaiverStore
 
 _HERE = Path(__file__).resolve().parent
 TEMPLATES_DIR = _HERE / "templates"
@@ -83,6 +92,9 @@ def register_ui(
     confirmation_store: FileConfirmationStore,
     statement_store: FileStatementStore,
     reconciliation_store: FileReconciliationStore,
+    close_store: FileCloseStore | None = None,
+    anomaly_review_store: FileAnomalyReviewStore | None = None,
+    waiver_store: FileWaiverStore | None = None,
 ) -> None:
     """Mount the HTML UI on `app`, reading through the same injected stores as #2.
 
@@ -92,6 +104,12 @@ def register_ui(
     templates/htmx surface — one app, two seams. All four Slice-1/Slice-2 stores
     are injected so the reconcile queue, the resolve path, and the ledger fold all
     read/write through the *same* files the JSON API uses.
+
+    The three Slice-3 stores (`close_store` / `anomaly_review_store` /
+    `waiver_store`) are **optional** (default `None`), mirroring `create_app`, so
+    the shipped tests that mount the UI with the five kwargs keep working. Here
+    only `close_store` is read — it is the closed-period truth the UI write-path
+    guards below probe; the other two are threaded for issues B–E.
     """
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -128,6 +146,22 @@ def register_ui(
                 request,
                 "_import_result.html",
                 {"error": str(exc)},
+            )
+
+        # Closed-period guard (the UI twin of the JSON `/import` 400): refuse the
+        # whole upload — render the refusal into the page as a 200 error partial,
+        # nothing persisted — if any row lands in a closed period.
+        closed = await closed_periods(close_store)
+        offending = [
+            (f"{t.vendor} {t.amount} on {t.date.date().isoformat()}", period_of(t.date))
+            for t in transactions
+            if period_of(t.date) in closed
+        ]
+        if offending:
+            return templates.TemplateResponse(
+                request,
+                "_import_result.html",
+                {"error": closed_import_refusal(offending)},
             )
 
         for transaction in transactions:
@@ -179,6 +213,25 @@ def register_ui(
                 request,
                 "_statement_import_result.html",
                 {"error": str(exc)},
+            )
+
+        # Closed-period guard (the UI twin of the JSON `/statements/import` 400):
+        # refuse the whole upload into the page, nothing persisted, if any line
+        # lands in a closed period.
+        closed = await closed_periods(close_store)
+        offending = [
+            (
+                f"{line.statement_ref} {line.amount} on {line.date.date().isoformat()}",
+                period_of(line.date),
+            )
+            for line in lines
+            if period_of(line.date) in closed
+        ]
+        if offending:
+            return templates.TemplateResponse(
+                request,
+                "_statement_import_result.html",
+                {"error": closed_import_refusal(offending)},
             )
 
         for line in lines:
@@ -252,6 +305,21 @@ def register_ui(
                     f"account {account!r} is not in chart_of_accounts — §5.2: never "
                     f"invent a category."
                 ),
+            )
+
+        # Closed-period guard — unlike the account/id guards below (defensive,
+        # unreachable from the queue → machine 4xx), a period can be signed while a
+        # human has this queue open, so the refusal is *reachable* and rendered into
+        # the page as a 200 partial (§5.7: a signed close is durable). The JSON
+        # `/resolve` twin returns a machine 409 for the same state.
+        closed_period = await transaction_in_closed_period(
+            close_store, ledger_store, transaction_id
+        )
+        if closed_period is not None:
+            return templates.TemplateResponse(
+                request,
+                "_closed_refusal.html",
+                {"period": closed_period},
             )
 
         if not await ledger_store.contains(transaction_id):
@@ -389,6 +457,27 @@ def register_ui(
                     f"decision {decision!r} requires a non-blank note recording the "
                     f"human's disposition."
                 ),
+            )
+
+        # --- Closed-period guard (§5.7: a signed close is durable) ---
+        # Reachable while a queue is open, so rendered into the page as a 200
+        # partial (the JSON `/reconcile/resolve` twin returns a machine 409):
+        # refuse if either resolved side lands in a closed period.
+        closed_txn = (
+            await transaction_in_closed_period(close_store, ledger_store, txn_id)
+            if txn_id is not None
+            else None
+        )
+        closed_stmt = (
+            await statement_line_in_closed_period(close_store, statement_store, stmt_id)
+            if stmt_id is not None
+            else None
+        )
+        if closed_txn is not None or closed_stmt is not None:
+            return templates.TemplateResponse(
+                request,
+                "_closed_refusal.html",
+                {"period": closed_txn or closed_stmt},
             )
 
         # --- 404 existence guards (N1: never dangle against nothing) ---
