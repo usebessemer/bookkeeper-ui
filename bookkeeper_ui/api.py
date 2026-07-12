@@ -21,6 +21,10 @@ plus the serialization boundary:
   reconcile write path, into the reconciliation store alone.
 - ``GET  /reconcile/view?period`` — the overlaid projection: the report annotated
   with each item's resolution status (the one truth the UI + ledger fold share).
+- ``GET  /close?period``      — the close-review projection (Slice 3): the framework
+  `close_period` checklist over the *effective* reports (raw skill output + persisted
+  human resolutions), plus tax, anomalies, and the app gates. Read-only; the writes
+  (anomaly review / waive / sign) are later Slice-3 issues.
 
 **Async on purpose** — it matches the framework's async ports/skills contract and
 serves the #3 UI. **The framework stays pure**: this module and `schemas.py` own
@@ -46,6 +50,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from bookkeeper.config import BookkeeperConfig
 from bookkeeper.skills.categorize import categorize
 from bookkeeper.skills.reconcile import reconcile_account
+from bookkeeper.skills.track_tax import UnknownTaxRegime
 
 from bookkeeper_ui.anomaly_reviews import FileAnomalyReviewStore
 from bookkeeper_ui.closes import (
@@ -73,6 +78,7 @@ from bookkeeper_ui.reconciliations import (
 )
 from bookkeeper_ui.schemas import (
     CategorizationReportOut,
+    CloseReviewOut,
     ConfirmationOut,
     ImportResultOut,
     LedgerOut,
@@ -89,7 +95,7 @@ from bookkeeper_ui.schemas import (
 from bookkeeper_ui.statement_importer import StatementImportError
 from bookkeeper_ui.statement_importer import import_bytes as import_statement_bytes
 from bookkeeper_ui.statement_store import FileStatementStore
-from bookkeeper_ui.views import build_ledger, build_reconciliation
+from bookkeeper_ui.views import build_close_review, build_ledger, build_reconciliation
 from bookkeeper_ui.waivers import FileWaiverStore
 from bookkeeper_ui.web import register_ui
 
@@ -474,6 +480,46 @@ def create_app(
             reconciliation_store=reconciliation_store,
             period=period,
         )
+
+    # --- Slice 3: close review (read-only). The one shared close projection —
+    # the framework `close_period` checklist over the *effective* reports, plus tax,
+    # anomalies, and the app gates. Read-only: the writes (anomaly review / waive /
+    # sign) are issues C + D. `build_close_review` is the single source of truth.
+
+    @app.get(
+        "/close",
+        response_model=CloseReviewOut,
+        response_model_exclude_none=False,
+        summary="The close-review projection (framework checklist + gates + signable)",
+    )
+    async def close_review(period: str) -> CloseReviewOut:
+        """The composed close review for `period` — read-only (`GET /close`).
+
+        Delegates to `views.build_close_review`, the single projection `GET /ui/close`
+        (issue E) also reads. Renders the framework's five-check `close_period`
+        checklist verbatim over the effective reports, the period's tax + anomalies,
+        the three app gates, and `signable`. An already-closed period renders its
+        stored signed snapshot (not a recomputation).
+
+        A `tax_regime` the framework does not register makes `track_tax` fail fast
+        with `UnknownTaxRegime`; it is surfaced as a **400** (never swallowed into a
+        200 with an empty tax) — the example config is `HST`, which registers.
+        """
+        try:
+            review = await build_close_review(
+                config=config,
+                ledger_store=ledger_store,
+                confirmation_store=confirmation_store,
+                statement_store=statement_store,
+                reconciliation_store=reconciliation_store,
+                close_store=close_store,
+                anomaly_review_store=anomaly_review_store,
+                waiver_store=waiver_store,
+                period=period,
+            )
+        except UnknownTaxRegime as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return CloseReviewOut.from_review(review)
 
     # #3 — the thin UI (Jinja + htmx) over these same stores, mounted on this app
     # so `uvicorn bookkeeper_ui.api:build_app_from_env --factory` serves both the
