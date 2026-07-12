@@ -47,6 +47,14 @@ from bookkeeper.config import BookkeeperConfig
 from bookkeeper.skills.categorize import categorize
 from bookkeeper.skills.reconcile import reconcile_account
 
+from bookkeeper_ui.anomaly_reviews import FileAnomalyReviewStore
+from bookkeeper_ui.closes import (
+    FileCloseStore,
+    closed_import_refusal,
+    closed_periods,
+    statement_line_in_closed_period,
+    transaction_in_closed_period,
+)
 from bookkeeper_ui.config_loader import load_config
 from bookkeeper_ui.confirmations import (
     SOURCE_HUMAN,
@@ -55,6 +63,7 @@ from bookkeeper_ui.confirmations import (
 )
 from bookkeeper_ui.importer import TransactionImportError, import_bytes
 from bookkeeper_ui.ledger_store import FileLedgerStore
+from bookkeeper_ui.periods import period_of
 from bookkeeper_ui.reconciliations import (
     NOTE_REQUIRED_DECISIONS,
     PAIR_DECISIONS,
@@ -81,6 +90,7 @@ from bookkeeper_ui.statement_importer import StatementImportError
 from bookkeeper_ui.statement_importer import import_bytes as import_statement_bytes
 from bookkeeper_ui.statement_store import FileStatementStore
 from bookkeeper_ui.views import build_ledger, build_reconciliation
+from bookkeeper_ui.waivers import FileWaiverStore
 from bookkeeper_ui.web import register_ui
 
 
@@ -91,6 +101,9 @@ def create_app(
     confirmation_store: FileConfirmationStore,
     statement_store: FileStatementStore,
     reconciliation_store: FileReconciliationStore,
+    close_store: FileCloseStore | None = None,
+    anomaly_review_store: FileAnomalyReviewStore | None = None,
+    waiver_store: FileWaiverStore | None = None,
 ) -> FastAPI:
     """Build the API over an injected config + the four #1/Slice-2 stores.
 
@@ -100,6 +113,14 @@ def create_app(
     routes write through — `categorize` and `reconcile_account` are called
     read-only, and the sole reconcile write path is `/reconcile/resolve` (into the
     reconciliation store alone).
+
+    The three Slice-3 stores (`close_store` / `anomaly_review_store` /
+    `waiver_store`) are **optional** (default `None`) so the shipped Slice-1/Slice-2
+    call sites — which pass exactly the five kwargs above — keep working unchanged.
+    In this issue only `close_store` is read: it is the single source of
+    closed-period truth the write-path guards below probe (an unset store means no
+    period is closed, so the guards are inert and behaviour is exactly pre-Slice-3).
+    The anomaly/waiver stores are threaded now for issues B–E.
     """
     app = FastAPI(
         title="bookkeeper-ui API",
@@ -127,6 +148,19 @@ def create_app(
             transactions = import_bytes(data, file.filename or "")
         except TransactionImportError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # Closed-period guard: refuse the *whole* upload if any parsed row lands in
+        # a closed period (nothing persisted — validate before the store loop,
+        # mirroring the nothing-on-failure import rule). Each row carries its own
+        # date, so `period_of` is directly available; closed truth is the close store.
+        closed = await closed_periods(close_store)
+        offending = [
+            (f"{t.vendor} {t.amount} on {t.date.date().isoformat()}", period_of(t.date))
+            for t in transactions
+            if period_of(t.date) in closed
+        ]
+        if offending:
+            raise HTTPException(status_code=400, detail=closed_import_refusal(offending))
 
         for transaction in transactions:
             await ledger_store.store(transaction)
@@ -163,8 +197,11 @@ def create_app(
           nothing, so a typo'd id is refused rather than persisted as an orphan.
 
         The account guard runs first: an invented category is rejected before the
-        transaction is even looked up. Append-only: a correction is a new row the
-        ledger view collapses to last-write-wins.
+        transaction is even looked up. Then the closed-period guard (§5.7: a signed
+        close is durable) refuses a **409** for a known transaction in a closed
+        period, before the existence check — an *unknown* id (in no closed period)
+        falls through to the unchanged N1 404. Append-only: a correction is a new
+        row the ledger view collapses to last-write-wins.
         """
         if request.account not in config.chart_of_accounts:
             raise HTTPException(
@@ -173,6 +210,19 @@ def create_app(
                     f"account {request.account!r} is not in chart_of_accounts — "
                     f"choose one of the configured accounts (§5.2: never invent a "
                     f"category)."
+                ),
+            )
+
+        closed_period = await transaction_in_closed_period(
+            close_store, ledger_store, request.transaction_id
+        )
+        if closed_period is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"transaction {request.transaction_id!r} is in closed period "
+                    f"{closed_period!r} — its books are write-guarded and cannot be "
+                    f"re-resolved (§5.7: a signed close is durable)."
                 ),
             )
 
@@ -239,6 +289,20 @@ def create_app(
             lines = import_statement_bytes(data, file.filename or "")
         except StatementImportError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # Closed-period guard, the statement-side twin of `/import`: refuse the
+        # whole upload if any line lands in a closed period (nothing persisted).
+        closed = await closed_periods(close_store)
+        offending = [
+            (
+                f"{line.statement_ref} {line.amount} on {line.date.date().isoformat()}",
+                period_of(line.date),
+            )
+            for line in lines
+            if period_of(line.date) in closed
+        ]
+        if offending:
+            raise HTTPException(status_code=400, detail=closed_import_refusal(offending))
 
         for line in lines:
             await statement_store.store(line)
@@ -337,6 +401,30 @@ def create_app(
                 ),
             )
 
+        # --- 409 closed-period guard (§5.7: a signed close is durable) ---
+        # Refuse if *either* resolved side lands in a closed period, before the
+        # existence checks. An unknown id is in no closed period, so it falls
+        # through to the unchanged N1 404 below.
+        closed_txn = (
+            await transaction_in_closed_period(close_store, ledger_store, txn_id)
+            if txn_id is not None
+            else None
+        )
+        closed_stmt = (
+            await statement_line_in_closed_period(close_store, statement_store, stmt_id)
+            if stmt_id is not None
+            else None
+        )
+        if closed_txn is not None or closed_stmt is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"the resolution targets closed period "
+                    f"{(closed_txn or closed_stmt)!r} — its books are write-guarded "
+                    f"and cannot be re-resolved (§5.7: a signed close is durable)."
+                ),
+            )
+
         # --- 404 existence guards (N1: never dangle against nothing) ---
         if txn_id is not None and not await ledger_store.contains(txn_id):
             raise HTTPException(
@@ -397,6 +485,9 @@ def create_app(
         confirmation_store=confirmation_store,
         statement_store=statement_store,
         reconciliation_store=reconciliation_store,
+        close_store=close_store,
+        anomaly_review_store=anomaly_review_store,
+        waiver_store=waiver_store,
     )
 
     return app
@@ -410,15 +501,18 @@ def build_app_from_env() -> FastAPI:
     - ``BOOKKEEPER_UI_CONFIG``   — path to the `BookkeeperConfig` JSON
                                    (default ``examples/config.json``).
     - ``BOOKKEEPER_UI_DATA_DIR`` — directory for the ledger + statement +
-                                   confirmation + reconciliation files (default
-                                   ``data``); each created on first write.
+                                   confirmation + reconciliation + close + anomaly
+                                   review + waiver files (default ``data``); each
+                                   created on first write.
 
     The wiring is deliberately thin: #3 (the UI) owns the real run surface. This
     exists so the API is runnable on its own for local development and the tests
-    exercise `create_app` directly with injected temp paths. The four files
+    exercise `create_app` directly with injected temp paths. The files
     (`ledger.jsonl` / `statements.jsonl` / `confirmations.jsonl` /
-    `reconciliations.jsonl`) stay distinct — a resolution never touches the ledger
-    or the statement it resolves.
+    `reconciliations.jsonl` / `closes.jsonl` / `anomaly_reviews.jsonl` /
+    `reconciliation_waivers.jsonl`) stay distinct — a resolution or a close never
+    touches the ledger or the statement it snapshots. This is the construction
+    site for the three Slice-3 stores (not `create_app`, which takes them injected).
     """
     config_path = os.environ.get("BOOKKEEPER_UI_CONFIG", "examples/config.json")
     data_dir = Path(os.environ.get("BOOKKEEPER_UI_DATA_DIR", "data"))
@@ -428,4 +522,7 @@ def build_app_from_env() -> FastAPI:
         confirmation_store=FileConfirmationStore(data_dir / "confirmations.jsonl"),
         statement_store=FileStatementStore(data_dir / "statements.jsonl"),
         reconciliation_store=FileReconciliationStore(data_dir / "reconciliations.jsonl"),
+        close_store=FileCloseStore(data_dir / "closes.jsonl"),
+        anomaly_review_store=FileAnomalyReviewStore(data_dir / "anomaly_reviews.jsonl"),
+        waiver_store=FileWaiverStore(data_dir / "reconciliation_waivers.jsonl"),
     )
