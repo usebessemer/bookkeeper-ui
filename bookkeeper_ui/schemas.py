@@ -23,7 +23,7 @@ read-path projection may drop it anyway (see `LedgerSource`).
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 
@@ -33,17 +33,27 @@ from bookkeeper.skills.categorize import (
     CategoryFlag,
     CategoryProposal,
 )
+from bookkeeper.skills.close_period import (
+    CloseBlocker,
+    CloseReport,
+    CloseStatus,
+)
 from bookkeeper.skills.reconcile import (
     MatchedPair,
     PairToConfirm,
     ReconciliationGap,
     ReconciliationReport,
 )
+from bookkeeper.skills.track_tax import TaxFlag, TaxSummary
 
 from bookkeeper_ui.confirmations import Confirmation
 from bookkeeper_ui.ledger_store import transaction_key
 from bookkeeper_ui.reconciliations import Reconciliation
 from bookkeeper_ui.statement_store import statement_line_key
+
+if TYPE_CHECKING:  # avoid a runtime import cycle (views imports this module)
+    from bookkeeper_ui.closes import CloseRecord
+    from bookkeeper_ui.views import CloseReview
 
 # Where a ledger entry stands: a human-`confirmed` account, an agent `proposed`
 # one awaiting confirm/correct, or `flagged` for a human to categorize from
@@ -201,10 +211,22 @@ class LedgerEntryOut(BaseModel):
 
 
 class LedgerOut(BaseModel):
-    """The categorized ledger for a period — every transaction, in read order."""
+    """The categorized ledger for a period — every transaction, in read order.
+
+    `closed` is the **additive** Slice 3 period-level close standing — `True` iff a
+    signed close record exists for the period (`FileCloseStore.by_period()`), with
+    `signed_at` / `signed_by` carrying the sign-off audit when closed. It is a
+    property of the *period*, not each row, so it lives here on the envelope and not
+    on `LedgerEntryOut`. Sourced from the same close-store truth every surface reads
+    (banners are issue E). Additive + defaulted: the Slice 1/2 callers that pass no
+    `close_store` to `build_ledger` see `closed=False` and are unaffected.
+    """
 
     period: str
     entries: list[LedgerEntryOut]
+    closed: bool = False
+    signed_at: str | None = Field(default=None, description="ISO 8601 sign-off time; null unless closed.")
+    signed_by: str | None = Field(default=None, description="Who signed the close; null unless closed.")
 
 
 class ImportResultOut(BaseModel):
@@ -479,3 +501,336 @@ class ReconciliationViewOut(BaseModel):
     matched: list[MatchedItemOut]
     to_confirm: list[ToConfirmItemOut]
     gaps: list[GapItemOut]
+
+
+# --- Slice 3: the close-review projection (the one shared close truth) --------
+#
+# `views.build_close_review` composes the framework's real close checklist
+# (`close_period`) over the *effective* reports (raw skill output + persisted human
+# resolutions), plus the period's tax (`track_tax`), anomalies (`flag_anomaly`), and
+# the app gates. It returns the `CloseReview` view-model (which holds the framework
+# `CloseReport` **by name** — the Slice 4 seam); `CloseReviewOut.from_review`
+# serializes it here for `GET /close`. The framework checklist + blockers are
+# rendered **verbatim** (AC2): the same five checks, the framework's own `reason`
+# strings, every blocker with its underlying item. Money everywhere is an exact
+# string (tax totals + gap deltas), reusing the shipped `*.from_model` serializers
+# so there is one money code path.
+
+
+class CloseCheckOut(BaseModel):
+    """One `close_period` precondition — the framework's verdict, verbatim (AC2)."""
+
+    name: str
+    met: bool
+    reason: str
+
+
+class BlockerOut(BaseModel):
+    """One `CloseBlocker` — the failed check, the framework reason, the open item.
+
+    `item` is a **tagged union** carrying the underlying framework item verbatim
+    (reusing the shipped `GapOut` / `PairToConfirmOut` / `FlagOut` / `TaxFlagOut`
+    serializers, so money stays an exact string and a statement line keeps its
+    load-bearing `id`), tagged by `type`, or `null` for the two period guards
+    (`period_closeable` / `period_coherent`), whose blocker is about the period
+    itself, not a report item.
+    """
+
+    check: str
+    reason: str
+    item: dict[str, object] | None = None
+
+
+class FrameworkCloseOut(BaseModel):
+    """The `close_period` result rendered verbatim: the five checks + every blocker.
+
+    `status` is the framework `CloseStatus` value (`ready` / `blocked`), the
+    `checklist` always all five checks, and `blockers` every `CloseBlocker` with its
+    `check` / `reason` / underlying `item` — nothing added, dropped, or re-worded.
+    """
+
+    status: Literal["ready", "blocked"]
+    checklist: list[CloseCheckOut]
+    blockers: list[BlockerOut]
+
+
+class CloseSummaryOut(BaseModel):
+    """The `PeriodSummary` disposition counts — present only on a READY close.
+
+    Note `auto_filed` is the framework's own bucketing (it counts the *effective*
+    proposals, so human-confirmed items are included); the app-truth per-transaction
+    disposition renders from `build_ledger` and is snapshotted separately (issue D).
+    """
+
+    processed: int
+    auto_filed: int
+    reviewed: int
+    open: int
+
+
+class TaxFlagOut(BaseModel):
+    """A `TaxFlag` — a transaction the regime held out of the totals (§5.3)."""
+
+    transaction: TransactionOut
+    reason: str
+
+    @classmethod
+    def from_model(cls, flag: TaxFlag) -> "TaxFlagOut":
+        return cls(
+            transaction=TransactionOut.from_model(flag.transaction),
+            reason=flag.reason,
+        )
+
+
+class TargetTaxOut(BaseModel):
+    """A `TargetTax` — reclaimable tax totalled for one attribution target.
+
+    `reclaimable` is the exact-Decimal sum **as a string** (never a JSON number);
+    `transaction_count` is the number of transactions it was built from.
+    """
+
+    attribution_target_id: str
+    reclaimable: str = Field(description="Exact Decimal as a string (never a lossy float).")
+    transaction_count: int
+
+
+class TaxSummaryOut(BaseModel):
+    """A `TaxSummary` on the wire — per-target + period totals as exact strings."""
+
+    period: str
+    regime: str
+    period_total: str = Field(description="Exact Decimal as a string (never a lossy float).")
+    per_target: list[TargetTaxOut]
+    flagged: list[TaxFlagOut]
+
+    @classmethod
+    def from_model(cls, tax: TaxSummary) -> "TaxSummaryOut":
+        return cls(
+            period=tax.period,
+            regime=tax.regime,
+            period_total=str(tax.period_total),
+            per_target=[
+                TargetTaxOut(
+                    attribution_target_id=t.attribution_target_id,
+                    reclaimable=str(t.reclaimable),
+                    transaction_count=t.transaction_count,
+                )
+                for t in tax.per_target
+            ],
+            flagged=[TaxFlagOut.from_model(f) for f in tax.flagged],
+        )
+
+
+class AnomalyOut(BaseModel):
+    """One `flag_anomaly` flag with its app-derived id and review disposition.
+
+    `id` is the deterministic app-derived id (`anomaly_reviews.derive_flag_id`) — the
+    framework flag carries none. `acknowledged` (+ `acknowledged_at` / `note`) is the
+    disposition overlaid from the anomaly-review store. Flags are advisory; they gate
+    nothing in the framework (the "all anomalies reviewed" rule is the app's gate B).
+    """
+
+    id: str
+    kind: str
+    reason: str
+    transactions: list[TransactionOut]
+    acknowledged: bool
+    acknowledged_at: str | None = None
+    note: str | None = None
+
+
+class GateAllConfirmedOut(BaseModel):
+    """App gate A — every ledger entry for the period is `confirmed`."""
+
+    met: bool
+    pending_count: int
+
+
+class GateAnomaliesReviewedOut(BaseModel):
+    """App gate B — every current anomaly flag has a recorded acknowledgment."""
+
+    met: bool
+    unacknowledged_count: int
+
+
+class GateStatementOrWaiverOut(BaseModel):
+    """App gate C — the period has a statement to reconcile against, or a waiver."""
+
+    met: bool
+    source: Literal["statement", "waived", "missing"]
+
+
+class AppGatesOut(BaseModel):
+    """The three app gates — the app's own close policy, distinct from the checklist.
+
+    These are labeled app policy layered over the framework's `close_period` (which
+    knows nothing of anomalies or the statement-present rule). `signable` requires
+    the framework `CloseReport` be READY **and** all three of these met.
+    """
+
+    all_confirmed: GateAllConfirmedOut
+    anomalies_reviewed: GateAnomaliesReviewedOut
+    statement_or_waiver: GateStatementOrWaiverOut
+
+
+def _blocker_item_out(item: object) -> dict[str, object] | None:
+    """Serialize one `CloseBlocker.item` to its tagged-union wire shape (or null).
+
+    Reuses the shipped `*.from_model` serializers so money stays an exact string and
+    a statement line keeps its load-bearing `id`; the two period guards carry no
+    item (`None`).
+    """
+    if item is None:
+        return None
+    if isinstance(item, ReconciliationGap):
+        return {"type": "reconciliation_gap", **GapOut.from_model(item).model_dump()}
+    if isinstance(item, PairToConfirm):
+        return {"type": "pair_to_confirm", **PairToConfirmOut.from_model(item).model_dump()}
+    if isinstance(item, CategoryFlag):
+        return {"type": "category_flag", **FlagOut.from_model(item).model_dump()}
+    if isinstance(item, TaxFlag):
+        return {"type": "tax_flag", **TaxFlagOut.from_model(item).model_dump()}
+    return None  # defensive: an unknown item kind carries no wire shape
+
+
+def _framework_out(report: CloseReport) -> FrameworkCloseOut:
+    """Render a `CloseReport` verbatim — the five checks + every blocker (AC2)."""
+    return FrameworkCloseOut(
+        status=report.status.value,  # type: ignore[arg-type]
+        checklist=[
+            CloseCheckOut(name=c.name, met=c.met, reason=c.reason) for c in report.checklist
+        ],
+        blockers=[
+            BlockerOut(check=b.check, reason=b.reason, item=_blocker_item_out(b.item))
+            for b in report.blockers
+        ],
+    )
+
+
+class CloseReviewOut(BaseModel):
+    """The composed close-review projection for a period — `GET /close`'s wire shape.
+
+    Two shapes in one envelope, distinguished by `closed`:
+
+    - **Open period** — the live composition: the framework `framework` checklist,
+      the `summary` (READY only), `tax`, `anomalies`, the `reconciliation_source`,
+      the three `app_gates`, and `signable`. `close_record` is null.
+    - **Closed period** — the stored signed snapshot rendered as the truth (a
+      **read of the record, not a recomputation**): `closed=True`, `close_record`
+      carries the durable close record, `signable=False`. The open-only composition
+      fields are null (the signed snapshot is the record; issue E renders it).
+
+    `effective_prior_period_state` / `config_prior_period_state` expose the D4
+    effective-prior substitution (the prior label the close was struck against) and
+    the untouched config-file value. `materiality_check_active` marks whether the
+    `over_materiality` anomaly check ran (it is inert when `materiality_floor` is
+    unset) — so a consumer never mistakes "no size flags" for "the check ran clean".
+    Money everywhere is an exact string.
+    """
+
+    period: str
+    closed: bool
+    close_record: dict[str, object] | None = None
+    framework: FrameworkCloseOut | None = None
+    summary: CloseSummaryOut | None = None
+    tax: TaxSummaryOut | None = None
+    anomalies: list[AnomalyOut] | None = None
+    materiality_check_active: bool | None = None
+    reconciliation_source: Literal["statement", "waived", "missing"] | None = None
+    app_gates: AppGatesOut | None = None
+    signable: bool = False
+    effective_prior_period_state: str | None = None
+    config_prior_period_state: str | None = None
+
+    @classmethod
+    def from_review(cls, review: "CloseReview") -> "CloseReviewOut":
+        """Serialize a `views.CloseReview` view-model to the wire shape.
+
+        A **closed** review echoes its stored `close_record` (the signed snapshot is
+        the rendered truth, never a recomputation); the open-only fields stay null.
+        An **open** review renders the live composition.
+        """
+        if review.closed:
+            record = review.close_record
+            return cls(
+                period=review.period,
+                closed=True,
+                close_record=_close_record_out(record) if record is not None else None,
+                signable=False,
+            )
+
+        assert review.close_report is not None  # open review always composes one
+        report = review.close_report
+        summary = (
+            CloseSummaryOut(
+                processed=report.proposed_close.summary.processed,
+                auto_filed=report.proposed_close.summary.auto_filed,
+                reviewed=report.proposed_close.summary.reviewed,
+                open=report.proposed_close.summary.open,
+            )
+            if report.proposed_close is not None
+            else None
+        )
+        assert review.tax_summary is not None
+        return cls(
+            period=review.period,
+            closed=False,
+            close_record=None,
+            framework=_framework_out(report),
+            summary=summary,
+            tax=TaxSummaryOut.from_model(review.tax_summary),
+            anomalies=[
+                AnomalyOut(
+                    id=a.id,
+                    kind=a.kind,
+                    reason=a.reason,
+                    transactions=[TransactionOut.from_model(t) for t in a.transactions],
+                    acknowledged=a.acknowledged,
+                    acknowledged_at=(
+                        a.acknowledged_at.isoformat() if a.acknowledged_at is not None else None
+                    ),
+                    note=a.note,
+                )
+                for a in review.anomalies
+            ],
+            materiality_check_active=review.materiality_check_active,
+            reconciliation_source=review.reconciliation_source,  # type: ignore[arg-type]
+            app_gates=AppGatesOut(
+                all_confirmed=GateAllConfirmedOut(
+                    met=review.gate_all_confirmed.met,
+                    pending_count=review.gate_all_confirmed.count,
+                ),
+                anomalies_reviewed=GateAnomaliesReviewedOut(
+                    met=review.gate_anomalies_reviewed.met,
+                    unacknowledged_count=review.gate_anomalies_reviewed.count,
+                ),
+                statement_or_waiver=GateStatementOrWaiverOut(
+                    met=review.gate_statement_or_waiver.met,
+                    source=review.reconciliation_source,  # type: ignore[arg-type]
+                ),
+            ),
+            signable=review.signable,
+            effective_prior_period_state=review.effective_prior_period_state,
+            config_prior_period_state=review.config_prior_period_state,
+        )
+
+
+def _close_record_out(record: "CloseRecord") -> dict[str, object]:
+    """Serialize a stored `CloseRecord` to its wire dict (the signed snapshot).
+
+    The record's snapshot payloads are already JSON-native with money pre-stringified
+    (the close store's discipline), so they pass through verbatim; only the
+    `signed_at` datetime is rendered ISO 8601.
+    """
+    return {
+        "period": record.period,
+        "signed_at": record.signed_at.isoformat(),
+        "signed_by": record.signed_by,
+        "checklist": [dict(c) for c in record.checklist],
+        "transactions": [dict(t) for t in record.transactions],
+        "tax": dict(record.tax),
+        "reconciliation": dict(record.reconciliation),
+        "anomalies": [dict(a) for a in record.anomalies],
+        "effective_prior_period_state": record.effective_prior_period_state,
+        "config_prior_period_state": record.config_prior_period_state,
+    }
