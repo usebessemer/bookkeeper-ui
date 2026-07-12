@@ -715,3 +715,25 @@ async def test_build_ledger_carries_closed_flag(harness: Harness):
     )
     assert without_store.closed is False
     assert without_store.signed_at is None
+
+
+async def test_acknowledged_amount_mismatch_still_blocks(harness: Harness):
+    """An AMOUNT_MISMATCH is a live money disagreement: an acknowledge does NOT clear it
+    for close (only the two one-sided gap kinds clear on acknowledge). The framework blocks
+    on it and an acknowledge changes no amounts — so reconciliation_clean stays unmet until
+    it is corrected-and-re-run or rejected. A one-sided acknowledge is unaffected."""
+    await _populate_reconcile(harness)  # Staples/STMT-003 is the amount_mismatch (delta -2.50)
+    staples = [t for t in await harness.ledger_store.fetch_for_period(PERIOD) if t.vendor == "Staples"][0]
+    stmt003 = [s for s in await harness.statement_store.fetch_statement(PERIOD) if s.statement_ref == "STMT-003"][0]
+    await harness.reconciliation_store.record(
+        Reconciliation(transaction_key(staples), statement_line_key(stmt003), DECISION_ACKNOWLEDGE,
+                       "seen", SOURCE_HUMAN, datetime(2026, 7, 1, tzinfo=timezone.utc))
+    )
+    report, _ = await build_effective_reconciliation(
+        config=harness.config, ledger_store=harness.ledger_store, statement_store=harness.statement_store,
+        reconciliation_store=harness.reconciliation_store, waiver_store=harness.waiver_store, period=PERIOD,
+    )
+    assert any(g.kind == GapKind.AMOUNT_MISMATCH for g in report.gaps)  # NOT dropped by the ack
+    body = (await _get_close(harness.app)).json()
+    rc = {c["name"]: c for c in body["framework"]["checklist"]}["reconciliation_clean"]
+    assert rc["met"] is False  # still blocks close

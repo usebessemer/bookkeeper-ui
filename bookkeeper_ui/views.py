@@ -496,8 +496,17 @@ async def build_effective_reconciliation(
             else None
         )
         resolution = latest.get((gap_txn_id, gap_stmt_id))
-        if resolution is not None and resolution.decision == DECISION_ACKNOWLEDGE:
-            continue  # acknowledged — no longer an open gap
+        if (
+            resolution is not None
+            and resolution.decision == DECISION_ACKNOWLEDGE
+            and gap.kind in (GapKind.UNMATCHED_IN_LEDGER, GapKind.UNMATCHED_ON_STATEMENT)
+        ):
+            # An acknowledged *one-sided* gap (a missing/absent entry the human has
+            # explained) clears. An AMOUNT_MISMATCH is a live money disagreement
+            # (books vs the authoritative statement) — the framework blocks on it and
+            # an acknowledge changes no amounts, so it must be corrected-and-re-run or
+            # rejected before it clears. Never close over an unresolved dollar delta.
+            continue
         kept_gaps.append(gap)
 
     return (
