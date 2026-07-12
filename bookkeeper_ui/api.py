@@ -23,8 +23,12 @@ plus the serialization boundary:
   with each item's resolution status (the one truth the UI + ledger fold share).
 - ``GET  /close?period``      — the close-review projection (Slice 3): the framework
   `close_period` checklist over the *effective* reports (raw skill output + persisted
-  human resolutions), plus tax, anomalies, and the app gates. Read-only; the writes
-  (anomaly review / waive / sign) are later Slice-3 issues.
+  human resolutions), plus tax, anomalies, and the app gates. Read-only.
+- ``POST /anomalies/review``  — acknowledge one *current* anomaly flag (422 if the
+  `flag_id` matches no current flag; 409 if the period is closed) → append the ack row.
+- ``POST /reconciliation/waive`` — waive reconciliation for a *no-statement* period
+  (409 if a statement exists or the period is closed) → append the waiver row. The
+  remaining Slice-3 write (the SIGN action) is issue D.
 
 **Async on purpose** — it matches the framework's async ports/skills contract and
 serves the #3 UI. **The framework stays pure**: this module and `schemas.py` own
@@ -49,10 +53,15 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 
 from bookkeeper.config import BookkeeperConfig
 from bookkeeper.skills.categorize import categorize
+from bookkeeper.skills.flag_anomaly import flag_anomaly
 from bookkeeper.skills.reconcile import reconcile_account
 from bookkeeper.skills.track_tax import UnknownTaxRegime
 
-from bookkeeper_ui.anomaly_reviews import FileAnomalyReviewStore
+from bookkeeper_ui.anomaly_reviews import (
+    AnomalyReview,
+    FileAnomalyReviewStore,
+    derive_flag_id,
+)
 from bookkeeper_ui.closes import (
     FileCloseStore,
     closed_import_refusal,
@@ -67,7 +76,7 @@ from bookkeeper_ui.confirmations import (
     FileConfirmationStore,
 )
 from bookkeeper_ui.importer import TransactionImportError, import_bytes
-from bookkeeper_ui.ledger_store import FileLedgerStore
+from bookkeeper_ui.ledger_store import FileLedgerStore, transaction_key
 from bookkeeper_ui.periods import period_of
 from bookkeeper_ui.reconciliations import (
     NOTE_REQUIRED_DECISIONS,
@@ -77,6 +86,8 @@ from bookkeeper_ui.reconciliations import (
     Reconciliation,
 )
 from bookkeeper_ui.schemas import (
+    AnomalyReviewOut,
+    AnomalyReviewRequest,
     CategorizationReportOut,
     CloseReviewOut,
     ConfirmationOut,
@@ -91,12 +102,14 @@ from bookkeeper_ui.schemas import (
     StatementLineOut,
     StatementLinesOut,
     TransactionOut,
+    WaiveRequest,
+    WaiverOut,
 )
 from bookkeeper_ui.statement_importer import StatementImportError
 from bookkeeper_ui.statement_importer import import_bytes as import_statement_bytes
 from bookkeeper_ui.statement_store import FileStatementStore
 from bookkeeper_ui.views import build_close_review, build_ledger, build_reconciliation
-from bookkeeper_ui.waivers import FileWaiverStore
+from bookkeeper_ui.waivers import FileWaiverStore, Waiver
 from bookkeeper_ui.web import register_ui
 
 
@@ -123,10 +136,12 @@ def create_app(
     The three Slice-3 stores (`close_store` / `anomaly_review_store` /
     `waiver_store`) are **optional** (default `None`) so the shipped Slice-1/Slice-2
     call sites — which pass exactly the five kwargs above — keep working unchanged.
-    In this issue only `close_store` is read: it is the single source of
-    closed-period truth the write-path guards below probe (an unset store means no
-    period is closed, so the guards are inert and behaviour is exactly pre-Slice-3).
-    The anomaly/waiver stores are threaded now for issues B–E.
+    `close_store` is the single source of closed-period truth every write-path guard
+    probes (an unset store means no period is closed, so the guards are inert and the
+    behaviour is exactly pre-Slice-3). The `anomaly_review_store` / `waiver_store` are
+    the append-only targets of the two Slice-3 write endpoints (`/anomalies/review` /
+    `/reconciliation/waive`); each endpoint refuses a **503** if its store is unwired,
+    so a Slice-1/2 app never silently no-ops a write.
     """
     app = FastAPI(
         title="bookkeeper-ui API",
@@ -520,6 +535,141 @@ def create_app(
         except UnknownTaxRegime as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return CloseReviewOut.from_review(review)
+
+    # --- Slice 3: the thin write endpoints (issue C). Acknowledge an anomaly flag
+    # and waive a no-statement period — the two small writes that feed close review's
+    # gate B (anomalies-reviewed) and gate C (statement-or-waiver). Each writes only
+    # its own Slice-3 store's row (never the ledger / statement it is dispositioning),
+    # append-only. These are machine 4xx (422/409); the human-reachable UI twins that
+    # render 2xx partials are issue E. `flag_anomaly` is called as-is (read-only).
+
+    @app.post(
+        "/anomalies/review",
+        response_model=AnomalyReviewOut,
+        summary="Acknowledge one current anomaly flag",
+    )
+    async def anomalies_review(request: AnomalyReviewRequest) -> AnomalyReviewOut:
+        """Record one human acknowledgment of a `flag_anomaly` flag into the store.
+
+        `flag_anomaly` is advisory — it surfaces mechanical anomalies but gates
+        nothing and writes nothing; this is the human acknowledgment layered on top,
+        which close review's gate B ("all anomalies reviewed") reads. Two guards, both
+        write nothing on rejection:
+
+        - **409** the period is closed (`close_store` truth) — a signed close is
+          write-guarded (§5.7), so its anomaly dispositions are frozen too. Checked
+          first, the period-level write guard (mirrors `/resolve`'s closed guard
+          preceding its existence check).
+        - **422** `flag_id` matches no **current** flag for the period: re-run
+          `flag_anomaly` (read-only, as-is) and derive each flag's id with A's exact
+          recipe (`derive_flag_id`, imported — never re-implemented), then reject an id
+          not in that set. Never acknowledge a flag that does not exist / fabricate
+          one. A `flag_id` derived from a *stale* flag (e.g. one whose over-materiality
+          reason changed after a `materiality_floor` change) derives a new id, is not
+          current, and so is refused here.
+
+        On success append exactly one row (append-only: a re-ack is a new row the
+        store collapses to last-write-wins) and echo it back.
+        """
+        if anomaly_review_store is None:
+            raise HTTPException(
+                status_code=503,
+                detail="the anomaly-review store is not configured on this server.",
+            )
+
+        if request.period in await closed_periods(close_store):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"period {request.period!r} is closed — its books are "
+                    f"write-guarded and its anomaly dispositions cannot be changed "
+                    f"(§5.7: a signed close is durable)."
+                ),
+            )
+
+        # The current flag set for the period — `flag_anomaly` called as-is
+        # (read-only), keyed by the app-derived id (A's exact recipe, imported).
+        report = await flag_anomaly(ledger_store, config, request.period)
+        flags_by_id = {derive_flag_id(flag): flag for flag in report.flags}
+        flag = flags_by_id.get(request.flag_id)
+        if flag is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"flag_id {request.flag_id!r} matches no current anomaly flag for "
+                    f"period {request.period!r} — an acknowledgment must never dangle "
+                    f"against a flag that does not exist (a changed flag derives a new "
+                    f"id, so a stale acknowledgment is never inherited)."
+                ),
+            )
+
+        review = AnomalyReview(
+            flag_id=request.flag_id,
+            kind=flag.kind.value,
+            reason=flag.reason,
+            transaction_ids=tuple(transaction_key(t) for t in flag.transactions),
+            note=request.note,
+            acknowledged_at=datetime.now(timezone.utc),
+            source=SOURCE_HUMAN,
+        )
+        await anomaly_review_store.record(review)
+        return AnomalyReviewOut.from_model(review)
+
+    @app.post(
+        "/reconciliation/waive",
+        response_model=WaiverOut,
+        summary="Waive reconciliation for a no-statement period",
+    )
+    async def reconciliation_waive(request: WaiveRequest) -> WaiverOut:
+        """Record one human waiver of a period's reconciliation precondition.
+
+        Close review's gate C is met by a statement to reconcile against **or** a
+        recorded waiver; this is that waiver — a dated, attributable decision to sign
+        the close despite no feed. Two guards, both write nothing on rejection:
+
+        - **409** the period is closed (`close_store` truth) — a signed close is
+          write-guarded (§5.7). Checked first, the period-level write guard.
+        - **409** statement lines exist for the period
+          (`statement_store.fetch_statement` non-empty) — a present statement is never
+          waivable: reconcile it, do not waive it.
+
+        On success append exactly one row (append-only: a re-waiver is a new row the
+        store collapses to last-write-wins) and echo it back. `waived_by` defaults to
+        ``"owner"`` (single-user local, a label not an identity).
+        """
+        if waiver_store is None:
+            raise HTTPException(
+                status_code=503,
+                detail="the waiver store is not configured on this server.",
+            )
+
+        if request.period in await closed_periods(close_store):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"period {request.period!r} is closed — its books are "
+                    f"write-guarded and cannot be waived (§5.7: a signed close is "
+                    f"durable)."
+                ),
+            )
+
+        if await statement_store.fetch_statement(request.period):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"period {request.period!r} has a statement on file — a present "
+                    f"statement is never waivable; reconcile it rather than waiving it."
+                ),
+            )
+
+        waiver = Waiver(
+            period=request.period,
+            waived_at=datetime.now(timezone.utc),
+            waived_by=request.waived_by or "owner",
+            note=request.note,
+        )
+        await waiver_store.record(waiver)
+        return WaiverOut.from_model(waiver)
 
     # #3 — the thin UI (Jinja + htmx) over these same stores, mounted on this app
     # so `uvicorn bookkeeper_ui.api:build_app_from_env --factory` serves both the

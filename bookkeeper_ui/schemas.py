@@ -46,10 +46,12 @@ from bookkeeper.skills.reconcile import (
 )
 from bookkeeper.skills.track_tax import TaxFlag, TaxSummary
 
+from bookkeeper_ui.anomaly_reviews import AnomalyReview
 from bookkeeper_ui.confirmations import Confirmation
 from bookkeeper_ui.ledger_store import transaction_key
 from bookkeeper_ui.reconciliations import Reconciliation
 from bookkeeper_ui.statement_store import statement_line_key
+from bookkeeper_ui.waivers import Waiver
 
 if TYPE_CHECKING:  # avoid a runtime import cycle (views imports this module)
     from bookkeeper_ui.closes import CloseRecord
@@ -834,3 +836,90 @@ def _close_record_out(record: "CloseRecord") -> dict[str, object]:
         "effective_prior_period_state": record.effective_prior_period_state,
         "config_prior_period_state": record.config_prior_period_state,
     }
+
+
+# --- Slice 3: the thin write shapes (issue C) --------------------------------
+#
+# The two Slice-3 write endpoints — acknowledge an anomaly flag (`POST
+# /anomalies/review`) and waive a no-statement period (`POST /reconciliation/waive`)
+# — that feed close review's gate B (anomalies-reviewed) and gate C
+# (statement-or-waiver). Each request is a thin shape validated in `api.py` (machine
+# 4xx); each response echoes the recorded store row verbatim so the caller can
+# confirm the append. These write only their own store's row — no ledger /
+# confirmation / statement / reconciliation touch (the app's separate-layer rule).
+
+
+class AnomalyReviewRequest(BaseModel):
+    """A human acknowledgment of one anomaly flag: which flag, which period, why.
+
+    `flag_id` is the app-derived id (`anomaly_reviews.derive_flag_id`) of a **current**
+    flag for `period` — the API re-runs `flag_anomaly` and rejects (422) an id that
+    matches no current flag, so an ack never dangles against a flag that does not
+    exist. `note` is the human's optional why.
+    """
+
+    flag_id: str
+    period: str
+    note: str | None = None
+
+
+class AnomalyReviewOut(BaseModel):
+    """A recorded `AnomalyReview` — echoed back so the surface can confirm the write.
+
+    Carries the acknowledged flag's id plus the snapshot it was made against
+    (`kind` / `reason` / `transaction_ids`, so the row is self-describing in the
+    trail even if the underlying flag later changes), the human's `note`, the
+    `acknowledged_at` audit timestamp, and `source` (`human`).
+    """
+
+    flag_id: str
+    kind: str
+    reason: str
+    transaction_ids: list[str]
+    note: str | None = None
+    acknowledged_at: str = Field(description="ISO 8601 audit timestamp.")
+    source: str
+
+    @classmethod
+    def from_model(cls, review: AnomalyReview) -> "AnomalyReviewOut":
+        return cls(
+            flag_id=review.flag_id,
+            kind=review.kind,
+            reason=review.reason,
+            transaction_ids=list(review.transaction_ids),
+            note=review.note,
+            acknowledged_at=review.acknowledged_at.isoformat(),
+            source=review.source,
+        )
+
+
+class WaiveRequest(BaseModel):
+    """A human waiver of one period's reconciliation precondition: which period, why.
+
+    `period` is the period waived — the API rejects (409) a period that already has a
+    statement on file (a present statement is never waivable) or that is already
+    closed. `waived_by` is the attribution (defaults to ``"owner"`` — single-user
+    local, a label not an identity); `note` is the human's optional why.
+    """
+
+    period: str
+    waived_by: str | None = None
+    note: str | None = None
+
+
+class WaiverOut(BaseModel):
+    """A recorded `Waiver` — echoed back so the surface can confirm the write."""
+
+    period: str
+    waived_at: str = Field(description="ISO 8601 audit timestamp.")
+    waived_by: str
+    note: str | None = None
+
+    @classmethod
+    def from_model(cls, waiver: Waiver) -> "WaiverOut":
+        return cls(
+            period=waiver.period,
+            waived_at=waiver.waived_at.isoformat(),
+            waived_by=waiver.waived_by,
+            note=waiver.note,
+        )
