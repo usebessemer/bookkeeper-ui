@@ -743,3 +743,168 @@ async def build_close_review(
         effective_prior_period_state=effective_prior,
         config_prior_period_state=config.prior_period_state,
     )
+
+
+async def build_close_record(
+    *,
+    review: CloseReview,
+    waiver_store: FileWaiverStore | None,
+    signed_by: str,
+    signed_at: datetime,
+) -> CloseRecord:
+    """Build the durable, self-contained `CloseRecord` for a signable close (D3).
+
+    The §5.7 snapshot: **capture, never re-derive**. Every field is read off the one
+    already-computed `build_close_review` projection (the same one the review screen
+    and the sign gate use — D2's "re-verify server-side, don't duplicate logic"), so
+    a later chart / rule / floor / `prior_period_state` edit — or a later confirmation
+    correction — can never rewrite what was signed. The caller has already checked
+    `review.signable`, so the framework `CloseReport` is READY (its `proposed_close`
+    present) and every ledger entry is confirmed.
+
+    **Pre-stringified in memory (refinement #3 + the round-trip contract).** All
+    money is written as exact-`Decimal` strings, all datetimes as ISO 8601, all
+    sequences as lists — mirroring the close store's own on-write discipline — so the
+    freshly-built record returned to the caller (`CloseRecordOut`) is byte-equal to
+    the one `FileCloseStore` reads back, and no raw `Decimal`/`float` ever reaches the
+    wire as a lossy number. Confidence is deliberately **not** snapshotted: it is a
+    non-money float, and the store's `_jsonable` refuses every float — the trail keeps
+    the agent's proposed account + rule (`source`), which is what "what was signed"
+    needs.
+    """
+    assert review.close_report is not None
+    assert review.close_report.proposed_close is not None  # signable ⇒ READY
+    assert review.ledger is not None
+    assert review.tax_summary is not None
+    assert review.effective_categorization is not None
+    assert review.effective_reconciliation is not None
+
+    report = review.close_report
+    ledger_entries = review.ledger.entries
+
+    # The five framework checks, verbatim (name / met / reason).
+    checklist = [
+        {"name": c.name, "met": c.met, "reason": c.reason} for c in report.checklist
+    ]
+
+    # Disposition counts: the framework `PeriodSummary` (its v1 approximation
+    # snapshotted as-is) alongside the app-truth per-transaction disposition read
+    # from `build_ledger` — both recorded, neither fabricated. At sign time every
+    # entry is confirmed (gate A), so app-truth is all-confirmed by construction.
+    fw = report.proposed_close.summary
+    summary = {
+        "framework": {
+            "processed": fw.processed,
+            "auto_filed": fw.auto_filed,
+            "reviewed": fw.reviewed,
+            "open": fw.open,
+        },
+        "app_truth": {
+            "confirmed": sum(1 for e in ledger_entries if e.status == "confirmed"),
+            "proposed": sum(1 for e in ledger_entries if e.status == "proposed"),
+            "flagged": sum(1 for e in ledger_entries if e.status == "flagged"),
+            "total": len(ledger_entries),
+        },
+    }
+
+    # Per-transaction final state, from `build_ledger` (the one per-transaction
+    # truth). The agent's original proposal (account + rule) is read from the
+    # effective categorization — raw agent proposals pass through it unchanged;
+    # the human proposals synthesised from confirmed flags carry source="human"
+    # and are excluded (a flag had no agent proposal to record).
+    agent_proposals = {
+        transaction_key(p.transaction): p
+        for p in review.effective_categorization.proposals
+        if p.source != SOURCE_HUMAN
+    }
+    transactions: list[dict[str, object]] = []
+    for entry in ledger_entries:
+        # `entry.transaction` is a `TransactionOut` — amount/tax already exact
+        # strings, date already ISO 8601 (the shipped serializer), so no coercion.
+        row: dict[str, object] = {
+            "transaction_key": entry.transaction.id,
+            "vendor": entry.transaction.vendor,
+            "date": entry.transaction.date,
+            "amount": entry.transaction.amount,
+            "tax": entry.transaction.tax,
+            "account": entry.account,
+            "source": entry.source,
+            "status": entry.status,
+        }
+        proposal = agent_proposals.get(entry.transaction.id)
+        if proposal is not None:
+            row["proposed"] = {
+                "account": proposal.proposed_account,
+                "source": proposal.source,
+            }
+        transactions.append(row)
+
+    # Tax snapshot — regime, per-target reclaimable (money → string), period total.
+    tax = review.tax_summary
+    tax_snapshot = {
+        "regime": tax.regime,
+        "per_target": [
+            {
+                "attribution_target_id": t.attribution_target_id,
+                "reclaimable": str(t.reclaimable),
+                "transaction_count": t.transaction_count,
+            }
+            for t in tax.per_target
+        ],
+        "period_total": str(tax.period_total),
+    }
+
+    # Reconciliation snapshot — the effective report's honest counts (an
+    # acknowledged amount_mismatch still counts as an open gap, so a period carrying
+    # one is not signable and never reaches here), or the recorded waiver when gate C
+    # was satisfied by waiver (rendered/snapshotted "waived", never "reconciled").
+    if review.reconciliation_source == "waived":
+        waiver = (
+            (await waiver_store.by_period()).get(review.period)
+            if waiver_store is not None
+            else None
+        )
+        reconciliation_snapshot: dict[str, object] = {
+            "waived": True,
+            "waived_at": waiver.waived_at.isoformat() if waiver is not None else None,
+            "waived_by": waiver.waived_by if waiver is not None else None,
+        }
+    else:
+        recon = review.effective_reconciliation
+        reconciliation_snapshot = {
+            "waived": False,
+            "source": review.reconciliation_source,
+            "matched": len(recon.matched),
+            "to_confirm": len(recon.to_confirm),
+            "gaps": len(recon.gaps),
+        }
+
+    # Anomaly snapshot — every flag with its derived id, kind, reason, member ids,
+    # and its acknowledgment disposition (all acknowledged at sign time, gate B).
+    anomalies = [
+        {
+            "id": a.id,
+            "kind": a.kind,
+            "reason": a.reason,
+            "transaction_ids": [transaction_key(t) for t in a.transactions],
+            "acknowledged_at": (
+                a.acknowledged_at.isoformat() if a.acknowledged_at is not None else None
+            ),
+            "note": a.note,
+        }
+        for a in review.anomalies
+    ]
+
+    return CloseRecord(
+        period=review.period,
+        signed_at=signed_at,
+        signed_by=signed_by,
+        checklist=checklist,
+        transactions=transactions,
+        tax=tax_snapshot,
+        reconciliation=reconciliation_snapshot,
+        anomalies=anomalies,
+        summary=summary,
+        effective_prior_period_state=review.effective_prior_period_state,
+        config_prior_period_state=review.config_prior_period_state,
+    )

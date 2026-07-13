@@ -27,8 +27,11 @@ plus the serialization boundary:
 - ``POST /anomalies/review``  — acknowledge one *current* anomaly flag (422 if the
   `flag_id` matches no current flag; 409 if the period is closed) → append the ack row.
 - ``POST /reconciliation/waive`` — waive reconciliation for a *no-statement* period
-  (409 if a statement exists or the period is closed) → append the waiver row. The
-  remaining Slice-3 write (the SIGN action) is issue D.
+  (409 if a statement exists or the period is closed) → append the waiver row.
+- ``POST /sign``               — the §5.7 sign-off (Slice 3): re-verify the whole
+  close server-side (400 on a non-quarterly label, 409 on an empty/already-closed
+  period or any unmet gate) → append **exactly one** durable, self-contained close
+  record. The correctness core — the sole write on the pass path.
 
 **Async on purpose** — it matches the framework's async ports/skills contract and
 serves the #3 UI. **The framework stays pure**: this module and `schemas.py` own
@@ -77,7 +80,7 @@ from bookkeeper_ui.confirmations import (
 )
 from bookkeeper_ui.importer import TransactionImportError, import_bytes
 from bookkeeper_ui.ledger_store import FileLedgerStore, transaction_key
-from bookkeeper_ui.periods import period_of
+from bookkeeper_ui.periods import is_quarterly_period, period_of
 from bookkeeper_ui.reconciliations import (
     NOTE_REQUIRED_DECISIONS,
     PAIR_DECISIONS,
@@ -89,6 +92,7 @@ from bookkeeper_ui.schemas import (
     AnomalyReviewOut,
     AnomalyReviewRequest,
     CategorizationReportOut,
+    CloseRecordOut,
     CloseReviewOut,
     ConfirmationOut,
     ImportResultOut,
@@ -98,6 +102,7 @@ from bookkeeper_ui.schemas import (
     ReconciliationViewOut,
     ResolveReconcileRequest,
     ResolveRequest,
+    SignRequest,
     StatementImportResultOut,
     StatementLineOut,
     StatementLinesOut,
@@ -108,7 +113,12 @@ from bookkeeper_ui.schemas import (
 from bookkeeper_ui.statement_importer import StatementImportError
 from bookkeeper_ui.statement_importer import import_bytes as import_statement_bytes
 from bookkeeper_ui.statement_store import FileStatementStore
-from bookkeeper_ui.views import build_close_review, build_ledger, build_reconciliation
+from bookkeeper_ui.views import (
+    build_close_record,
+    build_close_review,
+    build_ledger,
+    build_reconciliation,
+)
 from bookkeeper_ui.waivers import FileWaiverStore, Waiver
 from bookkeeper_ui.web import register_ui
 
@@ -670,6 +680,119 @@ def create_app(
         )
         await waiver_store.record(waiver)
         return WaiverOut.from_model(waiver)
+
+    # --- Slice 3: the SIGN action (issue D). The §5.7 human sign-off — re-verify the
+    # whole close server-side, then append exactly one durable, self-contained close
+    # record. The correctness core: the #14 immutability lesson (capture, never
+    # re-derive) + the sign gates live here. JSON route (machine 4xx); the UI twin is
+    # issue E. The sole write on the pass path is one `CloseRecord`; on every refusal
+    # nothing is written.
+
+    @app.post(
+        "/sign",
+        response_model=CloseRecordOut,
+        summary="Sign a period closed — re-verify + write the durable close record",
+    )
+    async def sign(request: SignRequest) -> CloseRecordOut:
+        """Sign `period` closed (§5.7) — the durable, append-only close record.
+
+        The handler order is load-bearing (issue D):
+
+        1. **Period precondition (before any composition).** `period` is
+           client-supplied free text: it MUST be a well-formed quarterly ``YYYY-Qn``
+           label (the `period_of` convention — else **400**) **and** carry ≥1 ledger
+           transaction (else **409**). This runs first because with
+           `prior_period_state` unset the framework calls any label READY — so signing
+           a garbage/empty label would append a close under a label the D4
+           effective-prior read cannot order, fail-safe-BLOCKing every future close.
+        2. **Closed-period guard (before trusting the composition).** An already-closed
+           period → **409** (never re-signed, never a second close row). Checked before
+           the composition because `build_close_review` returns the *stored snapshot*
+           for a closed period, which would otherwise look like a signable READY.
+        3. **In-handler re-verification (trust no client state).** Recompute the whole
+           close via the **same** `build_close_review` the review screen uses and
+           re-check every gate server-side — framework READY **and** all three app
+           gates (all-confirmed / anomalies-reviewed / statement-or-waiver). Any gate
+           unmet → **409** whose body is the `CloseReviewOut` enumerating what failed.
+           Signing at/before the effective prior close is refused by the framework's
+           own `period_closeable` (via the D4 effective prior) — never re-implemented.
+        4. **On pass — the sole write.** Append **exactly one** `CloseRecord` and echo
+           it. Nothing else is written (the D4 in-memory `dataclasses.replace` is not a
+           file write); an unregistered `tax_regime` surfaces the framework error 400.
+        """
+        if close_store is None:
+            raise HTTPException(
+                status_code=503,
+                detail="the close store is not configured on this server.",
+            )
+
+        # 1. Period precondition — before any composition or write.
+        if not is_quarterly_period(request.period):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"period {request.period!r} is not a well-formed quarterly label "
+                    f"(YYYY-Qn, n 1–4 — the period_of convention the books are filed "
+                    f"by). A close is never signed under a label the prior-period "
+                    f"guard cannot order."
+                ),
+            )
+        if not await ledger_store.fetch_for_period(request.period):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"period {request.period!r} has no ledger transactions — there is "
+                    f"nothing to close. Import and confirm the period's transactions "
+                    f"before signing."
+                ),
+            )
+
+        # 2. Closed-period guard — before trusting the composition (a closed period's
+        # review returns the stored snapshot, not a fresh gate evaluation).
+        if request.period in await closed_periods(close_store):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"period {request.period!r} is already closed — a signed close is "
+                    f"durable and is never re-signed (§5.7). No second close record is "
+                    f"written."
+                ),
+            )
+
+        # 3. In-handler re-verification — the same projection the review screen reads.
+        try:
+            review = await build_close_review(
+                config=config,
+                ledger_store=ledger_store,
+                confirmation_store=confirmation_store,
+                statement_store=statement_store,
+                reconciliation_store=reconciliation_store,
+                close_store=close_store,
+                anomaly_review_store=anomaly_review_store,
+                waiver_store=waiver_store,
+                period=request.period,
+            )
+        except UnknownTaxRegime as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        if not review.signable:
+            # 409 enumerating exactly which gates failed — the same CloseReviewOut the
+            # review renders (money already exact strings; mode="json" keeps them so).
+            raise HTTPException(
+                status_code=409,
+                detail=CloseReviewOut.from_review(review).model_dump(mode="json"),
+            )
+
+        # 4. On pass — append exactly one self-contained close record and echo it.
+        signed_by = (request.signed_by or "").strip() or "owner"
+        record = await build_close_record(
+            review=review,
+            waiver_store=waiver_store,
+            signed_by=signed_by,
+            signed_at=datetime.now(timezone.utc),
+        )
+        await close_store.record(record)
+        return CloseRecordOut.from_record(record)
 
     # #3 — the thin UI (Jinja + htmx) over these same stores, mounted on this app
     # so `uvicorn bookkeeper_ui.api:build_app_from_env --factory` serves both the
