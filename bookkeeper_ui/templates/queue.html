@@ -1,7 +1,18 @@
 {% extends "base.html" %}
+{% from "_closed_banner.html" import closed_banner %}
 {% block title %}Confirm queue — Bookkeeper{% endblock %}
 {% block content %}
 <h1>Confirm queue &mdash; {{ period }}</h1>
+
+{% if closed %}
+{# The period is signed closed — its books are write-guarded. Show the banner and
+   render NO confirm controls (the server guard from issue A refuses regardless). #}
+{{ closed_banner(period, signed_at, signed_by) }}
+<p class="empty-state">
+  This period is closed &mdash; no confirmations can be recorded.
+  <a href="/ui/close?period={{ period }}">View the signed close &rarr;</a>
+</p>
+{% else %}
 <p class="lead">
   <span id="pending-count">{{ entries | length }}</span> awaiting your review{% if total %} of {{ total }} in this period{% endif %}.
   <a href="/ui/ledger?period={{ period }}">Categorized ledger &rarr;</a>
@@ -18,5 +29,6 @@
   Nothing awaiting review in {{ period }}.
   <a href="/ui/ledger?period={{ period }}">View the ledger &rarr;</a>
 </p>
+{% endif %}
 {% endif %}
 {% endblock %}

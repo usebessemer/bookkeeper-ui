@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Close review &mdash; Bookkeeper{% endblock %}
+{% block content %}
+{# The close-review screen (issue E). Rendered from the SAME
+   `views.build_close_review` the JSON `GET /close` reads — the projection is
+   serialized once to `CloseReviewOut` (the `close` context var below), so the
+   HTML and the JSON render identical state (no second computation).
+
+   Three shapes in one screen, distinguished up front:
+   - `error`  — the tax regime did not register (`track_tax` fail-fast) — render
+     the message for the human, not a 500 (the Slice-1 error-into-the-page rule).
+   - closed   — the signed record IS the rendered truth (a read of the stored
+     snapshot, never a recompute): `_close_signed.html`.
+   - open     — the live composition + the acknowledge / waive / sign controls:
+     `_close_screen.html`. #}
+<h1>Close review &mdash; {{ period }}</h1>
+
+{% if error %}
+<div class="result error">
+  <p><strong>Cannot assemble the close for {{ period }}.</strong> {{ error }}</p>
+  <p>Fix the configured <code>tax_regime</code> and reload.</p>
+</div>
+{% elif close.closed %}
+{% set record = close.close_record %}
+{% include "_close_signed.html" %}
+{% else %}
+{% include "_close_screen.html" %}
+{% endif %}
+{% endblock %}

@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_closed_banner.html" import closed_banner %}
 {% block title %}Reconcile — Bookkeeper{% endblock %}
 {% block content %}
 {# Human-readable titles for the framework's three GapKind values. The raw kind
@@ -9,6 +10,8 @@
   "unmatched_on_statement": "Not on the statement"
 } %}
 <h1>Reconcile &mdash; {{ period }}</h1>
+
+{% if closed %}{{ closed_banner(period, signed_at, signed_by) }}{% endif %}
 
 {% if statement_lines == 0 %}
 {# The no-statement guard fired: never render every transaction as a discrepancy
@@ -38,6 +41,7 @@
   {% endif %}
 </div>
 
+{% if not closed %}
 <div id="reconcile-queue">
   {# --- To-confirm cards: the core interaction. Both sides side by side, the
      vendor similarity (NOT a match confidence), the report reason verbatim.
@@ -138,6 +142,7 @@
   </div>
   {% endfor %}
 </div>
+{% endif %}{# not closed — the interactive queue is suppressed on a closed period #}
 
 {% if open_count == 0 %}
 <p class="empty-state">

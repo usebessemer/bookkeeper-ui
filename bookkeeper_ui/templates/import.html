@@ -1,6 +1,14 @@
 {% extends "base.html" %}
+{% from "_closed_banner.html" import closed_banner %}
 {% block title %}Import — Bookkeeper{% endblock %}
 {% block content %}
+
+{% if closed_banners %}
+{# Every signed-closed period, so the human knows an import touching one will be
+   refused (the closed-period import guard refuses the whole upload). #}
+{% for b in closed_banners %}{{ closed_banner(b.period, b.signed_at, b.signed_by) }}{% endfor %}
+{% endif %}
+
 <h1>Import transactions</h1>
 <p class="lead">
   Upload a CSV or JSON of transactions. The agent then proposes a chart-of-accounts

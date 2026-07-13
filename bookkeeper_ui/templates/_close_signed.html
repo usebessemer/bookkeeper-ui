@@ -1,0 +1,105 @@
+{# The signed close, rendered from the STORED close record — a read of the durable
+   snapshot (issue D), never a recompute. `record` is the close-record wire dict
+   (`schemas._close_record_out`): every figure — the checklist verdicts, the
+   per-transaction final state, the tax / reconciliation / anomaly snapshots, the
+   summary — was captured at sign time, so a later chart / rule / floor / prior-
+   state edit can never rewrite what was signed. Money is exact strings throughout.
+
+   Roots at `#close-screen` so it can swap in as the `POST /ui/sign` success
+   response; it is also what the close screen renders for an already-closed period. #}
+<div id="close-screen" class="close-signed">
+  <div class="result ok signed-head">
+    <p><strong>Period {{ record.period }} is signed closed.</strong>
+       Signed on {{ record.signed_at[:19] }} by {{ record.signed_by }}.
+       This is the durable, self-contained close record &mdash; the truth as
+       signed, not a recomputation.</p>
+    {% if already %}<p>This period was already closed; no second close was written.</p>{% endif %}
+  </div>
+
+  <section class="signed-section">
+    <h2>Close checklist (as signed)</h2>
+    <ul class="framework-checklist">
+      {% for c in record.checklist %}
+      <li class="check {{ 'met' if c.met else 'unmet' }}">
+        <span class="tag check-name">{{ c.name }}</span>
+        <span class="mark">{{ "✓ met" if c.met else "✗ unmet" }}</span>
+        <p class="reason">{{ c.reason }}</p>
+      </li>
+      {% endfor %}
+    </ul>
+  </section>
+
+  <section class="signed-section">
+    <h2>Transactions (as signed)</h2>
+    <table class="ledger">
+      <thead><tr><th>Date</th><th>Vendor</th><th class="amount">Amount</th><th>Account</th><th>By</th></tr></thead>
+      <tbody>
+        {% for t in record.transactions %}
+        <tr>
+          <td>{{ t.date[:10] }}</td>
+          <td>{{ t.vendor }}</td>
+          <td class="amount">${{ t.amount }}</td>
+          <td>{{ t.account }}</td>
+          <td>{{ t.source }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+
+  <section class="signed-section">
+    <h2>Tax (as signed) &mdash; {{ record.tax.regime }}</h2>
+    <table class="ledger">
+      <thead><tr><th>Attribution target</th><th class="amount">Reclaimable</th><th class="amount">Transactions</th></tr></thead>
+      <tbody>
+        {% for t in record.tax.per_target or [] %}
+        <tr>
+          <td>{{ t.attribution_target_id }}</td>
+          <td class="amount">${{ t.reclaimable }}</td>
+          <td class="amount">{{ t.transaction_count }}</td>
+        </tr>
+        {% endfor %}
+        <tr class="total">
+          <td><strong>Period total</strong></td>
+          <td class="amount"><strong>${{ record.tax.period_total }}</strong></td>
+          <td class="amount"></td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="signed-section">
+    <h2>Reconciliation (as signed)</h2>
+    {% if record.reconciliation.waived %}
+    <p>Reconciliation was <strong>waived</strong>{% if record.reconciliation.waived_by %} by {{ record.reconciliation.waived_by }}{% endif %}{% if record.reconciliation.waived_at %} on {{ record.reconciliation.waived_at[:19] }}{% endif %} &mdash; no statement was reconciled.</p>
+    {% else %}
+    <p>Source: {{ record.reconciliation.source }} &mdash;
+       {{ record.reconciliation.matched }} matched,
+       {{ record.reconciliation.to_confirm }} awaiting confirmation,
+       {{ record.reconciliation.gaps }} gap(s).</p>
+    {% endif %}
+  </section>
+
+  <section class="signed-section">
+    <h2>Anomalies (as signed)</h2>
+    {% if record.anomalies %}
+    <ul>
+      {% for a in record.anomalies %}
+      <li>
+        <span class="tag kind">{{ a.kind }}</span>
+        <span class="reason">{{ a.reason }}</span>
+        {% if a.acknowledged_at %}&mdash; acknowledged {{ a.acknowledged_at[:19] }}{% endif %}
+        {% if a.note %}&mdash; <span class="note">{{ a.note }}</span>{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty-state">No anomalies were flagged.</p>
+    {% endif %}
+  </section>
+
+  <p class="prior-note">
+    Struck against prior period {{ record.effective_prior_period_state or "none" }}
+    (config value at sign time: {{ record.config_prior_period_state or "unset" }}).
+  </p>
+</div>

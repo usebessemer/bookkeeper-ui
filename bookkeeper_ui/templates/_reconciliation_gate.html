@@ -1,0 +1,30 @@
+{# App gate C — the period has a statement to reconcile against, or a recorded
+   waiver. `reconciliation_source` is one of `statement` / `waived` / `missing`;
+   `period` comes from the enclosing screen. Rooted at `#reconciliation-gate` so
+   the waive control's htmx swap (and the waived re-render) can replace it.
+
+   Rendered both in the close screen's app-policy block and as the
+   `POST /ui/reconciliation/waive` response (re-rendered as `waived` — never
+   "reconciled"). The waive control shows ONLY when `missing` (zero statement
+   lines, no waiver): a present statement is reconciled, never waived. #}
+<div id="reconciliation-gate" class="gate {{ 'met' if reconciliation_source != 'missing' else 'unmet' }}">
+  <span class="tag gate-name">statement or waiver</span>
+  {% if reconciliation_source == "statement" %}
+  <span class="mark">✓ met</span>
+  <span class="detail">reconciled against the imported statement</span>
+  {% elif reconciliation_source == "waived" %}
+  <span class="mark">✓ met</span>
+  <span class="detail">reconciliation waived for this period</span>
+  {% else %}
+  <span class="mark">✗ unmet</span>
+  <span class="detail">no statement imported for {{ period }}</span>
+  <form class="waive" hx-post="/ui/reconciliation/waive" hx-target="#reconciliation-gate" hx-swap="outerHTML">
+    <input type="hidden" name="period" value="{{ period }}">
+    <input type="hidden" name="waived_by" value="owner">
+    <label>Why (optional)
+      <input type="text" name="note" placeholder="No bank feed this quarter">
+    </label>
+    <button type="submit">Close this period without statement reconciliation</button>
+  </form>
+  {% endif %}
+</div>
