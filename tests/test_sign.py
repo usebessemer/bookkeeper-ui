@@ -809,3 +809,54 @@ async def test_raw_float_money_is_refused_on_the_close_store_write():
         store = FileCloseStore(Path(d) / "closes.jsonl")
         with pytest.raises(TypeError):
             await store.record(_raw_record(tax={"period_total": 6.50}))
+
+
+# ============================================================================
+# Refinement #3 (belt) + #2 (D4 ordering) — regression pins added at lead review
+# ============================================================================
+
+
+async def test_close_record_out_stringifies_a_raw_decimal_on_the_wire():
+    """Refinement #3 belt: even if a raw `Decimal` slipped past build_close_record's
+    stringification into a snapshot payload, `CloseRecordOut` (the /sign response_model)
+    renders it as an exact STRING — never FastAPI's lossy float. Guards against a future
+    refactor to a raw-dict response silently reintroducing the money-as-float bug."""
+    from bookkeeper_ui.schemas import CloseRecordOut
+
+    record = CloseRecord(
+        period=PERIOD, signed_at=AT, signed_by="owner",
+        checklist=[], transactions=[{"amount": Decimal("100.00")}],
+        tax={"period_total": Decimal("82.50"), "per_target": [{"reclaimable": Decimal("5.00")}]},
+        reconciliation={}, anomalies=[],
+        effective_prior_period_state=None, config_prior_period_state=None,
+    )
+    wire = CloseRecordOut.from_record(record).model_dump(mode="json")
+    assert wire["tax"]["period_total"] == "82.50"
+    assert isinstance(wire["tax"]["period_total"], str)
+    assert isinstance(wire["tax"]["per_target"][0]["reclaimable"], str)
+    assert isinstance(wire["transactions"][0]["amount"], str)
+    _no_money_float(wire)
+
+
+async def test_effective_prior_is_latest_not_first_close_on_a_forward_jump(examples_dir, tmp_path):
+    """Refinement #2 (D4 ordering tripwire): the effective prior must be the LATEST
+    (strictly-after max) signed close, not the first. Sign 2026-Q2 then 2026-Q4 (skipping
+    Q3); a Q3 close is then blocked by the framework's period_closeable against the latest
+    close Q4 — whereas if the effective-prior read the FIRST close (Q2), Q3 (> Q2) would
+    wrongly read signable. A monotone-consecutive walk (the AC8 test) cannot distinguish
+    latest from first; this forward jump does."""
+    h = _harness(examples_dir, tmp_path)
+    await _make_signable(h, "2026-Q2")
+    assert (await _sign(h.app, "2026-Q2")).status_code == 200
+    await _make_signable(h, "2026-Q4")
+    assert (await _sign(h.app, "2026-Q4")).status_code == 200
+    assert (await h.close_store.latest()).period == "2026-Q4"
+
+    await _make_signable(h, "2026-Q3")
+    q3 = await _sign(h.app, "2026-Q3")
+    assert q3.status_code == 409  # Q3 is at/before the latest close Q4 → blocked
+    detail = q3.json()["detail"]
+    pc = {c["name"]: c for c in detail["framework"]["checklist"]}["period_closeable"]
+    assert pc["met"] is False
+    assert detail["effective_prior_period_state"] == "2026-Q4"  # latest, not first (Q2)
+    assert "2026-Q3" not in await h.close_store.by_period()  # nothing appended
