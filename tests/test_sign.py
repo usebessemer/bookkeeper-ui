@@ -60,6 +60,7 @@ from bookkeeper_ui.reconciliations import (
 )
 from bookkeeper_ui.schemas import CloseRecordOut
 from bookkeeper_ui.statement_store import FileStatementStore, statement_line_key
+from bookkeeper_ui.views import build_close_record, build_close_review
 from bookkeeper_ui.waivers import FileWaiverStore, Waiver
 from bookkeeper.skills.flag_anomaly import flag_anomaly
 from tests.conftest import make_stmt_line, make_txn
@@ -836,6 +837,61 @@ async def test_close_record_out_stringifies_a_raw_decimal_on_the_wire():
     assert isinstance(wire["tax"]["per_target"][0]["reclaimable"], str)
     assert isinstance(wire["transactions"][0]["amount"], str)
     _no_money_float(wire)
+
+
+async def test_build_close_record_stringifies_tax_money_at_construction(harness: Harness):
+    """D3 spec pin (refinement #3, undefended): `build_close_record` stringifies tax
+    money **at construction** — not only via the downstream `CloseRecordOut` / store
+    `_jsonable` nets. On the freshly-built record the tax `period_total` + per-target
+    `reclaimable` are already exact `str`s, equal to the store read-back.
+
+    Bites if the at-construction `str()` on `views.build_close_record` (L849/854) is
+    dropped: a raw `Decimal` is neither a `str` nor `== '6.10'`, and no longer equals
+    the (re-stringified) round-trip — the build-equals-read-back invariant the spec
+    mandates. The full suite otherwise misses this: wire + disk stay correct because
+    `CloseRecordOut` and `_jsonable` re-stringify downstream. 6.10 also float-corrupts
+    (`str(float(Decimal('6.10')))` == '6.1'), so a `str(float())` variant trips too."""
+    # A signable AWS close (tax 6.10 → target-001) — under the 1000 floor, confirmed,
+    # waived: framework READY + all three gates, so build_close_record is reachable.
+    txn = make_txn(vendor="AWS", amount="50.00", tax="6.10", date=_date_in(PERIOD), description="cloud")
+    await harness.ledger_store.store(txn)
+    await harness.confirmation_store.record(
+        Confirmation(transaction_id=transaction_key(txn), account="5100-software-subscriptions",
+                     source=SOURCE_HUMAN, decided_at=AT)
+    )
+    await harness.waiver_store.record(Waiver(period=PERIOD, waived_at=AT, waived_by="human", note="no feed"))
+
+    review = await build_close_review(
+        config=harness.config,
+        ledger_store=harness.ledger_store,
+        confirmation_store=harness.confirmation_store,
+        statement_store=harness.statement_store,
+        reconciliation_store=harness.reconciliation_store,
+        close_store=harness.close_store,
+        anomaly_review_store=harness.anomaly_review_store,
+        waiver_store=harness.waiver_store,
+        period=PERIOD,
+    )
+    assert review.signable is True
+
+    record = await build_close_record(
+        review=review, waiver_store=harness.waiver_store, signed_by="owner", signed_at=AT,
+    )
+
+    # AT CONSTRUCTION: money is already an exact string — no downstream net involved.
+    assert record.tax["period_total"] == "6.10"
+    assert isinstance(record.tax["period_total"], str)
+    (target,) = record.tax["per_target"]
+    assert target["reclaimable"] == "6.10"
+    assert isinstance(target["reclaimable"], str)
+
+    # Build-equals-read-back: the in-memory record's money equals the store round-trip.
+    # (`_jsonable` would re-stringify a stray Decimal — so this must already hold BEFORE
+    # that net, which only the at-construction str() guarantees.)
+    await harness.close_store.record(record)
+    (stored,) = await harness.close_store.all()
+    assert stored.tax["period_total"] == record.tax["period_total"]
+    assert stored.tax["per_target"][0]["reclaimable"] == record.tax["per_target"][0]["reclaimable"]
 
 
 async def test_effective_prior_is_latest_not_first_close_on_a_forward_jump(examples_dir, tmp_path):

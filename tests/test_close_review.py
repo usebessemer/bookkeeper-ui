@@ -594,6 +594,27 @@ async def test_all_money_is_string_including_delta(harness: Harness):
     _no_money_float(body)
 
 
+async def test_get_close_tax_money_survives_float_roundtrip_exactly(harness: Harness):
+    """A tax total whose float round-trip corrupts it (6.10 → 6.1) renders EXACT on
+    GET /close — biting a planted `float()` on the `TaxSummaryOut` render path that
+    the isinstance-str / no-float pins (`test_all_money_is_string_including_delta`)
+    miss: `str(float(Decimal('6.10')))` == '6.1' is a lossy *string* those pins accept.
+
+    HstRegime sets reclaimable = the transaction's exact `tax` Decimal, so an AWS txn
+    with tax 6.10 (attribution target-001, non-ambiguous) totals target reclaimable and
+    the period total to Decimal('6.10'). `str()` renders '6.10'; a `float()` on either
+    the `period_total` (L613) or `reclaimable` (L617) render → '6.1', tripping this."""
+    await harness.ledger_store.store(
+        make_txn(vendor="AWS", amount="50.00", tax="6.10", date=datetime(2026, 5, 1), description="cloud")
+    )
+    body = (await _get_close(harness.app)).json()
+
+    assert body["tax"]["period_total"] == "6.10"  # exact — a float() renders '6.1'
+    target = [t for t in body["tax"]["per_target"] if t["attribution_target_id"] == "target-001"]
+    assert len(target) == 1
+    assert target[0]["reclaimable"] == "6.10"  # exact per-target reclaimable, not '6.1'
+
+
 # ============================================================================
 # AC9 — one projection: per-transaction status derives from build_ledger
 # ============================================================================
