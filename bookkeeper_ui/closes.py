@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -89,6 +89,11 @@ class CloseRecord:
     - `tax` — the `track_tax` summary snapshot;
     - `reconciliation` — the effective reconciliation snapshot;
     - `anomalies` — the period's anomaly flags + their review disposition;
+    - `summary` — the disposition counts: the framework `PeriodSummary`
+      (`processed`/`auto_filed`/`reviewed`/`open`, snapshotted as-is — its v1
+      approximation and all) alongside the app-truth per-transaction disposition
+      read from `build_ledger`, so both the framework tally and the app's are on
+      the trail, neither fabricated (issue D populates it; defaults to `{}`);
     - `effective_prior_period_state` — the prior-period label the close was struck
       against (the D4 effective substitution), and `config_prior_period_state` —
       the config's raw `prior_period_state` at sign time, kept for the trail.
@@ -115,6 +120,10 @@ class CloseRecord:
     anomalies: tuple[Mapping[str, object], ...]
     effective_prior_period_state: str | None
     config_prior_period_state: str | None
+    # The disposition counts (framework `PeriodSummary` + app-truth). Optional with
+    # an empty default so the issue-A/B/C call sites that predate it keep working;
+    # issue D's sign path populates it.
+    summary: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Freeze the multi-item payloads to tuples, so a record is an immutable
@@ -140,6 +149,7 @@ def _to_record(close: CloseRecord) -> dict[str, object]:
         "tax": _jsonable(close.tax),
         "reconciliation": _jsonable(close.reconciliation),
         "anomalies": _jsonable(list(close.anomalies)),
+        "summary": _jsonable(close.summary),
         "effective_prior_period_state": close.effective_prior_period_state,
         "config_prior_period_state": close.config_prior_period_state,
     }
@@ -166,6 +176,7 @@ def _from_record(record: dict[str, object]) -> CloseRecord:
         tax=dict(record.get("tax") or {}),  # type: ignore[arg-type]
         reconciliation=dict(record.get("reconciliation") or {}),  # type: ignore[arg-type]
         anomalies=tuple(record.get("anomalies") or ()),  # type: ignore[arg-type]
+        summary=dict(record.get("summary") or {}),  # type: ignore[arg-type]
         effective_prior_period_state=_opt_str(record.get("effective_prior_period_state")),
         config_prior_period_state=_opt_str(record.get("config_prior_period_state")),
     )

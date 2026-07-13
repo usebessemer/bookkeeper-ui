@@ -821,8 +821,8 @@ def _close_record_out(record: "CloseRecord") -> dict[str, object]:
     """Serialize a stored `CloseRecord` to its wire dict (the signed snapshot).
 
     The record's snapshot payloads are already JSON-native with money pre-stringified
-    (the close store's discipline), so they pass through verbatim; only the
-    `signed_at` datetime is rendered ISO 8601.
+    (the close store's discipline — and issue D's in-memory sign path mirrors it), so
+    they pass through verbatim; only the `signed_at` datetime is rendered ISO 8601.
     """
     return {
         "period": record.period,
@@ -833,9 +833,60 @@ def _close_record_out(record: "CloseRecord") -> dict[str, object]:
         "tax": dict(record.tax),
         "reconciliation": dict(record.reconciliation),
         "anomalies": [dict(a) for a in record.anomalies],
+        "summary": dict(record.summary),
         "effective_prior_period_state": record.effective_prior_period_state,
         "config_prior_period_state": record.config_prior_period_state,
     }
+
+
+class CloseRecordOut(BaseModel):
+    """A signed `CloseRecord` on the wire — `POST /sign`'s response (the D3 snapshot).
+
+    The durable, self-contained record echoed back after a period is signed. Its
+    nested payloads (`checklist` / `transactions` / `tax` / `reconciliation` /
+    `anomalies` / `summary`) are typed `object` maps carrying the snapshot verbatim;
+    the sign path builds them **pre-stringified** (money as exact-`Decimal` strings,
+    datetimes ISO 8601, sequences as lists) so the returned record is byte-equal to
+    the one the store reads back.
+
+    **Money discipline (why a pydantic model, not a raw dict).** A raw-dict route
+    response goes through FastAPI's `jsonable_encoder`, which coerces a `Decimal` to
+    a lossy JSON **float** — the exact money bug the slice forbids. Serializing
+    through this model instead renders any `Decimal` value inside the `object` maps
+    as its exact **string**, so even a payload that slipped a raw `Decimal` past the
+    sign path's stringification still lands on the wire as an exact string, never a
+    number (the refinement-#3 belt-and-suspenders).
+    """
+
+    period: str
+    signed_at: str = Field(description="ISO 8601 sign-off time (UTC).")
+    signed_by: str
+    checklist: list[dict[str, object]]
+    transactions: list[dict[str, object]]
+    tax: dict[str, object]
+    reconciliation: dict[str, object]
+    anomalies: list[dict[str, object]]
+    summary: dict[str, object]
+    effective_prior_period_state: str | None = None
+    config_prior_period_state: str | None = None
+
+    @classmethod
+    def from_record(cls, record: "CloseRecord") -> "CloseRecordOut":
+        return cls(**_close_record_out(record))
+
+
+class SignRequest(BaseModel):
+    """A §5.7 human sign-off request: which period, and (optionally) who signed.
+
+    `period` is client-supplied free text — the sign handler validates it up front
+    (a well-formed quarterly ``YYYY-Qn`` label with ≥1 ledger transaction) before any
+    composition, and re-verifies the whole close server-side (never trusting client
+    state). `signed_by` defaults to ``"owner"`` (single-user local — a label, not an
+    identity).
+    """
+
+    period: str
+    signed_by: str | None = None
 
 
 # --- Slice 3: the thin write shapes (issue C) --------------------------------
