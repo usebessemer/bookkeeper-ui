@@ -1,7 +1,11 @@
 {% extends "base.html" %}
+{% from "_closed_banner.html" import closed_banner %}
 {% block title %}Ledger — Bookkeeper{% endblock %}
 {% block content %}
 <h1>Categorized ledger &mdash; {{ period }}</h1>
+
+{% if closed %}{{ closed_banner(period, signed_at, signed_by) }}{% endif %}
+
 <p class="lead">
   {{ confirmed | length }} confirmed &middot; <strong>{{ pending }}</strong> still pending{% if total %} of {{ total }} in this period{% endif %}.
   {% if pending %}<a href="/ui/queue?period={{ period }}">Review the queue &rarr;</a>{% endif %}

@@ -48,8 +48,14 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from bookkeeper.config import BookkeeperConfig
+from bookkeeper.skills.flag_anomaly import flag_anomaly
+from bookkeeper.skills.track_tax import UnknownTaxRegime
 
-from bookkeeper_ui.anomaly_reviews import FileAnomalyReviewStore
+from bookkeeper_ui.anomaly_reviews import (
+    AnomalyReview,
+    FileAnomalyReviewStore,
+    derive_flag_id,
+)
 from bookkeeper_ui.closes import (
     FileCloseStore,
     closed_import_refusal,
@@ -59,8 +65,8 @@ from bookkeeper_ui.closes import (
 )
 from bookkeeper_ui.confirmations import SOURCE_HUMAN, Confirmation, FileConfirmationStore
 from bookkeeper_ui.importer import TransactionImportError, import_bytes
-from bookkeeper_ui.ledger_store import FileLedgerStore
-from bookkeeper_ui.periods import period_of
+from bookkeeper_ui.ledger_store import FileLedgerStore, transaction_key
+from bookkeeper_ui.periods import is_quarterly_period, period_of
 from bookkeeper_ui.reconciliations import (
     NOTE_REQUIRED_DECISIONS,
     PAIR_DECISIONS,
@@ -68,11 +74,22 @@ from bookkeeper_ui.reconciliations import (
     FileReconciliationStore,
     Reconciliation,
 )
+from bookkeeper_ui.schemas import (
+    AnomalyOut,
+    CloseRecordOut,
+    CloseReviewOut,
+    TransactionOut,
+)
 from bookkeeper_ui.statement_importer import StatementImportError
 from bookkeeper_ui.statement_importer import import_bytes as import_statement_bytes
 from bookkeeper_ui.statement_store import FileStatementStore
-from bookkeeper_ui.views import build_ledger, build_reconciliation
-from bookkeeper_ui.waivers import FileWaiverStore
+from bookkeeper_ui.views import (
+    build_close_record,
+    build_close_review,
+    build_ledger,
+    build_reconciliation,
+)
+from bookkeeper_ui.waivers import FileWaiverStore, Waiver
 
 _HERE = Path(__file__).resolve().parent
 TEMPLATES_DIR = _HERE / "templates"
@@ -115,13 +132,23 @@ def register_ui(
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
     @app.get("/", response_class=HTMLResponse, summary="Import screen (home)")
-    async def home(request: Request) -> HTMLResponse:
+    async def home(request: Request, period: str = _DEFAULT_PERIOD) -> HTMLResponse:
         """The import screen: upload a transactions and/or a statement file, choose
-        the period to review."""
+        the period to review.
+
+        Surfaces a closed banner for **every** signed-closed period (an import
+        touching a closed period is refused whole), read from the one closed-period
+        truth `close_store.by_period()`. `period` only pre-fills the form / carries
+        the nav context; the store still derives each row's real period from its date.
+        """
+        closed_banners = [
+            {"period": p, "signed_at": r.signed_at.isoformat(), "signed_by": r.signed_by}
+            for p, r in sorted((await close_store.by_period()).items())
+        ] if close_store is not None else []
         return templates.TemplateResponse(
             request,
             "import.html",
-            {"default_period": _DEFAULT_PERIOD},
+            {"default_period": period, "closed_banners": closed_banners},
         )
 
     @app.post("/ui/import", response_class=HTMLResponse, summary="Handle a transactions upload (htmx)")
@@ -267,6 +294,7 @@ def register_ui(
             ledger_store=ledger_store,
             confirmation_store=confirmation_store,
             period=period,
+            close_store=close_store,
         )
         pending = [e for e in ledger.entries if e.status != "confirmed"]
         return templates.TemplateResponse(
@@ -277,6 +305,11 @@ def register_ui(
                 "entries": pending,
                 "chart_of_accounts": config.chart_of_accounts,
                 "total": len(ledger.entries),
+                # The period-level close standing (issue B's LedgerOut fields) — the
+                # banner + control suppression when the period is signed closed.
+                "closed": ledger.closed,
+                "signed_at": ledger.signed_at,
+                "signed_by": ledger.signed_by,
             },
         )
 
@@ -378,6 +411,10 @@ def register_ui(
         open_count = sum(1 for p in view.to_confirm if p.status == "to_confirm") + sum(
             1 for g in view.gaps if g.status == "gap_open"
         )
+        # The period-level close standing — the reconcile view carries no `closed`
+        # field, so read the one closed-period truth directly (the banner + the
+        # interactive-queue suppression on a signed-closed period).
+        record = (await close_store.by_period()).get(period) if close_store is not None else None
         return templates.TemplateResponse(
             request,
             "reconcile.html",
@@ -390,6 +427,9 @@ def register_ui(
                 "open_count": open_count,
                 "date_window": config.reconcile_date_window(),
                 "vendor_floor": config.reconcile_vendor_threshold(),
+                "closed": record is not None,
+                "signed_at": record.signed_at.isoformat() if record is not None else None,
+                "signed_by": record.signed_by if record is not None else None,
             },
         )
 
@@ -544,6 +584,7 @@ def register_ui(
             period=period,
             statement_store=statement_store,
             reconciliation_store=reconciliation_store,
+            close_store=close_store,
         )
         confirmed = [e for e in ledger.entries if e.status == "confirmed"]
         pending = sum(1 for e in ledger.entries if e.status != "confirmed")
@@ -573,5 +614,281 @@ def register_ui(
                 "pending": pending,
                 "total": len(ledger.entries),
                 "reconcile_summary": reconcile_summary,
+                # The period-level close standing (issue B's LedgerOut fields).
+                "closed": ledger.closed,
+                "signed_at": ledger.signed_at,
+                "signed_by": ledger.signed_by,
             },
+        )
+
+    # --- Slice 3: the close-review screen + its htmx write twins (issue E). The
+    # human surface over the composition (issue B) and the write endpoints (C: the
+    # anomaly ack + the waiver; D: the sign). `GET /ui/close` renders the SAME
+    # `views.build_close_review` projection the JSON `GET /close` serializes (one
+    # projection, no second computation). Each write twin renders a 2xx partial with
+    # a human-readable refusal in place of the control (the Slice-1 convention: the
+    # JSON C/D twins keep the machine 4xx); the server re-verifies + guards exactly
+    # as those JSON twins do — the disabled/absent control is a convenience, the
+    # server stays the enforcer.
+
+    @app.get("/ui/close", response_class=HTMLResponse, summary="The close-review screen")
+    async def ui_close(request: Request, period: str = _DEFAULT_PERIOD) -> HTMLResponse:
+        """The close-review screen for `period` — the live framework checklist, tax,
+        anomalies, and app gates, or the stored signed snapshot for a closed period.
+
+        Reads `views.build_close_review` and serializes it with the *same*
+        `CloseReviewOut.from_review` the JSON `GET /close` uses, so HTML and JSON
+        render identical state (AC2). An unregistered `tax_regime` makes `track_tax`
+        fail fast (`UnknownTaxRegime`); it is rendered into the page as an error (the
+        Slice-1 error-into-the-page rule), never a 500.
+        """
+        try:
+            review = await build_close_review(
+                config=config,
+                ledger_store=ledger_store,
+                confirmation_store=confirmation_store,
+                statement_store=statement_store,
+                reconciliation_store=reconciliation_store,
+                close_store=close_store,
+                anomaly_review_store=anomaly_review_store,
+                waiver_store=waiver_store,
+                period=period,
+            )
+        except UnknownTaxRegime as exc:
+            return templates.TemplateResponse(
+                request, "close.html", {"period": period, "error": str(exc)}
+            )
+        return templates.TemplateResponse(
+            request,
+            "close.html",
+            {"period": period, "close": CloseReviewOut.from_review(review)},
+        )
+
+    @app.post(
+        "/ui/anomalies/review",
+        response_class=HTMLResponse,
+        summary="Acknowledge one anomaly flag (htmx)",
+    )
+    async def ui_anomalies_review(
+        request: Request,
+        flag_id: str = Form(...),
+        period: str = Form(_DEFAULT_PERIOD),
+        note: str = Form(""),
+    ) -> HTMLResponse:
+        """Record one anomaly acknowledgment, then re-render the card as acknowledged.
+
+        The form twin of JSON `POST /anomalies/review`, with the identical guards —
+        a **closed** period (its dispositions are frozen) and a `flag_id` matching no
+        **current** flag (a changed flag derives a new id) — each rendered as a 200
+        refusal partial in place of the card, rather than the JSON 409/422. The flag
+        id is derived with issue A's exact recipe (`derive_flag_id`), so the ack lands
+        on the same gate-B linkage the JSON twin feeds.
+        """
+        if anomaly_review_store is None:
+            return templates.TemplateResponse(
+                request,
+                "_close_refusal.html",
+                {"message": "the anomaly-review store is not configured on this server."},
+            )
+        if period in await closed_periods(close_store):
+            return templates.TemplateResponse(
+                request,
+                "_close_refusal.html",
+                {"message": f"period {period} is closed — its anomaly dispositions are frozen (§5.7)."},
+            )
+
+        # The current flag set — `flag_anomaly` called as-is (read-only), keyed by the
+        # app-derived id (A's exact recipe). A stale/unknown id is refused into the page.
+        report = await flag_anomaly(ledger_store, config, period)
+        flags_by_id = {derive_flag_id(flag): flag for flag in report.flags}
+        flag = flags_by_id.get(flag_id)
+        if flag is None:
+            return templates.TemplateResponse(
+                request,
+                "_close_refusal.html",
+                {"message": (
+                    f"flag {flag_id} matches no current anomaly for {period} — it may "
+                    f"have changed. Reload the close review and acknowledge again."
+                )},
+            )
+
+        review = AnomalyReview(
+            flag_id=flag_id,
+            kind=flag.kind.value,
+            reason=flag.reason,
+            transaction_ids=tuple(transaction_key(t) for t in flag.transactions),
+            note=note.strip() or None,
+            acknowledged_at=datetime.now(timezone.utc),
+            source=SOURCE_HUMAN,
+        )
+        await anomaly_review_store.record(review)
+
+        acknowledged = AnomalyOut(
+            id=flag_id,
+            kind=flag.kind.value,
+            reason=flag.reason,
+            transactions=[TransactionOut.from_model(t) for t in flag.transactions],
+            acknowledged=True,
+            acknowledged_at=review.acknowledged_at.isoformat(),
+            note=review.note,
+        )
+        return templates.TemplateResponse(
+            request, "_anomaly_card.html", {"a": acknowledged, "period": period}
+        )
+
+    @app.post(
+        "/ui/reconciliation/waive",
+        response_class=HTMLResponse,
+        summary="Waive reconciliation for a no-statement period (htmx)",
+    )
+    async def ui_reconciliation_waive(
+        request: Request,
+        period: str = Form(_DEFAULT_PERIOD),
+        waived_by: str = Form("owner"),
+        note: str = Form(""),
+    ) -> HTMLResponse:
+        """Record one reconciliation waiver, then re-render the gate block as waived.
+
+        The form twin of JSON `POST /reconciliation/waive`, with the identical guards
+        — a **closed** period and a period with a **statement on file** (never
+        waivable: reconcile it) — each rendered as a 200 refusal partial rather than
+        the JSON 409. After waiving, the gate renders as *waived* (never "reconciled").
+        """
+        if waiver_store is None:
+            return templates.TemplateResponse(
+                request,
+                "_close_refusal.html",
+                {"message": "the waiver store is not configured on this server."},
+            )
+        if period in await closed_periods(close_store):
+            return templates.TemplateResponse(
+                request,
+                "_close_refusal.html",
+                {"message": f"period {period} is closed — it cannot be waived (§5.7)."},
+            )
+        if await statement_store.fetch_statement(period):
+            return templates.TemplateResponse(
+                request,
+                "_close_refusal.html",
+                {"message": (
+                    f"period {period} has a statement on file — a present statement is "
+                    f"never waivable; reconcile it rather than waiving it."
+                )},
+            )
+
+        waiver = Waiver(
+            period=period,
+            waived_at=datetime.now(timezone.utc),
+            waived_by=waived_by.strip() or "owner",
+            note=note.strip() or None,
+        )
+        await waiver_store.record(waiver)
+        return templates.TemplateResponse(
+            request,
+            "_reconciliation_gate.html",
+            {"reconciliation_source": "waived", "period": period},
+        )
+
+    @app.post("/ui/sign", response_class=HTMLResponse, summary="Sign the period closed (htmx)")
+    async def ui_sign(
+        request: Request,
+        period: str = Form(_DEFAULT_PERIOD),
+        signed_by: str = Form("owner"),
+    ) -> HTMLResponse:
+        """Sign `period` closed, then render the signed close (or the refusal).
+
+        The form twin of JSON `POST /sign`, with the identical load-bearing order —
+        the period precondition (a well-formed quarterly label with ≥1 ledger txn)
+        and the closed-period guard **before** any composition, then in-handler
+        re-verification via the *same* `build_close_review` and the three app gates.
+        On a not-signable period the screen re-renders enumerating the failed gates
+        (server-enforced); on pass it appends **exactly one** durable close record
+        and renders the signed snapshot. Refusals are 200 partials; the JSON twin
+        keeps the machine 4xx.
+        """
+        if close_store is None:
+            return templates.TemplateResponse(
+                request,
+                "_close_refusal.html",
+                {"message": "the close store is not configured on this server."},
+            )
+
+        # 1. Period precondition — before any composition (a garbage/empty label under
+        # an unset prior would append a close the effective-prior read cannot order).
+        if not is_quarterly_period(period):
+            return templates.TemplateResponse(
+                request,
+                "_close_refusal.html",
+                {"message": (
+                    f"period {period!r} is not a well-formed quarterly label (YYYY-Qn) "
+                    f"— a close is never signed under a label the prior-period guard "
+                    f"cannot order."
+                )},
+            )
+        if not await ledger_store.fetch_for_period(period):
+            return templates.TemplateResponse(
+                request,
+                "_close_refusal.html",
+                {"message": (
+                    f"period {period} has no ledger transactions — there is nothing to "
+                    f"close. Import and confirm the period's transactions before signing."
+                )},
+            )
+
+        # 2. Closed-period guard — before trusting the composition. An already-closed
+        # period renders its stored signed snapshot (never a second close row).
+        if period in await closed_periods(close_store):
+            record = (await close_store.by_period())[period]
+            return templates.TemplateResponse(
+                request,
+                "_close_signed.html",
+                {
+                    "record": CloseRecordOut.from_record(record).model_dump(),
+                    "period": period,
+                    "already": True,
+                },
+            )
+
+        # 3. In-handler re-verification — the same projection the review screen reads.
+        try:
+            review = await build_close_review(
+                config=config,
+                ledger_store=ledger_store,
+                confirmation_store=confirmation_store,
+                statement_store=statement_store,
+                reconciliation_store=reconciliation_store,
+                close_store=close_store,
+                anomaly_review_store=anomaly_review_store,
+                waiver_store=waiver_store,
+                period=period,
+            )
+        except UnknownTaxRegime as exc:
+            return templates.TemplateResponse(
+                request, "_close_refusal.html", {"message": str(exc)}
+            )
+
+        if not review.signable:
+            # Re-render the screen enumerating exactly which checks/gates are unmet.
+            return templates.TemplateResponse(
+                request,
+                "_close_screen.html",
+                {
+                    "period": period,
+                    "close": CloseReviewOut.from_review(review),
+                    "sign_attempted": True,
+                },
+            )
+
+        # 4. On pass — append exactly one self-contained close record and render it.
+        record = await build_close_record(
+            review=review,
+            waiver_store=waiver_store,
+            signed_by=signed_by.strip() or "owner",
+            signed_at=datetime.now(timezone.utc),
+        )
+        await close_store.record(record)
+        return templates.TemplateResponse(
+            request,
+            "_close_signed.html",
+            {"record": CloseRecordOut.from_record(record).model_dump(), "period": period},
         )

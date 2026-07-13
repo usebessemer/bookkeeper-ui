@@ -1,0 +1,185 @@
+{# The live close-review composition + the acknowledge / waive / sign controls.
+   Roots at `#close-screen` so the SIGN form's htmx swap (and a not-signable
+   re-render) can replace the whole screen with `hx-swap="outerHTML"`.
+
+   `close` is a `CloseReviewOut` (the serialized `build_close_review` projection).
+   The framework checklist + every blocker render VERBATIM (issue B computed them;
+   E never re-words or re-derives). The app gates render under their own "app
+   policy" heading — a load-bearing visual separation: the checklist the screen
+   shows is really the framework's; the extra strictness is visibly the app's.
+
+   `sign_attempted` is set when a SIGN was refused server-side (not signable): the
+   screen re-renders with a refusal banner enumerating exactly what is unmet — the
+   server is the enforcer, the disabled button is only a convenience. #}
+<div id="close-screen">
+
+  {% if sign_attempted and not close.signable %}
+  <div class="result error sign-refusal">
+    <p><strong>This period is not ready to sign.</strong> The server refused the
+       sign-off &mdash; resolve the unmet requirements below, then sign again:</p>
+    <ul>
+      {% for c in close.framework.checklist if not c.met %}
+      <li>Framework check <code>{{ c.name }}</code> is unmet.</li>
+      {% endfor %}
+      {% if not close.app_gates.all_confirmed.met %}
+      <li>App policy: {{ close.app_gates.all_confirmed.pending_count }} transaction(s) still pending confirmation.</li>
+      {% endif %}
+      {% if not close.app_gates.anomalies_reviewed.met %}
+      <li>App policy: {{ close.app_gates.anomalies_reviewed.unacknowledged_count }} anomaly flag(s) not yet acknowledged.</li>
+      {% endif %}
+      {% if not close.app_gates.statement_or_waiver.met %}
+      <li>App policy: no statement imported and reconciliation not waived.</li>
+      {% endif %}
+    </ul>
+  </div>
+  {% endif %}
+
+  {# --- The framework close checklist, verbatim (the five close_period checks +
+     every blocker). This section carries ONLY the framework's own checklist — the
+     app gates live in their own section below (issue E's app-policy separation). #}
+  <section class="framework-close">
+    <h2>Framework close checklist</h2>
+    <p class="lead">
+      <span class="tag status-{{ close.framework.status }}">{{ close.framework.status }}</span>
+      &mdash; the framework <code>close_period</code> verdict over this period's
+      effective reports.
+    </p>
+    <ul class="framework-checklist">
+      {% for c in close.framework.checklist %}
+      <li class="check {{ 'met' if c.met else 'unmet' }}">
+        <span class="tag check-name">{{ c.name }}</span>
+        <span class="mark">{{ "✓ met" if c.met else "✗ unmet" }}</span>
+        <p class="reason">{{ c.reason }}</p>
+      </li>
+      {% endfor %}
+    </ul>
+
+    {% if close.framework.blockers %}
+    <div class="blockers">
+      <h3>Blockers</h3>
+      <ul>
+        {% for b in close.framework.blockers %}
+        <li class="blocker">
+          <span class="tag check-name">{{ b.check }}</span>
+          <span class="reason">{{ b.reason }}</span>
+          {% if b.item %}{% set it = b.item %}
+          <span class="item">
+            {% if it.type in ("category_flag", "tax_flag") %}
+              {{ it.transaction.vendor }} ${{ it.transaction.amount }} on {{ it.transaction.date[:10] }}
+            {% elif it.type == "pair_to_confirm" %}
+              {{ it.transaction.vendor }} &harr; {{ it.statement_line.statement_ref }} (${{ it.transaction.amount }})
+            {% elif it.type == "reconciliation_gap" %}
+              {{ it.kind }}{% if it.transaction %} &mdash; {{ it.transaction.vendor }} ${{ it.transaction.amount }}{% endif %}{% if it.statement_line %} &mdash; {{ it.statement_line.statement_ref }} ${{ it.statement_line.amount }}{% endif %}{% if it.delta %} (delta {{ it.delta }}){% endif %}
+            {% endif %}
+          </span>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+  </section>
+
+  {# --- The tax summary block: per-target reclaimable + the period total, and any
+     tax exceptions the regime held out (§5.3). Money is exact strings throughout. #}
+  <section class="tax-summary">
+    <h2>Tax summary &mdash; {{ close.tax.regime }}</h2>
+    <table class="ledger">
+      <thead><tr><th>Attribution target</th><th class="amount">Reclaimable</th><th class="amount">Transactions</th></tr></thead>
+      <tbody>
+        {% for t in close.tax.per_target %}
+        <tr>
+          <td>{{ t.attribution_target_id }}</td>
+          <td class="amount">${{ t.reclaimable }}</td>
+          <td class="amount">{{ t.transaction_count }}</td>
+        </tr>
+        {% endfor %}
+        <tr class="total">
+          <td><strong>Period total</strong></td>
+          <td class="amount"><strong>${{ close.tax.period_total }}</strong></td>
+          <td class="amount"></td>
+        </tr>
+      </tbody>
+    </table>
+    {% if close.tax.flagged %}
+    <div class="tax-flags">
+      <h3>Tax exceptions</h3>
+      <ul>
+        {% for f in close.tax.flagged %}
+        <li>{{ f.transaction.vendor }} ${{ f.transaction.amount }} &mdash; <span class="reason">{{ f.reason }}</span></li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+  </section>
+
+  {# --- The anomalies block: one card per advisory `flag_anomaly` flag, each with
+     an Acknowledge control (gate B). When `materiality_floor` is unset the size
+     check is inactive — state so honestly (the framework skips it entirely; never
+     imply it ran clean). #}
+  <section class="anomalies">
+    <h2>Anomalies</h2>
+    {% if not close.materiality_check_active %}
+    <p class="empty-state inert">
+      Materiality floor not configured &mdash; the size check is inactive
+      (the framework skips the <code>over_materiality</code> check entirely when unset).
+    </p>
+    {% endif %}
+    {% if close.anomalies %}
+    <div class="anomaly-cards">
+      {% for a in close.anomalies %}{% include "_anomaly_card.html" %}{% endfor %}
+    </div>
+    {% else %}
+    <p class="empty-state">No anomalies flagged for {{ period }}.</p>
+    {% endif %}
+  </section>
+
+  {# --- The app-policy gates: the app's OWN close policy, layered over (and
+     visually distinct from) the framework checklist above. `close_period` knows
+     nothing of anomalies or the statement-present rule — these three are the app's. #}
+  <section class="app-policy">
+    <h2>App policy</h2>
+    <p class="lead">Extra close requirements the app enforces on top of the framework checklist.</p>
+    <ul class="app-gates">
+      <li class="gate {{ 'met' if close.app_gates.all_confirmed.met else 'unmet' }}">
+        <span class="tag gate-name">all confirmed</span>
+        <span class="mark">{{ "✓ met" if close.app_gates.all_confirmed.met else "✗ unmet" }}</span>
+        <span class="detail">{{ close.app_gates.all_confirmed.pending_count }} pending</span>
+      </li>
+      <li class="gate {{ 'met' if close.app_gates.anomalies_reviewed.met else 'unmet' }}">
+        <span class="tag gate-name">anomalies reviewed</span>
+        <span class="mark">{{ "✓ met" if close.app_gates.anomalies_reviewed.met else "✗ unmet" }}</span>
+        <span class="detail">{{ close.app_gates.anomalies_reviewed.unacknowledged_count }} unacknowledged</span>
+      </li>
+    </ul>
+    {% set reconciliation_source = close.reconciliation_source %}
+    {% include "_reconciliation_gate.html" %}
+  </section>
+
+  {# --- The SIGN form (§5.7 human sign-off). The signer name defaults to `owner`
+     (a label, not an identity — single-user local). The button is enabled only
+     when `signable`, but the server re-verifies + runs the period precondition and
+     closed-guard: the disabled state is a convenience, the server is the gate. #}
+  <section class="sign">
+    <h2>Sign the period closed</h2>
+    <form class="sign-form" hx-post="/ui/sign" hx-target="#close-screen" hx-swap="outerHTML">
+      <input type="hidden" name="period" value="{{ period }}">
+      <label>Signed by
+        <input type="text" name="signed_by" value="owner">
+      </label>
+      <button type="submit" class="sign-button"{% if not close.signable %} disabled{% endif %}>
+        Sign {{ period }} closed
+      </button>
+      {% if not close.signable %}
+      <small class="sign-hint">Resolve the unmet checks and app-policy gates above to enable signing.</small>
+      {% else %}
+      <small class="sign-hint">Every check and gate is met &mdash; this writes the durable, self-contained close record.</small>
+      {% endif %}
+    </form>
+    <p class="prior-note">
+      Prior period on record: {{ close.effective_prior_period_state or "none" }}
+      (config value: {{ close.config_prior_period_state or "unset" }}).
+    </p>
+  </section>
+
+</div>

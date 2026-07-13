@@ -1,0 +1,11 @@
+{# A human-readable refusal for a close-review write (acknowledge / waive / sign),
+   rendered as a 200 partial htmx swaps into the target — the Slice-1 convention:
+   the JSON twins in C/D keep the machine 4xx (422/409/400); on this surface the
+   message is for the human, in place of the control. `message` is the why.
+   Deliberately un-rooted (no id): it replaces whatever element the refused form
+   targeted (`#close-screen`, `#anomaly-…`, or `#reconciliation-gate`). Nothing
+   was written. #}
+<div class="result error">
+  <p><strong>Refused.</strong> {{ message }}</p>
+  <p>Nothing was changed.</p>
+</div>

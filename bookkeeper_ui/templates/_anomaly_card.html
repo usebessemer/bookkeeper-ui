@@ -1,0 +1,36 @@
+{# One anomaly card. `a` is an `AnomalyOut` (kind, reason, the derived flag id,
+   the implicated transactions, and the acknowledgment disposition); `period`
+   comes from the enclosing screen. Rendered both in the close screen's loop and
+   as the `POST /ui/anomalies/review` response (the acknowledged re-render), so it
+   roots at `#anomaly-{{ a.id }}` for the htmx outerHTML swap. #}
+<div class="card anomaly-card {{ 'acknowledged' if a.acknowledged else 'open' }}" id="anomaly-{{ a.id }}">
+  <div class="anomaly-head">
+    <span class="tag kind">{{ a.kind }}</span>
+    {% if a.acknowledged %}<span class="tag status-acknowledged">acknowledged</span>{% endif %}
+  </div>
+  <p class="reason">{{ a.reason }}</p>
+  <ul class="implicated">
+    {% for t in a.transactions %}
+    <li>
+      <span class="date">{{ t.date[:10] }}</span>
+      <span class="vendor">{{ t.vendor }}</span>
+      <span class="amount">${{ t.amount }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% if a.acknowledged %}
+  <p class="ack-trail">
+    Acknowledged{% if a.acknowledged_at %} {{ a.acknowledged_at[:19] }}{% endif %}{% if a.note %} &mdash; <span class="note">{{ a.note }}</span>{% endif %}.
+  </p>
+  {% else %}
+  <form class="acknowledge" hx-post="/ui/anomalies/review" hx-target="#anomaly-{{ a.id }}" hx-swap="outerHTML">
+    <input type="hidden" name="flag_id" value="{{ a.id }}">
+    <input type="hidden" name="period" value="{{ period }}">
+    <label>Note (optional)
+      <input type="text" name="note" placeholder="Reviewed &mdash; expected">
+    </label>
+    <button type="submit">Acknowledge</button>
+  </form>
+  <p class="disclaimer">Acknowledging records your disposition &mdash; it does not change the books.</p>
+  {% endif %}
+</div>
