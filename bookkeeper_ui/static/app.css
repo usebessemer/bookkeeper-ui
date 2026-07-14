@@ -193,6 +193,69 @@ table.matched .amount { text-align: right; font-variant-numeric: tabular-nums; }
 .tag.status-rejected { background: var(--err-bg); border-color: #ffc1bc; color: var(--err); }
 .tag.status-gap_acknowledged { background: var(--bg); color: var(--muted); }
 
+/* --- Closed-period banner --------------------------------------------- */
+.closed-banner {
+  margin: 0 0 1.25rem;
+  padding: 0.85rem 1.15rem;
+  background: var(--ok-bg);
+  border: 1px solid #aceebb;
+  border-left: 4px solid var(--ok);
+  border-radius: 10px;
+  color: var(--ink);
+}
+.closed-banner strong { color: var(--ok); }
+
+/* --- Close-review screen ---------------------------------------------- */
+#close-screen section { margin: 1.75rem 0; }
+#close-screen h2 { font-size: 1.2rem; margin: 0 0 0.5rem; }
+#close-screen h3 { font-size: 1rem; margin: 1rem 0 0.4rem; }
+
+.framework-checklist, .app-gates { list-style: none; padding: 0; display: grid; gap: 0.6rem; }
+.framework-checklist .check, .app-gates .gate {
+  padding: 0.6rem 0.85rem;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--line);
+  border-radius: 9px;
+}
+.check.met, .gate.met { border-left-color: var(--ok); }
+.check.unmet, .gate.unmet { border-left-color: var(--err); }
+.check .mark, .gate .mark { font-weight: 600; margin-left: 0.5rem; }
+.check.met .mark, .gate.met .mark { color: var(--ok); }
+.check.unmet .mark, .gate.unmet .mark { color: var(--err); }
+.check .reason { margin: 0.35rem 0 0; }
+.tag.check-name, .tag.gate-name { background: #ddf4ff; border-color: #b6e3ff; color: #0a3069; }
+.tag.status-ready { background: var(--ok-bg); border-color: #aceebb; color: var(--ok); }
+.tag.status-blocked { background: var(--err-bg); border-color: #ffc1bc; color: var(--err); }
+
+.blockers .blocker { padding: 0.5rem 0.75rem; background: var(--card); border: 1px solid var(--line); border-radius: 8px; }
+.blockers .item { display: block; margin-top: 0.25rem; color: var(--muted); font-size: 0.9rem; }
+.app-gates .gate .detail { color: var(--muted); margin-left: 0.5rem; font-size: 0.9rem; }
+
+.app-policy { padding: 1rem 1.15rem; background: var(--bg); border: 1px dashed var(--line); border-radius: 10px; }
+
+.anomaly-card.open { border-left-color: var(--warn); }
+.anomaly-card.acknowledged { border-left-color: var(--ok); }
+.anomaly-head { display: flex; gap: 0.4rem; margin-bottom: 0.4rem; }
+.tag.status-acknowledged { background: var(--ok-bg); border-color: #aceebb; color: var(--ok); }
+.anomaly-card .implicated { list-style: none; padding: 0; margin: 0.5rem 0; display: grid; gap: 0.3rem; }
+.anomaly-card .implicated li { display: flex; gap: 0.6rem; align-items: baseline; }
+.anomaly-card .implicated .amount { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 700; }
+.anomaly-card .ack-trail { color: var(--muted); margin: 0.5rem 0 0; }
+.anomaly-card .acknowledge label, .waive label, .sign-form label { display: grid; gap: 0.25rem; font-size: 0.85rem; color: var(--muted); margin: 0.5rem 0; }
+
+#reconciliation-gate { margin-top: 0.6rem; }
+#reconciliation-gate .waive { margin-top: 0.5rem; }
+
+.close-signed .signed-head strong { color: var(--ok); }
+.close-signed .signed-section { margin: 1.5rem 0; }
+.sign-form { display: grid; gap: 0.5rem; max-width: 420px; }
+.sign-form .sign-hint { color: var(--muted); }
+.sign-button:disabled { background: var(--muted); border-color: var(--muted); cursor: not-allowed; filter: none; }
+.prior-note { color: var(--muted); font-size: 0.9rem; }
+.empty-state.inert { background: var(--warn-bg); border-color: #eddf8f; color: var(--warn); }
+.sign-refusal ul { margin: 0.4rem 0 0; }
+
 /* --- Ledger reconciliation fold --------------------------------------- */
 .reconcile-summary { color: var(--muted); margin: 0 0 1rem; }
 .recon-badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.8rem; border: 1px solid var(--line); background: var(--bg); color: var(--muted); }

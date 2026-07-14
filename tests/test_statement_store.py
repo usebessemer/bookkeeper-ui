@@ -42,6 +42,30 @@ async def test_store_is_idempotent_on_stable_key(tmp_path):
     assert len(fetched) == 1
 
 
+async def test_re_store_writes_no_second_physical_row(tmp_path):
+    """A re-store appends no second row to `statements.jsonl` — write-side idempotency (AC 3).
+
+    Asserts on the raw on-disk rows, not through `fetch_statement`, whose
+    read-side dedup would mask a `store` that duplicated the row. Pins that the
+    write path itself never appends an already-filed key (the sibling of the
+    read-side pin above, which stays green even if write-side dedup is removed).
+    """
+    import json
+
+    path = tmp_path / "statements.jsonl"
+    store = FileStatementStore(path)
+    line = make_stmt_line(statement_ref="BANK-1")
+    key = statement_line_key(line)
+
+    await store.store(line)
+    await store.store(line)  # exact re-store
+    await store.store(make_stmt_line(statement_ref="BANK-1"))  # equal-by-value, same key
+
+    rows = [json.loads(r) for r in path.read_text(encoding="utf-8").splitlines() if r.strip()]
+    assert [r["key"] for r in rows].count(key) == 1  # exactly one physical row for the key
+    assert len(rows) == 1
+
+
 async def test_distinct_refs_key_apart_even_when_otherwise_identical(tmp_path):
     """Two charges sharing amount/date/description but with distinct refs both persist.
 

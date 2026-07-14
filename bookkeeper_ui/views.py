@@ -19,11 +19,31 @@ just as happily as JSON.
 
 from __future__ import annotations
 
-from bookkeeper.config import BookkeeperConfig
-from bookkeeper.skills.categorize import categorize
-from bookkeeper.skills.reconcile import reconcile_account
+import dataclasses
+from dataclasses import dataclass
+from datetime import datetime
 
-from bookkeeper_ui.confirmations import FileConfirmationStore
+from bookkeeper.config import BookkeeperConfig
+from bookkeeper.model import Transaction
+from bookkeeper.skills.categorize import (
+    CategorizationReport,
+    CategoryProposal,
+    categorize,
+)
+from bookkeeper.skills.close_period import CloseReport, CloseStatus, close_period
+from bookkeeper.skills.flag_anomaly import flag_anomaly
+from bookkeeper.skills.reconcile import (
+    GapKind,
+    MatchedPair,
+    ReconciliationGap,
+    ReconciliationReport,
+    reconcile_account,
+)
+from bookkeeper.skills.track_tax import TaxSummary, track_tax
+
+from bookkeeper_ui.anomaly_reviews import FileAnomalyReviewStore, derive_flag_id
+from bookkeeper_ui.closes import CloseRecord, FileCloseStore
+from bookkeeper_ui.confirmations import SOURCE_HUMAN, FileConfirmationStore
 from bookkeeper_ui.ledger_store import FileLedgerStore, transaction_key
 from bookkeeper_ui.reconciliations import (
     DECISION_ACKNOWLEDGE,
@@ -44,6 +64,7 @@ from bookkeeper_ui.schemas import (
     TransactionOut,
 )
 from bookkeeper_ui.statement_store import FileStatementStore, statement_line_key
+from bookkeeper_ui.waivers import FileWaiverStore
 
 
 async def build_ledger(
@@ -54,6 +75,7 @@ async def build_ledger(
     period: str,
     statement_store: FileStatementStore | None = None,
     reconciliation_store: FileReconciliationStore | None = None,
+    close_store: FileCloseStore | None = None,
 ) -> LedgerOut:
     """The categorized ledger for `period`: every stored transaction (in the
     store's deterministic read order) annotated with its current standing —
@@ -68,6 +90,12 @@ async def build_ledger(
     also carries its reconcile standing (`reconciliation`) from the *same*
     `build_reconciliation` projection — the Slice 2 fold. Omitting them (the Slice 1
     callers) leaves `reconciliation` null: additive, so those callers are unchanged.
+
+    `close_store` is the **additive** Slice 3 param (keyword-only, default `None`,
+    mirroring the reconcile stores): supplied, the period-level `closed` /
+    `signed_at` / `signed_by` fields carry the period's signed-close standing from
+    `by_period()` (the one closed-period truth every surface reads). Omitted (the
+    five Slice 1/2 call sites), `closed` is `False` — so those callers are unchanged.
     """
     report = await categorize(ledger_store, config, period)
     transactions = await ledger_store.fetch_for_period(period)
@@ -135,7 +163,18 @@ async def build_ledger(
             )
         )
 
-    return LedgerOut(period=period, entries=entries)
+    # The period-level close standing, from the one closed-period truth
+    # (`by_period()`). Absent the close store (the Slice 1/2 callers) → not closed.
+    record = None
+    if close_store is not None:
+        record = (await close_store.by_period()).get(period)
+    return LedgerOut(
+        period=period,
+        entries=entries,
+        closed=record is not None,
+        signed_at=record.signed_at.isoformat() if record is not None else None,
+        signed_by=record.signed_by if record is not None else None,
+    )
 
 
 def _reconciliation_by_transaction(
@@ -277,4 +316,595 @@ async def build_reconciliation(
         matched=matched,
         to_confirm=to_confirm,
         gaps=gaps,
+    )
+
+
+# --- Slice 3: the effective reports + the shared close-review projection ------
+#
+# The close checklist (`close_period`) is a pure function of three framework
+# reports. The app never hands it the *raw* skill output: it hands **effective**
+# reports — the raw report with each persisted human resolution applied — so a
+# flagged-then-confirmed transaction, a confirmed/rejected reconcile pair, an
+# acknowledged gap, and a no-statement waiver all read correctly at close. These
+# two constructors build the effective reports as **real framework dataclasses**
+# (never by mutating a Slice-2 view), and `build_close_review` composes the one
+# shared close projection over them — the single truth `GET /close` (this issue)
+# and `GET /ui/close` (issue E) both render, and the seam Slice 4 binds to.
+
+
+async def build_effective_categorization(
+    *,
+    config: BookkeeperConfig,
+    ledger_store: FileLedgerStore,
+    confirmation_store: FileConfirmationStore,
+    period: str,
+) -> CategorizationReport:
+    """The effective `CategorizationReport` for `period` — raw `categorize` + confirmations.
+
+    Start from raw `categorize` (writes nothing). Every `flagged` entry whose
+    transaction has a confirmation-store resolution is **moved out of `flagged` and
+    into `proposals`** as a human proposal (`proposed_account` = the confirmed
+    account, `confidence=1.0`, `source=SOURCE_HUMAN` — the app's ``"human"``
+    convention, a free-text source string, *not* a framework constant). Raw agent
+    proposals pass through unchanged (they never block); a flag with no confirmation
+    stays flagged (it still blocks). The report **must** carry `period=<the closing
+    period>`, or `close_period`'s `period_coherent` precondition fail-safe-BLOCKs.
+
+    The synthetic `confidence=1.0` is never rendered as an agent claim — close-review
+    status renders from `build_ledger` (whose confirmed rows carry `source="human"`
+    and no confidence). It exists only so the framework counts the item as filed.
+    """
+    raw = await categorize(ledger_store, config, period)
+    confirmed = await confirmation_store.latest_by_transaction()
+
+    proposals = list(raw.proposals)
+    flagged = []
+    for flag in raw.flagged:
+        confirmation = confirmed.get(transaction_key(flag.transaction))
+        if confirmation is not None:
+            proposals.append(
+                CategoryProposal(
+                    transaction=flag.transaction,
+                    proposed_account=confirmation.account,
+                    confidence=1.0,
+                    source=SOURCE_HUMAN,
+                )
+            )
+        else:
+            flagged.append(flag)
+
+    return CategorizationReport(
+        period=period,
+        proposals=tuple(proposals),
+        flagged=tuple(flagged),
+    )
+
+
+async def build_effective_reconciliation(
+    *,
+    config: BookkeeperConfig,
+    ledger_store: FileLedgerStore,
+    statement_store: FileStatementStore,
+    reconciliation_store: FileReconciliationStore,
+    waiver_store: FileWaiverStore | None,
+    period: str,
+) -> tuple[ReconciliationReport, str]:
+    """The effective `ReconciliationReport` for `period` + its `reconciliation_source`.
+
+    The close-input sibling of `build_reconciliation` (status-view → real framework
+    report). Returns a `(ReconciliationReport, source)` pair where `source` is one of
+    ``"statement"`` / ``"waived"`` / ``"missing"`` (gate C reads it).
+
+    - **No statement lines + a waiver row** → an empty report (backed by the recorded
+      waiver), `source="waived"` — rendered/snapshotted as *waived*, never
+      "reconciled".
+    - **No statement lines + no waiver** → run `reconcile_account` against the empty
+      statement and let it block honestly (`source="missing"`); never fabricate a
+      clean report. (Zero transactions too → a vacuously-empty report that is
+      framework-clean, but `source` still `"missing"` so gate C fails — AC10.)
+    - **Statement lines present** → run `reconcile_account` and overlay the
+      reconciliation store's `latest_by_item()` (any prior waiver row is ignored),
+      `source="statement"`:
+        - a **confirmed** `to_confirm` pair → a `MatchedPair` in `matched`;
+        - a **rejected** `to_confirm` pair → decomposed into its two constituent
+          one-sided gaps (a real, close-blocking discrepancy);
+        - an **acknowledged** gap → dropped; an unresolved pair/gap stays (blocks);
+        - `matched` pairs never consult the overlay (a stale resolution is ignored).
+
+    Both paths stamp `period=<the closing period>` — `close_period`'s
+    `period_coherent` fail-safe-BLOCKs on any input report whose `.period` differs.
+    """
+    statement_lines = await statement_store.fetch_statement(period)
+
+    if not statement_lines:
+        waived = waiver_store is not None and period in (await waiver_store.by_period())
+        if waived:
+            # Empty, backed by the recorded waiver — rendered/snapshotted as waived.
+            return (
+                ReconciliationReport(period=period, matched=(), to_confirm=(), gaps=()),
+                "waived",
+            )
+        # No statement and no waiver: run the skill against the empty statement and
+        # let it block honestly (every ledger txn → an unmatched_on_statement gap).
+        # Never short-circuit to a clean report here (unlike the Slice-2 view guard).
+        report = await reconcile_account(ledger_store, statement_store, config, period)
+        return (
+            ReconciliationReport(
+                period=period,
+                matched=report.matched,
+                to_confirm=report.to_confirm,
+                gaps=report.gaps,
+            ),
+            "missing",
+        )
+
+    report = await reconcile_account(ledger_store, statement_store, config, period)
+    latest = await reconciliation_store.latest_by_item()
+
+    # `matched` — never consult the overlay (mirrors build_reconciliation).
+    matched = list(report.matched)
+    to_confirm = []
+
+    # `to_confirm` — confirm → matched; reject → two one-sided gaps; else stays open.
+    rejected_gaps: list[ReconciliationGap] = []
+    for ptc in report.to_confirm:
+        txn_id = transaction_key(ptc.pair.transaction)
+        stmt_id = statement_line_key(ptc.pair.statement_line)
+        resolution = latest.get((txn_id, stmt_id))
+        decision = resolution.decision if resolution is not None else None
+        if decision == DECISION_CONFIRM:
+            matched.append(
+                MatchedPair(ptc.pair.transaction, ptc.pair.statement_line)
+            )
+        elif decision == DECISION_REJECT:
+            # A rejected match is an unexplained discrepancy: decompose into the two
+            # constituent one-sided gaps, both of which block `reconciliation_clean`.
+            rejected_gaps.append(
+                ReconciliationGap(
+                    kind=GapKind.UNMATCHED_ON_STATEMENT,
+                    reason=(
+                        f"Human rejected the amount+date link to statement line "
+                        f"{ptc.pair.statement_line.statement_ref!r} — the captured "
+                        f"transaction has no confirmed statement counterpart."
+                    ),
+                    transaction=ptc.pair.transaction,
+                )
+            )
+            rejected_gaps.append(
+                ReconciliationGap(
+                    kind=GapKind.UNMATCHED_IN_LEDGER,
+                    reason=(
+                        f"Human rejected the amount+date link for statement line "
+                        f"{ptc.pair.statement_line.statement_ref!r} — the statement "
+                        f"charge has no confirmed ledger counterpart."
+                    ),
+                    statement_line=ptc.pair.statement_line,
+                )
+            )
+        else:
+            to_confirm.append(ptc)
+
+    # `gaps` — drop an acknowledged gap; everything else stays open. Append the
+    # rejected-pair gaps after the raw gaps (deterministic: report order, then
+    # to_confirm order).
+    kept_gaps: list[ReconciliationGap] = []
+    for gap in report.gaps:
+        gap_txn_id = transaction_key(gap.transaction) if gap.transaction is not None else None
+        gap_stmt_id = (
+            statement_line_key(gap.statement_line)
+            if gap.statement_line is not None
+            else None
+        )
+        resolution = latest.get((gap_txn_id, gap_stmt_id))
+        if (
+            resolution is not None
+            and resolution.decision == DECISION_ACKNOWLEDGE
+            and gap.kind in (GapKind.UNMATCHED_IN_LEDGER, GapKind.UNMATCHED_ON_STATEMENT)
+        ):
+            # An acknowledged *one-sided* gap (a missing/absent entry the human has
+            # explained) clears. An AMOUNT_MISMATCH is a live money disagreement
+            # (books vs the authoritative statement) — the framework blocks on it and
+            # an acknowledge changes no amounts, so it must be corrected-and-re-run or
+            # rejected before it clears. Never close over an unresolved dollar delta.
+            continue
+        kept_gaps.append(gap)
+
+    return (
+        ReconciliationReport(
+            period=period,
+            matched=tuple(matched),
+            to_confirm=tuple(to_confirm),
+            gaps=tuple(kept_gaps + rejected_gaps),
+        ),
+        "statement",
+    )
+
+
+@dataclass(frozen=True)
+class AnomalyItem:
+    """One `flag_anomaly` flag with its app-derived id and review disposition.
+
+    `id` is the deterministic app-derived id (`derive_flag_id`); the framework flag
+    carries none. `transactions` are the flag's member framework `Transaction`s.
+    `acknowledged` (+ `acknowledged_at` / `note`) is the disposition overlaid from
+    the anomaly-review store (gate B reads it).
+    """
+
+    id: str
+    kind: str
+    reason: str
+    transactions: tuple[Transaction, ...]
+    acknowledged: bool
+    acknowledged_at: datetime | None
+    note: str | None
+
+
+@dataclass(frozen=True)
+class GateResult:
+    """One app gate's verdict + its count (pending / unacknowledged; 0 for gate C)."""
+
+    met: bool
+    count: int
+
+
+@dataclass(frozen=True)
+class CloseReview:
+    """The composed close-review projection for a period — the one shared close truth.
+
+    Holds the framework `CloseReport` **by name** (`close_report`, the effective
+    close over the effective reports — the seam Slice 4 binds to, never a
+    recomputation), plus the effective reports, the tax summary, the anomaly overlay,
+    the app gates, and `signable`. `build_close_review` returns it; the API/UI
+    serialize it (`CloseReviewOut.from_review`). `effective_prior_period_state` /
+    `config_prior_period_state` carry the D4 effective-prior substitution and the
+    untouched config-file value.
+
+    For an **already-closed** period, `closed=True` and `close_record` is the stored
+    signed snapshot — the rendered truth (a *read of the record*, not a recompute);
+    the composition fields are `None`.
+    """
+
+    period: str
+    closed: bool
+    close_record: CloseRecord | None
+    close_report: CloseReport | None
+    effective_categorization: CategorizationReport | None
+    effective_reconciliation: ReconciliationReport | None
+    tax_summary: TaxSummary | None
+    anomalies: tuple[AnomalyItem, ...]
+    materiality_check_active: bool
+    reconciliation_source: str
+    ledger: LedgerOut | None
+    gate_all_confirmed: GateResult
+    gate_anomalies_reviewed: GateResult
+    gate_statement_or_waiver: GateResult
+    signable: bool
+    effective_prior_period_state: str | None
+    config_prior_period_state: str | None
+
+
+async def build_close_review(
+    *,
+    config: BookkeeperConfig,
+    ledger_store: FileLedgerStore,
+    confirmation_store: FileConfirmationStore,
+    statement_store: FileStatementStore,
+    reconciliation_store: FileReconciliationStore,
+    close_store: FileCloseStore | None,
+    anomaly_review_store: FileAnomalyReviewStore | None,
+    waiver_store: FileWaiverStore | None,
+    period: str,
+) -> CloseReview:
+    """Compose the one shared close-review projection for `period`.
+
+    An **already-closed** period (in `close_store.by_period()`) returns its stored
+    signed snapshot as the rendered truth — never a recomputation.
+
+    Otherwise:
+
+    1. Build the effective `CategorizationReport` + `ReconciliationReport` (raw skill
+       output + persisted human resolutions, incl. the no-statement waiver path).
+    2. Run `track_tax` (surfacing `UnknownTaxRegime`, never swallowing) and
+       `flag_anomaly` **as-is**.
+    3. Apply the **effective prior-period state (D4)**: the latest close record's
+       period if the close store is non-empty, else `config.prior_period_state` —
+       substituted **only** into the `close_period` call via
+       `dataclasses.replace` (the config file is never written; no other skill sees
+       the replaced value).
+    4. Overlay anomaly acknowledgments (matched on the derived flag id) and evaluate
+       the three **app gates** (all-confirmed / anomalies-reviewed /
+       statement-or-waiver).
+    5. `signable` = the effective `CloseReport` is READY **and** all three gates met.
+    """
+    # Closed-period truth first — a signed period renders its stored snapshot.
+    closed_map = await close_store.by_period() if close_store is not None else {}
+    if period in closed_map:
+        return CloseReview(
+            period=period,
+            closed=True,
+            close_record=closed_map[period],
+            close_report=None,
+            effective_categorization=None,
+            effective_reconciliation=None,
+            tax_summary=None,
+            anomalies=(),
+            materiality_check_active=config.materiality_floor is not None,
+            reconciliation_source="missing",
+            ledger=None,
+            gate_all_confirmed=GateResult(met=False, count=0),
+            gate_anomalies_reviewed=GateResult(met=False, count=0),
+            gate_statement_or_waiver=GateResult(met=False, count=0),
+            signable=False,
+            effective_prior_period_state=None,
+            config_prior_period_state=config.prior_period_state,
+        )
+
+    # The effective reports (raw skill output + persisted human resolutions).
+    effective_categorization = await build_effective_categorization(
+        config=config,
+        ledger_store=ledger_store,
+        confirmation_store=confirmation_store,
+        period=period,
+    )
+    effective_reconciliation, reconciliation_source = await build_effective_reconciliation(
+        config=config,
+        ledger_store=ledger_store,
+        statement_store=statement_store,
+        reconciliation_store=reconciliation_store,
+        waiver_store=waiver_store,
+        period=period,
+    )
+
+    # The framework computation skills, called as-is. `UnknownTaxRegime` propagates
+    # (the route surfaces it) — never swallowed into a 200 with an empty tax.
+    tax_summary = await track_tax(ledger_store, config, period)
+    anomaly_report = await flag_anomaly(ledger_store, config, period)
+
+    # The effective prior-period state (D4): the latest signed close's period, else
+    # the config value. Substituted ONLY for the close_period call (config unwritten).
+    latest_close = await close_store.latest() if close_store is not None else None
+    effective_prior = (
+        latest_close.period if latest_close is not None else config.prior_period_state
+    )
+    close_config = dataclasses.replace(config, prior_period_state=effective_prior)
+    close_report = close_period(
+        effective_reconciliation,
+        tax_summary,
+        effective_categorization,
+        close_config,
+        period,
+    )
+
+    # The ledger projection — per-transaction status is the one truth (gate A source).
+    ledger = await build_ledger(
+        config=config,
+        ledger_store=ledger_store,
+        confirmation_store=confirmation_store,
+        period=period,
+        statement_store=statement_store,
+        reconciliation_store=reconciliation_store,
+        close_store=close_store,
+    )
+
+    # Anomaly acknowledgment overlay (matched on the derived flag id) + gate B count.
+    reviews = (
+        await anomaly_review_store.by_flag_id() if anomaly_review_store is not None else {}
+    )
+    anomalies: list[AnomalyItem] = []
+    unacknowledged = 0
+    for flag in anomaly_report.flags:
+        flag_id = derive_flag_id(flag)
+        review = reviews.get(flag_id)
+        if review is None:
+            unacknowledged += 1
+        anomalies.append(
+            AnomalyItem(
+                id=flag_id,
+                kind=flag.kind.value,
+                reason=flag.reason,
+                transactions=flag.transactions,
+                acknowledged=review is not None,
+                acknowledged_at=review.acknowledged_at if review is not None else None,
+                note=review.note if review is not None else None,
+            )
+        )
+
+    # The three app gates (labeled app policy, distinct from the framework checklist).
+    pending = sum(1 for e in ledger.entries if e.status != "confirmed")
+    gate_all_confirmed = GateResult(met=pending == 0, count=pending)
+    gate_anomalies_reviewed = GateResult(met=unacknowledged == 0, count=unacknowledged)
+    gate_statement_or_waiver = GateResult(
+        met=reconciliation_source != "missing", count=0
+    )
+
+    signable = (
+        close_report.status == CloseStatus.READY
+        and gate_all_confirmed.met
+        and gate_anomalies_reviewed.met
+        and gate_statement_or_waiver.met
+    )
+
+    return CloseReview(
+        period=period,
+        closed=False,
+        close_record=None,
+        close_report=close_report,
+        effective_categorization=effective_categorization,
+        effective_reconciliation=effective_reconciliation,
+        tax_summary=tax_summary,
+        anomalies=tuple(anomalies),
+        materiality_check_active=config.materiality_floor is not None,
+        reconciliation_source=reconciliation_source,
+        ledger=ledger,
+        gate_all_confirmed=gate_all_confirmed,
+        gate_anomalies_reviewed=gate_anomalies_reviewed,
+        gate_statement_or_waiver=gate_statement_or_waiver,
+        signable=signable,
+        effective_prior_period_state=effective_prior,
+        config_prior_period_state=config.prior_period_state,
+    )
+
+
+async def build_close_record(
+    *,
+    review: CloseReview,
+    waiver_store: FileWaiverStore | None,
+    signed_by: str,
+    signed_at: datetime,
+) -> CloseRecord:
+    """Build the durable, self-contained `CloseRecord` for a signable close (D3).
+
+    The §5.7 snapshot: **capture, never re-derive**. Every field is read off the one
+    already-computed `build_close_review` projection (the same one the review screen
+    and the sign gate use — D2's "re-verify server-side, don't duplicate logic"), so
+    a later chart / rule / floor / `prior_period_state` edit — or a later confirmation
+    correction — can never rewrite what was signed. The caller has already checked
+    `review.signable`, so the framework `CloseReport` is READY (its `proposed_close`
+    present) and every ledger entry is confirmed.
+
+    **Pre-stringified in memory (refinement #3 + the round-trip contract).** All
+    money is written as exact-`Decimal` strings, all datetimes as ISO 8601, all
+    sequences as lists — mirroring the close store's own on-write discipline — so the
+    freshly-built record returned to the caller (`CloseRecordOut`) is byte-equal to
+    the one `FileCloseStore` reads back, and no raw `Decimal`/`float` ever reaches the
+    wire as a lossy number. Confidence is deliberately **not** snapshotted: it is a
+    non-money float, and the store's `_jsonable` refuses every float — the trail keeps
+    the agent's proposed account + rule (`source`), which is what "what was signed"
+    needs.
+    """
+    assert review.close_report is not None
+    assert review.close_report.proposed_close is not None  # signable ⇒ READY
+    assert review.ledger is not None
+    assert review.tax_summary is not None
+    assert review.effective_categorization is not None
+    assert review.effective_reconciliation is not None
+
+    report = review.close_report
+    ledger_entries = review.ledger.entries
+
+    # The five framework checks, verbatim (name / met / reason).
+    checklist = [
+        {"name": c.name, "met": c.met, "reason": c.reason} for c in report.checklist
+    ]
+
+    # Disposition counts: the framework `PeriodSummary` (its v1 approximation
+    # snapshotted as-is) alongside the app-truth per-transaction disposition read
+    # from `build_ledger` — both recorded, neither fabricated. At sign time every
+    # entry is confirmed (gate A), so app-truth is all-confirmed by construction.
+    fw = report.proposed_close.summary
+    summary = {
+        "framework": {
+            "processed": fw.processed,
+            "auto_filed": fw.auto_filed,
+            "reviewed": fw.reviewed,
+            "open": fw.open,
+        },
+        "app_truth": {
+            "confirmed": sum(1 for e in ledger_entries if e.status == "confirmed"),
+            "proposed": sum(1 for e in ledger_entries if e.status == "proposed"),
+            "flagged": sum(1 for e in ledger_entries if e.status == "flagged"),
+            "total": len(ledger_entries),
+        },
+    }
+
+    # Per-transaction final state, from `build_ledger` (the one per-transaction
+    # truth). The agent's original proposal (account + rule) is read from the
+    # effective categorization — raw agent proposals pass through it unchanged;
+    # the human proposals synthesised from confirmed flags carry source="human"
+    # and are excluded (a flag had no agent proposal to record).
+    agent_proposals = {
+        transaction_key(p.transaction): p
+        for p in review.effective_categorization.proposals
+        if p.source != SOURCE_HUMAN
+    }
+    transactions: list[dict[str, object]] = []
+    for entry in ledger_entries:
+        # `entry.transaction` is a `TransactionOut` — amount/tax already exact
+        # strings, date already ISO 8601 (the shipped serializer), so no coercion.
+        row: dict[str, object] = {
+            "transaction_key": entry.transaction.id,
+            "vendor": entry.transaction.vendor,
+            "date": entry.transaction.date,
+            "amount": entry.transaction.amount,
+            "tax": entry.transaction.tax,
+            "account": entry.account,
+            "source": entry.source,
+            "status": entry.status,
+        }
+        proposal = agent_proposals.get(entry.transaction.id)
+        if proposal is not None:
+            row["proposed"] = {
+                "account": proposal.proposed_account,
+                "source": proposal.source,
+            }
+        transactions.append(row)
+
+    # Tax snapshot — regime, per-target reclaimable (money → string), period total.
+    tax = review.tax_summary
+    tax_snapshot = {
+        "regime": tax.regime,
+        "per_target": [
+            {
+                "attribution_target_id": t.attribution_target_id,
+                "reclaimable": str(t.reclaimable),
+                "transaction_count": t.transaction_count,
+            }
+            for t in tax.per_target
+        ],
+        "period_total": str(tax.period_total),
+    }
+
+    # Reconciliation snapshot — the effective report's honest counts (an
+    # acknowledged amount_mismatch still counts as an open gap, so a period carrying
+    # one is not signable and never reaches here), or the recorded waiver when gate C
+    # was satisfied by waiver (rendered/snapshotted "waived", never "reconciled").
+    if review.reconciliation_source == "waived":
+        waiver = (
+            (await waiver_store.by_period()).get(review.period)
+            if waiver_store is not None
+            else None
+        )
+        reconciliation_snapshot: dict[str, object] = {
+            "waived": True,
+            "waived_at": waiver.waived_at.isoformat() if waiver is not None else None,
+            "waived_by": waiver.waived_by if waiver is not None else None,
+        }
+    else:
+        recon = review.effective_reconciliation
+        reconciliation_snapshot = {
+            "waived": False,
+            "source": review.reconciliation_source,
+            "matched": len(recon.matched),
+            "to_confirm": len(recon.to_confirm),
+            "gaps": len(recon.gaps),
+        }
+
+    # Anomaly snapshot — every flag with its derived id, kind, reason, member ids,
+    # and its acknowledgment disposition (all acknowledged at sign time, gate B).
+    anomalies = [
+        {
+            "id": a.id,
+            "kind": a.kind,
+            "reason": a.reason,
+            "transaction_ids": [transaction_key(t) for t in a.transactions],
+            "acknowledged_at": (
+                a.acknowledged_at.isoformat() if a.acknowledged_at is not None else None
+            ),
+            "note": a.note,
+        }
+        for a in review.anomalies
+    ]
+
+    return CloseRecord(
+        period=review.period,
+        signed_at=signed_at,
+        signed_by=signed_by,
+        checklist=checklist,
+        transactions=transactions,
+        tax=tax_snapshot,
+        reconciliation=reconciliation_snapshot,
+        anomalies=anomalies,
+        summary=summary,
+        effective_prior_period_state=review.effective_prior_period_state,
+        config_prior_period_state=review.config_prior_period_state,
     )

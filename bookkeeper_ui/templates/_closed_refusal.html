@@ -1,0 +1,10 @@
+{# Rendered into a resolve / reconcile card target when a resolution targets a
+   closed period. The period is signed and write-guarded, so the resolution is
+   refused — the human sees why in place of the card (a 200 partial htmx swaps in,
+   per the Slice-1 2xx-error convention). Nothing was changed; the open-items
+   counter is deliberately left untouched. #}
+<div class="result error">
+  <p><strong>Period {{ period }} is closed.</strong>
+     Its books are write-guarded, so this resolution was refused — a signed close
+     is durable (§5.7). Nothing was changed.</p>
+</div>

@@ -10,7 +10,7 @@
   ],
   "accounting_method": "cash",
   "jurisdiction": "US",
-  "tax_regime": "standard",
+  "tax_regime": "HST",
   "accountant_format": "generic-export",
   "attribution_targets": ["target-001", "target-002"],
   "books_location": "local-file-store",

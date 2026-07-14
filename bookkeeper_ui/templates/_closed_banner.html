@@ -1,0 +1,13 @@
+{# The one closed-period banner, shared by every screen that surfaces a closed
+   period (queue / ledger / reconcile / import). Reads the period-level close
+   standing — the `closed` / `signed_at` / `signed_by` fields issue B added to
+   `LedgerOut` (a property of the period, not each row). A macro so a period-
+   specific screen renders it once and the import screen loops it over every
+   closed period, from one definition. `signed_at` is an ISO 8601 string. #}
+{% macro closed_banner(period, signed_at, signed_by) %}
+<div class="closed-banner">
+  <strong>Period {{ period }} is signed closed</strong>
+  &mdash; signed on {{ signed_at[:10] }} by {{ signed_by }}.
+  Its books are write-guarded (§5.7: a signed close is durable).
+</div>
+{% endmacro %}
