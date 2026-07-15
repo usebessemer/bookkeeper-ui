@@ -32,6 +32,10 @@ from bookkeeper.skills.categorize import (
 )
 from bookkeeper.skills.close_period import CloseReport, CloseStatus, close_period
 from bookkeeper.skills.flag_anomaly import flag_anomaly
+from bookkeeper.skills.generate_package import (
+    PackageStatus,
+    generate_accountant_package,
+)
 from bookkeeper.skills.reconcile import (
     GapKind,
     MatchedPair,
@@ -57,9 +61,14 @@ from bookkeeper_ui.schemas import (
     LedgerEntryOut,
     LedgerOut,
     MatchedItemOut,
+    PackageEntryOut,
+    PackageOut,
+    PackageSummaryOut,
+    ReconciliationOut,
     ReconciliationStatus,
     ReconciliationViewOut,
     StatementLineOut,
+    TaxSummaryOut,
     ToConfirmItemOut,
     TransactionOut,
 )
@@ -195,6 +204,146 @@ def _reconciliation_by_transaction(
         if gap.transaction is not None:
             by_txn[gap.transaction.id] = gap.status
     return by_txn
+
+
+# --- Slice 4 · A: the accountant-package preview projection -------------------
+#
+# The read side of the Contract A deliverable. `build_package` delegates to the
+# shared Slice-3 `build_close_review` (defined below) for the effective
+# `CloseReport`, hands it to `generate_accountant_package` **as-is** (the terminal
+# framework skill — pure, sync, writes nothing), then adds the app's confirmation
+# overlay before serializing to `PackageOut`. Read-only: `build_close_review` only
+# reads its stores and runs pure skills, so a `GET /package` built on it writes
+# nothing. Sits beside `build_ledger` (async, keyword-only, returns its wire schema
+# directly) — the shape this mirrors.
+
+
+async def build_package(
+    *,
+    config: BookkeeperConfig,
+    ledger_store: FileLedgerStore,
+    confirmation_store: FileConfirmationStore,
+    statement_store: FileStatementStore,
+    reconciliation_store: FileReconciliationStore,
+    close_store: FileCloseStore | None,
+    anomaly_review_store: FileAnomalyReviewStore | None,
+    waiver_store: FileWaiverStore | None,
+    period: str,
+) -> PackageOut:
+    """The accountant-package preview for `period` — proposed (assembled) or blocked.
+
+    1. Obtain the effective `CloseReport` from the one shared close projection
+       (`build_close_review` — every store passed through; it runs the pure skills
+       and only reads its stores).
+    2. **Closed-period short-circuit (guard ordering is load-bearing — this MUST
+       precede the skill call).** For an already-closed period `build_close_review`
+       short-circuits with `close_report=None` (a `CloseRecord` snapshot is not a
+       framework `CloseReport`), and `generate_accountant_package(None, config)`
+       would crash reading `close_report.status`. So a closed period returns an
+       honest BLOCKED `PackageOut` naming the deferred snapshot path (a dedicated
+       closed-period package-from-snapshot surface is a later issue) — never a
+       re-derivation from the snapshot dicts, never a bypass of the short-circuit.
+    3. Open period: `generate_accountant_package(review.close_report, config)`,
+       called **as-is** (the precondition is purely the framework `close_report.status`
+       — never the app's `review.signable`). A non-READY effective close yields the
+       framework's own BLOCKED package, surfaced verbatim.
+    4. PROPOSED: join each entry to its latest confirmation and annotate additively
+       (`confirmed_account` / `confirmed_at` / `diverges`) — the framework fields
+       (`proposed_account` / `confidence` / `source`) are never rewritten.
+    """
+    review = await build_close_review(
+        config=config,
+        ledger_store=ledger_store,
+        confirmation_store=confirmation_store,
+        statement_store=statement_store,
+        reconciliation_store=reconciliation_store,
+        close_store=close_store,
+        anomaly_review_store=anomaly_review_store,
+        waiver_store=waiver_store,
+        period=period,
+    )
+
+    # Closed-period short-circuit — before the skill call (see step 2). Honest
+    # BLOCKED, no crash: the snapshot-derived package path is a later issue.
+    if review.closed or review.close_report is None:
+        return PackageOut(
+            period=period,
+            status=PackageStatus.BLOCKED.value,
+            accounting_method=config.accounting_method,
+            jurisdiction=config.jurisdiction,
+            summary=None,
+            entries=[],
+            tax_breakout=None,
+            reconciliation=None,
+            unmet_close=(
+                f"Period {period!r} is already closed; its package must be previewed "
+                "from the stored snapshot, which is not yet available."
+            ),
+            divergence_count=0,
+        )
+
+    package = generate_accountant_package(review.close_report, config)
+
+    # A non-READY effective close → the framework's own BLOCKED package, verbatim
+    # (no entries / breakout / reconciliation; `unmet_close` names the open checks).
+    if package.status is not PackageStatus.PROPOSED:
+        return PackageOut(
+            period=package.period,
+            status=package.status.value,
+            accounting_method=package.accounting_method,
+            jurisdiction=package.jurisdiction,
+            summary=None,
+            entries=[],
+            tax_breakout=None,
+            reconciliation=None,
+            unmet_close=package.unmet_close,
+            divergence_count=0,
+        )
+
+    # PROPOSED: the confirmation overlay. `latest_by_transaction()` is keyed by
+    # `transaction_id` (= `transaction_key`) — the existing key, no new derivation.
+    confirmed = await confirmation_store.latest_by_transaction()
+    entries: list[PackageEntryOut] = []
+    divergence_count = 0
+    for entry in package.entries:
+        txn_id = transaction_key(entry.transaction)
+        confirmation = confirmed.get(txn_id)
+        confirmed_account = confirmation.account if confirmation is not None else None
+        confirmed_at = (
+            confirmation.decided_at.isoformat() if confirmation is not None else None
+        )
+        # Diverges iff a human recorded a different account than the packaged one.
+        diverges = confirmation is not None and confirmation.account != entry.account
+        if diverges:
+            divergence_count += 1
+        entries.append(
+            PackageEntryOut(
+                transaction=TransactionOut.from_model(entry.transaction),
+                # Framework fields, verbatim from the categorization — never rewritten
+                # by the overlay (byte-identical with or without a confirmation).
+                proposed_account=entry.categorization.proposed_account,
+                confidence=entry.categorization.confidence,
+                source=entry.categorization.source,
+                attribution_target_id=entry.attribution_target_id,
+                tax=str(entry.tax),
+                confirmed_account=confirmed_account,
+                confirmed_at=confirmed_at,
+                diverges=diverges,
+            )
+        )
+
+    return PackageOut(
+        period=package.period,
+        status=package.status.value,
+        accounting_method=package.accounting_method,
+        jurisdiction=package.jurisdiction,
+        summary=PackageSummaryOut.from_model(package.summary),
+        entries=entries,
+        tax_breakout=TaxSummaryOut.from_model(package.tax_breakout),
+        reconciliation=ReconciliationOut.from_model(package.reconciliation),
+        unmet_close=package.unmet_close,
+        divergence_count=divergence_count,
+    )
 
 
 async def build_reconciliation(

@@ -97,6 +97,7 @@ from bookkeeper_ui.schemas import (
     ConfirmationOut,
     ImportResultOut,
     LedgerOut,
+    PackageOut,
     ReconcileResolutionOut,
     ReconciliationReportOut,
     ReconciliationViewOut,
@@ -117,6 +118,7 @@ from bookkeeper_ui.views import (
     build_close_record,
     build_close_review,
     build_ledger,
+    build_package,
     build_reconciliation,
 )
 from bookkeeper_ui.waivers import FileWaiverStore, Waiver
@@ -545,6 +547,45 @@ def create_app(
         except UnknownTaxRegime as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return CloseReviewOut.from_review(review)
+
+    # --- Slice 4 · A: the accountant-package preview (read-only). The read side of
+    # the Contract A deliverable — `generate_accountant_package` over the effective
+    # close (`build_package` delegates to the same `build_close_review` GET /close
+    # uses), plus the app's confirmation overlay. No exporter / write path here.
+
+    @app.get(
+        "/package",
+        response_model=PackageOut,
+        response_model_exclude_none=False,
+        summary="The accountant-package preview projection (proposed | blocked)",
+    )
+    async def package(period: str) -> PackageOut:
+        """The accountant-package preview for `period` — proposed (assembled) or blocked.
+
+        Delegates to `views.build_package`, the single projection `GET /ui/package`
+        (a later issue) will also read. A PROPOSED package (the effective close was
+        READY) is a **200** carrying the full trail; a BLOCKED package (the effective
+        close was not READY, or the period is already closed) is also a **200** with a
+        non-null `unmet_close` — a blocked package is the honest answer, not an error.
+
+        A `tax_regime` the framework does not register makes `track_tax` fail fast with
+        `UnknownTaxRegime`; it is surfaced as a **400** (mirrors `GET /close`), never
+        swallowed — the example config is `HST`, which registers.
+        """
+        try:
+            return await build_package(
+                config=config,
+                ledger_store=ledger_store,
+                confirmation_store=confirmation_store,
+                statement_store=statement_store,
+                reconciliation_store=reconciliation_store,
+                close_store=close_store,
+                anomaly_review_store=anomaly_review_store,
+                waiver_store=waiver_store,
+                period=period,
+            )
+        except UnknownTaxRegime as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # --- Slice 3: the thin write endpoints (issue C). Acknowledge an anomaly flag
     # and waive a no-statement period — the two small writes that feed close review's
