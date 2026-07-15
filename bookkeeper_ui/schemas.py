@@ -38,6 +38,7 @@ from bookkeeper.skills.close_period import (
     CloseReport,
     CloseStatus,
 )
+from bookkeeper.skills.generate_package import PackageSummary
 from bookkeeper.skills.reconcile import (
     MatchedPair,
     PairToConfirm,
@@ -974,3 +975,142 @@ class WaiverOut(BaseModel):
             waived_by=waiver.waived_by,
             note=waiver.note,
         )
+
+
+# --- Slice 4 · A: the accountant-package preview surface (proposed | blocked) ---
+#
+# The wire shape of `generate_accountant_package`'s `AccountantPackage` — the
+# read side of the accountant-package deliverable (`GET /package`). Money stays an
+# exact `Decimal` string (never a JSON number), dates ISO 8601, and each entry
+# carries `transaction_id` (= `transaction_key`) so the trust trail travels by
+# reference back to the local ledger row — `artifact_bytes` never crosses the wire.
+# The framework fields (`proposed_account` / `confidence` / `source`) come verbatim
+# from the categorization; the confirmation overlay (`confirmed_account` /
+# `confirmed_at` / `diverges`) is **additive** — `views.build_package` joins each
+# entry to its latest confirmation and never rewrites a framework field.
+
+
+class PackageEntryOut(BaseModel):
+    """One costed / categorized / taxed package line + the app's confirmation overlay.
+
+    `proposed_account` / `confidence` / `source` are the framework `CategoryProposal`
+    verbatim (`owner-rule` / `chart-match`, or the app's `human` convention for a
+    Slice-3 human-confirmed flag). The overlay — `confirmed_account` / `confirmed_at`
+    / `diverges` — is the app's latest confirm/correct decision joined on
+    `transaction.id`, **additive only** (the framework fields are byte-identical with
+    or without a confirmation present). The raw `human`-source values (`source`,
+    `confidence=1.0`) stay honest on the wire; the "human-confirmed" label +
+    confidence suppression is a UI-render concern (a later issue), not this JSON.
+    """
+
+    transaction: TransactionOut
+    proposed_account: str
+    confidence: float
+    source: str = Field(description="Which rule fired: 'owner-rule' / 'chart-match' / 'human'.")
+    attribution_target_id: str
+    tax: str = Field(description="Exact Decimal as a string (never a lossy float).")
+    confirmed_account: str | None = Field(
+        default=None, description="The human's latest confirm/correct account, or null."
+    )
+    confirmed_at: str | None = Field(default=None, description="ISO 8601, or null.")
+    diverges: bool = Field(
+        description="True iff a confirmation exists and its account differs from proposed_account.",
+    )
+
+
+class PackageMatchedPairOut(BaseModel):
+    """A narrowed package-surface matched pair — the txn id + its statement side.
+
+    Deliberately narrower than `MatchedPairOut` (which carries both full sides): the
+    package trail links by reference, so it carries `transaction_id` (= the ledger
+    `transaction_key`) rather than the whole transaction, plus the statement line's
+    own fields. `StatementLine` has **no vendor** — the only description available is
+    the statement line's `description`.
+    """
+
+    transaction_id: str = Field(description="The ledger transaction_key of the matched txn.")
+    statement_ref: str
+    date: str = Field(description="ISO 8601 (the statement line's date).")
+    amount: str = Field(description="Exact Decimal as a string (the statement line's amount).")
+    statement_description: str
+
+    @classmethod
+    def from_model(cls, pair: MatchedPair) -> "PackageMatchedPairOut":
+        return cls(
+            transaction_id=transaction_key(pair.transaction),
+            statement_ref=pair.statement_line.statement_ref,
+            date=pair.statement_line.date.isoformat(),
+            amount=str(pair.statement_line.amount),
+            statement_description=pair.statement_line.description,
+        )
+
+
+class ReconciliationOut(BaseModel):
+    """The package's reconciliation trail — matched pairs + honest open counts.
+
+    The package-surface projection of a `ReconciliationReport`: the `matched` pairs
+    (narrowed to `PackageMatchedPairOut`) plus `to_confirm_count` / `gap_count`. On a
+    PROPOSED package both counts are 0 by construction (a READY close carries no open
+    reconcile item) — serialized anyway (honesty over assumption).
+    """
+
+    matched: list[PackageMatchedPairOut]
+    to_confirm_count: int
+    gap_count: int
+
+    @classmethod
+    def from_model(cls, report: ReconciliationReport) -> "ReconciliationOut":
+        return cls(
+            matched=[PackageMatchedPairOut.from_model(m) for m in report.matched],
+            to_confirm_count=len(report.to_confirm),
+            gap_count=len(report.gaps),
+        )
+
+
+class PackageSummaryOut(BaseModel):
+    """The package's disposition counts — mirrors the framework `PackageSummary`.
+
+    On a PROPOSED package (built from a READY close) `open == 0` and
+    `processed == auto_filed + reviewed` by construction.
+    """
+
+    processed: int
+    auto_filed: int
+    reviewed: int
+    open: int
+
+    @classmethod
+    def from_model(cls, summary: PackageSummary) -> "PackageSummaryOut":
+        return cls(
+            processed=summary.processed,
+            auto_filed=summary.auto_filed,
+            reviewed=summary.reviewed,
+            open=summary.open,
+        )
+
+
+class PackageOut(BaseModel):
+    """The accountant-package preview on the wire — proposed (assembled) or blocked.
+
+    A PROPOSED package (the effective close was READY) carries the full trail:
+    `summary`, the costed/categorized/taxed `entries` (in the categorization report's
+    order), the `tax_breakout` (per target + period, exact-string money), and the
+    `reconciliation` result. A BLOCKED package (the effective close was not READY, or
+    the period is already closed) sets `summary` / `tax_breakout` / `reconciliation`
+    to null, `entries` to `[]`, `divergence_count` to 0, and names why in
+    `unmet_close`. `divergence_count` is the number of entries a human corrected
+    away from the proposed account.
+    """
+
+    period: str
+    status: Literal["proposed", "blocked"] = Field(
+        description="The PackageStatus value — 'proposed' (assembled) or 'blocked' (refused)."
+    )
+    accounting_method: str
+    jurisdiction: str
+    summary: PackageSummaryOut | None = None
+    entries: list[PackageEntryOut] = Field(default_factory=list)
+    tax_breakout: TaxSummaryOut | None = None
+    reconciliation: ReconciliationOut | None = None
+    unmet_close: str | None = None
+    divergence_count: int = 0
