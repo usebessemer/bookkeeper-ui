@@ -54,8 +54,9 @@ from bookkeeper_ui.reconciliations import Reconciliation
 from bookkeeper_ui.statement_store import statement_line_key
 from bookkeeper_ui.waivers import Waiver
 
-if TYPE_CHECKING:  # avoid a runtime import cycle (views imports this module)
+if TYPE_CHECKING:  # avoid a runtime import cycle (views/exporter import this module)
     from bookkeeper_ui.closes import CloseRecord
+    from bookkeeper_ui.exporter import ExportRecord
     from bookkeeper_ui.views import CloseReview
 
 # Where a ledger entry stands: a human-`confirmed` account, an agent `proposed`
@@ -1114,3 +1115,77 @@ class PackageOut(BaseModel):
     reconciliation: ReconciliationOut | None = None
     unmet_close: str | None = None
     divergence_count: int = 0
+
+
+# --- Slice 4 · B: the export write-path shapes -------------------------------
+#
+# The wire shapes for the export write path: `POST /export`'s result and the
+# `GET /exports` log-row projection. Both echo an `ExportRecord` (the append-only
+# log row) verbatim — same shape, one per surface — so a caller can confirm the
+# write and list the trail. Money never appears here (only ids, hashes, counts, and
+# ISO timestamps), so there is no float risk on this boundary.
+
+
+class ExportFileOut(BaseModel):
+    """One exported Core file's fingerprint — its name, sha256, and byte count."""
+
+    name: str
+    sha256: str = Field(description="sha256 hex digest of the file's exact bytes.")
+    bytes: int
+
+
+class ExportResultOut(BaseModel):
+    """`POST /export`'s response — the export just written, echoed for confirmation.
+
+    Carries the `export_id`, `period`, `package_status` (`proposed`), `exported_at`
+    (ISO 8601, UTC), the per-file fingerprints of the three hashed Core files, and
+    the package's `divergence_count`.
+    """
+
+    export_id: str
+    period: str
+    package_status: str
+    exported_at: str = Field(description="ISO 8601 export time (UTC).")
+    files: list[ExportFileOut]
+    divergence_count: int
+
+    @classmethod
+    def from_record(cls, record: "ExportRecord") -> "ExportResultOut":
+        return cls(**_export_record_fields(record))
+
+
+class ExportRecordOut(BaseModel):
+    """A `GET /exports` log-row — the same shape as `ExportResultOut`, per trail row.
+
+    The append-only export log projected to the wire, in export (insertion) order.
+    """
+
+    export_id: str
+    period: str
+    package_status: str
+    exported_at: str = Field(description="ISO 8601 export time (UTC).")
+    files: list[ExportFileOut]
+    divergence_count: int
+
+    @classmethod
+    def from_record(cls, record: "ExportRecord") -> "ExportRecordOut":
+        return cls(**_export_record_fields(record))
+
+
+def _export_record_fields(record: "ExportRecord") -> dict[str, object]:
+    """The shared field mapping both export wire shapes project from an `ExportRecord`."""
+    return {
+        "export_id": record.export_id,
+        "period": record.period,
+        "package_status": record.package_status,
+        "exported_at": record.exported_at.isoformat(),
+        "files": [
+            ExportFileOut(
+                name=str(f["name"]),
+                sha256=str(f["sha256"]),
+                bytes=int(f["bytes"]),  # type: ignore[call-overload]
+            )
+            for f in record.files
+        ],
+        "divergence_count": record.divergence_count,
+    }
