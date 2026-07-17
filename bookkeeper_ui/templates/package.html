@@ -1,0 +1,224 @@
+{% extends "base.html" %}
+{% block title %}Package preview &mdash; Bookkeeper{% endblock %}
+{% block content %}
+{# The accountant-package preview (Slice 4 · C). Rendered from the SAME
+   `views.build_package` projection the JSON `GET /package` reads — the projection is
+   computed once (the `package` context var, a `PackageOut`), so HTML and JSON render
+   identical state. No second computation, no direct `generate_accountant_package`
+   call, no re-derivation of `status`.
+
+   Three shapes in one page, dispatched up front (mirrors close.html):
+   - `error`              — the tax regime did not register (`track_tax` fail-fast) —
+     render the message for the human, not a 500 (the Slice-1 error-into-the-page rule).
+   - status == "blocked"  — the framework refused the close: `unmet_close` VERBATIM,
+     no deliverable, and NO export control anywhere.
+   - status == "proposed" — the assembled deliverable: proposed, never auto-published. #}
+<h1>Accountant package &mdash; {{ period }}</h1>
+
+{% if error %}
+<div class="result error">
+  <p><strong>Cannot assemble the package for {{ period }}.</strong> {{ error }}</p>
+  <p>Fix the configured <code>tax_regime</code> and reload.</p>
+</div>
+
+{% elif package.status == "blocked" %}
+{# BLOCKED — the effective framework close was not READY (or the period is already
+   closed). `unmet_close` names the failing close checks VERBATIM — that text IS the
+   feature (never paraphrased, truncated, or reworded). No package content is
+   assembled and NO export control renders anywhere on this page. #}
+<div class="result error package-status package-blocked">
+  <p><span class="tag status-blocked">blocked</span></p>
+  <p><strong>No deliverable &mdash; this period's close is not ready.</strong>
+     The framework refused to assemble a package; nothing is exportable until the
+     close is clean.</p>
+  <p class="unmet-close">{{ package.unmet_close }}</p>
+  <p>Resolve the open items on the
+     <a href="/ui/close?period={{ period }}">close review</a>, then reload.</p>
+</div>
+
+{% else %}
+{# PROPOSED — assembled and proposed, never auto-published: a proposal awaiting the
+   human's hand, not a filed document. #}
+<div class="result ok package-status package-proposed">
+  <p><span class="tag status-proposed">proposed</span></p>
+  <p><strong>This package is proposed &mdash; assembled by the agent, never
+     auto-published.</strong> Review it below, then send it to your accountant by
+     hand. Nothing on this page leaves your machine.</p>
+</div>
+
+<p class="basis lead">
+  {{ package.period }} &middot; {{ package.accounting_method }} &middot;
+  {{ package.jurisdiction }} &middot; {{ package.tax_breakout.regime }}
+</p>
+
+{# --- Summary: the disposition counts (open == 0 and processed == auto_filed +
+   reviewed by construction on a PROPOSED, READY-built package). #}
+<section class="package-summary">
+  <h2>Summary</h2>
+  <p>
+    <strong>{{ package.summary.processed }}</strong> processed &middot;
+    {{ package.summary.auto_filed }} auto-filed &middot;
+    {{ package.summary.reviewed }} reviewed &middot;
+    {{ package.summary.open }} open.
+  </p>
+</section>
+
+{# --- Divergence banner — only when the human corrected ≥1 entry away from the
+   packaged proposal. The framework package carries the agent's proposals; the
+   human's corrections travel alongside in the confirmation trail. #}
+{% if package.divergence_count > 0 %}
+<div class="result divergence-banner">
+  <p>The framework package carries the agent's proposals. Your
+     <strong>{{ package.divergence_count }}</strong>
+     correction{{ "" if package.divergence_count == 1 else "s" }}
+     {{ "is" if package.divergence_count == 1 else "are" }} recorded in the
+     confirmation trail and {{ "is" if package.divergence_count == 1 else "are" }}
+     exported alongside &mdash; review before sending anything to your accountant.</p>
+</div>
+{% endif %}
+
+{# --- Entries: the trust trail. One row per entry, in the categorization report's
+   order. The framework fields (proposed account / confidence / rule) render
+   VERBATIM from the wire; the confirmation overlay (confirmed account + a "diverges"
+   badge) is ADDITIVE — it never rewrites a framework field. A human-confirmed
+   entry renders its source as "human-confirmed" with the confidence cell blank (the
+   synthetic 1.0 is never presented as an agent confidence). #}
+<section class="package-entries">
+  <h2>Entries</h2>
+  {% if package.entries %}
+  <table class="ledger package-trail">
+    <thead>
+      <tr>
+        <th>Date</th><th>Vendor</th><th>Description</th><th>Target</th>
+        <th class="amount">Amount</th><th class="amount">Tax</th>
+        <th>Proposed account</th><th>Confidence</th><th>Rule</th>
+        <th>Confirmed</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for e in package.entries %}
+      <tr{% if e.diverges %} class="diverges"{% endif %}>
+        <td>{{ e.transaction.date[:10] }}</td>
+        <td>{{ e.transaction.vendor }}</td>
+        <td>{{ e.transaction.description }}</td>
+        <td>{{ e.attribution_target_id }}</td>
+        <td class="amount">${{ e.transaction.amount }}</td>
+        <td class="amount">${{ e.tax }}</td>
+        <td>{{ e.proposed_account }}</td>
+        {% if e.source == "human" %}
+        {# Human-confirmed: the synthetic 1.0 is not an agent confidence — suppress it. #}
+        <td class="confidence-suppressed">&mdash;</td>
+        <td><span class="tag source source-human">human-confirmed</span></td>
+        {% else %}
+        <td>{{ (e.confidence * 100) | round | int }}%</td>
+        <td><span class="tag source source-{{ e.source }}">{{ e.source }}</span></td>
+        {% endif %}
+        <td>
+          {% if e.confirmed_account %}{{ e.confirmed_account }}{% else %}&mdash;{% endif %}
+          {% if e.diverges %}<span class="tag diverges-badge">diverges</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-state">No entries in this package for {{ period }}.</p>
+  {% endif %}
+</section>
+
+{# --- Tax breakout: the `track_tax` display — per-target reclaimable + the period
+   total (exact-string money throughout). The `flagged` section renders ONLY when
+   non-empty (empty on a PROPOSED package by construction; shown defensively, never
+   hidden, if ever present). #}
+<section class="package-tax">
+  <h2>Tax breakout &mdash; {{ package.tax_breakout.regime }}</h2>
+  <table class="ledger">
+    <thead>
+      <tr><th>Attribution target</th><th class="amount">Reclaimable</th><th class="amount">Transactions</th></tr>
+    </thead>
+    <tbody>
+      {% for t in package.tax_breakout.per_target %}
+      <tr>
+        <td>{{ t.attribution_target_id }}</td>
+        <td class="amount">${{ t.reclaimable }}</td>
+        <td class="amount">{{ t.transaction_count }}</td>
+      </tr>
+      {% endfor %}
+      <tr class="total">
+        <td><strong>Period total</strong></td>
+        <td class="amount"><strong>${{ package.tax_breakout.period_total }}</strong></td>
+        <td class="amount"></td>
+      </tr>
+    </tbody>
+  </table>
+  {% if package.tax_breakout.flagged %}
+  <div class="tax-flags">
+    <h3>Tax exceptions</h3>
+    <ul>
+      {% for f in package.tax_breakout.flagged %}
+      <li>{{ f.transaction.vendor }} ${{ f.transaction.amount }} &mdash;
+          <span class="reason">{{ f.reason }}</span></li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+</section>
+
+{# --- Reconciliation: the positive trail — the matched pairs (evidence of what
+   reconciled), plus the honest open counts (both 0 on a PROPOSED package, shown
+   anyway). `PackageMatchedPairOut` carries the statement side + the ledger
+   `transaction_id` by reference (no vendor field exists on a StatementLine). #}
+<section class="package-reconciliation">
+  <h2>Reconciliation &mdash; {{ package.reconciliation.matched | length }} matched</h2>
+  <p class="lead">
+    {{ package.reconciliation.to_confirm_count }} awaiting confirmation &middot;
+    {{ package.reconciliation.gap_count }} gap{{ "" if package.reconciliation.gap_count == 1 else "s" }} open.
+  </p>
+  {% if package.reconciliation.matched %}
+  <table class="ledger matched">
+    <thead>
+      <tr><th>Statement ref</th><th>Date</th><th class="amount">Amount</th><th>Description</th><th>Ledger txn</th></tr>
+    </thead>
+    <tbody>
+      {% for m in package.reconciliation.matched %}
+      <tr>
+        <td>{{ m.statement_ref }}</td>
+        <td>{{ m.date[:10] }}</td>
+        <td class="amount">${{ m.amount }}</td>
+        <td>{{ m.statement_description }}</td>
+        <td><code>{{ m.transaction_id }}</code></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-state">No matched pairs (no statement imported, or nothing matched).</p>
+  {% endif %}
+</section>
+
+{# --- Export (PROPOSED only) — a CLIENT-CONVENIENCE trigger. It posts via htmx to
+   `POST /ui/export`, whose server-side §5.4 re-obtain is the real gate (it rebuilds
+   the package from its own stores and refuses a non-PROPOSED one, 409, writing
+   nothing). The acknowledgment checkbox below (shown only when divergences exist) is
+   a UX nudge, NOT a server-side gate — export is never blocked on divergence here.
+   The `/ui/export` handler + the export result partial land in issue D. #}
+<section class="package-export">
+  <h2>Export</h2>
+  <form class="export-form" hx-post="/ui/export" hx-target="#export-result" hx-swap="innerHTML">
+    <input type="hidden" name="period" value="{{ period }}">
+    {% if package.divergence_count > 0 %}
+    <label class="ack-label">
+      <input type="checkbox" class="ack" name="acknowledged" required>
+      I have reviewed the {{ package.divergence_count }}
+      divergence{{ "" if package.divergence_count == 1 else "s" }}.
+    </label>
+    {% endif %}
+    <button type="submit" class="export-button">Export package to local files</button>
+    <small class="export-hint">Writes the package to local files on this machine only
+      &mdash; nothing is transmitted. You send it to your accountant by hand.</small>
+  </form>
+  <div id="export-result"></div>
+</section>
+
+{% endif %}
+{% endblock %}

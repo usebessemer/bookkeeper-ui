@@ -256,6 +256,29 @@ table.matched .amount { text-align: right; font-variant-numeric: tabular-nums; }
 .empty-state.inert { background: var(--warn-bg); border-color: #eddf8f; color: var(--warn); }
 .sign-refusal ul { margin: 0.4rem 0 0; }
 
+/* --- Package preview (Slice 4 · C) ------------------------------------ */
+.package-status { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.6rem; }
+.package-status p { margin: 0.35rem 0; }
+.tag.status-proposed { background: var(--ok-bg); border-color: #aceebb; color: var(--ok); }
+.package-blocked .unmet-close { font-weight: 600; color: var(--err); }
+
+.basis { font-variant-numeric: tabular-nums; }
+
+.divergence-banner { background: var(--warn-bg); border: 1px solid #eddf8f; color: var(--warn); }
+
+.package-entries, .package-tax, .package-reconciliation, .package-export, .package-summary { margin: 1.75rem 0; }
+.package-entries h2, .package-tax h2, .package-reconciliation h2, .package-export h2, .package-summary h2 { font-size: 1.2rem; margin: 0 0 0.5rem; }
+table.package-trail { display: block; overflow-x: auto; }
+table.package-trail .confidence-suppressed { color: var(--muted); }
+.tag.source-human { background: var(--ok-bg); border-color: #aceebb; color: var(--ok); }
+tr.diverges { background: var(--warn-bg); }
+.tag.diverges-badge { background: var(--warn-bg); border-color: #eddf8f; color: var(--warn); margin-left: 0.4rem; }
+
+.export-form { display: grid; gap: 0.6rem; max-width: 460px; }
+.export-form .ack-label { display: flex; align-items: baseline; gap: 0.4rem; font-size: 0.9rem; color: var(--muted); }
+.export-form .export-hint { color: var(--muted); }
+.export-form .ack:not(:checked) ~ .export-button { opacity: 0.55; }
+
 /* --- Ledger reconciliation fold --------------------------------------- */
 .reconcile-summary { color: var(--muted); margin: 0 0 1rem; }
 .recon-badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.8rem; border: 1px solid var(--line); background: var(--bg); color: var(--muted); }
