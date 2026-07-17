@@ -87,6 +87,7 @@ from bookkeeper_ui.views import (
     build_close_record,
     build_close_review,
     build_ledger,
+    build_package,
     build_reconciliation,
 )
 from bookkeeper_ui.waivers import FileWaiverStore, Waiver
@@ -891,4 +892,52 @@ def register_ui(
             request,
             "_close_signed.html",
             {"record": CloseRecordOut.from_record(record).model_dump(), "period": period},
+        )
+
+    # --- Slice 4 · C: the accountant-package preview (read-only). The human surface
+    # over the Contract A deliverable — the SAME `views.build_package` projection the
+    # JSON `GET /package` (issue A) serializes (one projection, no second computation,
+    # no direct `generate_accountant_package` call). It renders the honest two-state
+    # picture: PROPOSED (assembled, never auto-published — the full trust trail + tax
+    # + reconciliation + the app's confirmation overlay) or BLOCKED (the framework's
+    # `unmet_close` reason verbatim, no deliverable, no export control). The Export
+    # button + acknowledgment checkbox on a PROPOSED page are client convenience only
+    # — the real §5.4 refusal gate lives server-side in issue B's `POST /export`, which
+    # re-obtains the close and refuses a non-PROPOSED package regardless of this page.
+
+    @app.get("/ui/package", response_class=HTMLResponse, summary="The accountant-package preview")
+    async def ui_package(request: Request, period: str = _DEFAULT_PERIOD) -> HTMLResponse:
+        """The accountant-package preview for `period` — proposed (assembled) or blocked.
+
+        Reads `views.build_package` and renders `package.html` — the same projection
+        the JSON `GET /package` serializes, so HTML and JSON render identical state.
+        A PROPOSED package carries the full trail (summary, the costed/categorized/taxed
+        entries with their trust trail + the additive confirmation overlay, the tax
+        breakout, the reconciliation trail); a BLOCKED package renders `unmet_close`
+        verbatim with no export control.
+
+        An unregistered `tax_regime` makes `track_tax` fail fast (`UnknownTaxRegime`);
+        it is rendered into the page as an error (the Slice-1 error-into-the-page
+        rule), never a 500.
+        """
+        try:
+            package = await build_package(
+                config=config,
+                ledger_store=ledger_store,
+                confirmation_store=confirmation_store,
+                statement_store=statement_store,
+                reconciliation_store=reconciliation_store,
+                close_store=close_store,
+                anomaly_review_store=anomaly_review_store,
+                waiver_store=waiver_store,
+                period=period,
+            )
+        except UnknownTaxRegime as exc:
+            return templates.TemplateResponse(
+                request, "package.html", {"period": period, "error": str(exc)}
+            )
+        return templates.TemplateResponse(
+            request,
+            "package.html",
+            {"period": period, "package": package},
         )
