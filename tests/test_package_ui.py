@@ -196,8 +196,10 @@ async def test_blocked_renders_unmet_close_verbatim_and_no_export_control(harnes
     assert str(escape(j["unmet_close"])) in html
     assert '<span class="tag status-blocked">blocked' in html
 
-    # NO export control of any kind on a blocked page.
-    assert "/ui/export" not in html
+    # NO export control of any kind on a blocked page. (The export *action* is the
+    # `hx-post="/ui/export"` form; asserted precisely so it does not collide with the
+    # shared-nav `/ui/exports` listing link, which — correctly — renders on every page.)
+    assert 'hx-post="/ui/export"' not in html
     assert 'type="checkbox"' not in html
     assert "export-button" not in html
     assert "export-form" not in html
@@ -220,7 +222,9 @@ async def test_blocked_from_already_closed_period_also_has_no_export_control(har
     html = (await _get(harness.app)).text
     assert '<span class="tag status-blocked">blocked' in html
     assert "already closed" in html
-    assert "export-button" not in html and "/ui/export" not in html
+    # No export *action* control (precise, so it does not collide with the shared-nav
+    # `/ui/exports` listing link, which renders on every page).
+    assert "export-button" not in html and 'hx-post="/ui/export"' not in html
 
 
 # ============================================================================

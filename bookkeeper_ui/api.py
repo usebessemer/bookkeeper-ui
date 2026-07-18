@@ -956,6 +956,8 @@ def create_app(
         close_store=close_store,
         anomaly_review_store=anomaly_review_store,
         waiver_store=waiver_store,
+        export_dir=export_dir,
+        export_store=export_store,
     )
 
     return app
