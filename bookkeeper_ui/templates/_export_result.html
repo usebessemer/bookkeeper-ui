@@ -1,0 +1,37 @@
+{# Partial swapped into #export-result after the Export button posts (Slice 4 · D) —
+   the human twin of B's JSON `POST /export`. Three shapes:
+   - `error`   — the export surface is unwired, or the tax regime did not register
+     (`track_tax` fail-fast): render the message for the human, not a 500. Nothing written.
+   - `refusal` — the server-side re-obtain rebuilt a NON-PROPOSED package: `unmet_close`
+     VERBATIM (never paraphrased), nothing written (no folder, no log row). The web
+     convention: a human refusal is a 200 partial (B's machine route keeps its 409).
+   - success   — the export was written: its id + one guarded-download link per Core file. #}
+{% if error %}
+<div class="result error">
+  <p><strong>Export failed.</strong> {{ error }}</p>
+  <p>Nothing was written.</p>
+</div>
+{% elif refusal %}
+<div class="result error">
+  <p><strong>Nothing exported &mdash; this period's close is not ready.</strong>
+     The package was rebuilt from your stores at export time and is not proposed, so
+     nothing was written.</p>
+  <p class="unmet-close">{{ refusal }}</p>
+  <p>Resolve the open items on the
+     <a href="/ui/close?period={{ period }}">close review</a>, then export again.</p>
+</div>
+{% else %}
+<div class="result ok">
+  <p><strong>Exported to local files.</strong>
+     {% if divergence_count > 0 %}The
+     {{ divergence_count }} correction{{ "" if divergence_count == 1 else "s" }}
+     travelled alongside &mdash; review before sending.{% endif %}</p>
+  <p>Export <code>{{ export_id }}</code> &mdash; download the files to send by hand:</p>
+  <ul class="export-files">
+    {% for f in files %}
+    <li><a href="{{ f.url }}" download>{{ f.name }}</a></li>
+    {% endfor %}
+  </ul>
+  <p><a href="/ui/exports?period={{ period }}">See all exports &rarr;</a></p>
+</div>
+{% endif %}
