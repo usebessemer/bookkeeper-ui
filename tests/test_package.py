@@ -43,7 +43,7 @@ from bookkeeper_ui.ledger_store import FileLedgerStore, transaction_key
 from bookkeeper_ui.reconciliations import FileReconciliationStore
 from bookkeeper_ui.schemas import TaxSummaryOut
 from bookkeeper_ui.statement_store import FileStatementStore
-from bookkeeper_ui.views import build_effective_categorization, build_package
+from bookkeeper_ui.views import build_package
 from bookkeeper_ui.waivers import FileWaiverStore, Waiver
 from tests.conftest import make_stmt_line, make_txn
 
@@ -116,6 +116,27 @@ async def _get_package(app: FastAPI, period: str = PERIOD) -> httpx.Response:
         return await client.get("/package", params={"period": period})
 
 
+# The seven input-store files `build_package` reads for `GET /package` — snapshotted
+# before/after the call to prove the read path writes nothing (a file that does not
+# exist snapshots as None). Convention mirrors test_write_endpoints.py:154.
+_STORE_FILES = (
+    "ledger.jsonl",
+    "confirmations.jsonl",
+    "statements.jsonl",
+    "reconciliations.jsonl",
+    "closes.jsonl",
+    "anomaly_reviews.jsonl",
+    "reconciliation_waivers.jsonl",
+)
+
+
+def _snapshot(data_dir: Path) -> dict[str, bytes | None]:
+    return {
+        name: ((data_dir / name).read_bytes() if (data_dir / name).exists() else None)
+        for name in _STORE_FILES
+    }
+
+
 # Grounded against the shipped example config (chart + owner_policies + HST):
 #   "AWS"            → owner-rule proposal (5100-software-subscriptions), conf 1.0.
 #   "Rent"           → chart-match proposal (6100-rent), conf 0.9.
@@ -176,20 +197,20 @@ async def test_ready_close_yields_proposed_package_in_order(harness: Harness):
     assert body["status"] == "proposed"
     assert body["unmet_close"] is None
 
-    # Entry order == the effective categorization proposals' order (ledger read order,
-    # then the human proposal appended for the confirmed flag).
-    eff_cat = await build_effective_categorization(
-        config=harness.config, ledger_store=harness.ledger_store,
-        confirmation_store=harness.confirmation_store, period=PERIOD,
-    )
-    assert [e["transaction"]["vendor"] for e in body["entries"]] == [
-        p.transaction.vendor for p in eff_cat.proposals
-    ]
+    # Entry order — a bare literal (deterministic per views.py: ledger read order, then
+    # the human proposal appended for the confirmed flag). NOT re-derived from the same
+    # `build_effective_categorization` helper `build_package` uses (which would stay
+    # green even if both drifted in lockstep).
+    assert [e["transaction"]["vendor"] for e in body["entries"]] == ["AWS", "Rent", "Zzxq Gibberish"]
 
     # Summary invariants of a PROPOSED (READY-built) package.
     summary = body["summary"]
     assert summary["open"] == 0
     assert summary["processed"] == summary["auto_filed"] + summary["reviewed"]
+    # Exact counts (a PackageSummaryOut(0, 0, 0, 0) mutation satisfies the invariants
+    # above but not this): three proposals (AWS owner-rule, Rent chart-match, the
+    # confirmed flag as a human proposal), nothing flagged.
+    assert summary == {"processed": 3, "auto_filed": 3, "reviewed": 0, "open": 0}
 
     # Config basis stamped verbatim.
     assert body["accounting_method"] == harness.config.accounting_method  # "cash"
@@ -263,14 +284,17 @@ async def test_reconciliation_trail_matched_pairs_render(harness: Harness):
     """A clean matched pair renders on the package with its statement_ref; on a
     PROPOSED package to_confirm_count and gap_count are 0."""
     # Travel Agency 100.00 categorizes (chart-match, 5200-travel) AND reconciles
-    # cleanly against a same-amount/same-date statement line whose description matches
-    # the vendor (similarity 1.0 ≥ the 0.7 floor → matched, not to_confirm).
+    # cleanly against a same-amount/same-date statement line. The statement descriptor
+    # is a mangled bank descriptor DISTINCT from the ledger vendor, but shares enough
+    # tokens that vendor similarity (0.74) stays ≥ the 0.7 floor → still a confident
+    # `matched` pair. Distinguishing them pins that `statement_description` is sourced
+    # from the statement line, not the transaction's vendor.
     txn = make_txn(vendor="Travel Agency", amount="100.00", tax="0",
                    date=datetime(2026, 5, 5), description="travel")
     await harness.ledger_store.store(txn)
     await harness.statement_store.store(
         make_stmt_line(statement_ref="STMT-100", amount="100.00",
-                       date=datetime(2026, 5, 5), description="Travel Agency")
+                       date=datetime(2026, 5, 5), description="TRAVEL AGENCY INC - CARD 4021")
     )
 
     body = (await _get_package(harness.app)).json()
@@ -279,7 +303,10 @@ async def test_reconciliation_trail_matched_pairs_render(harness: Harness):
     assert [m["statement_ref"] for m in recon["matched"]] == ["STMT-100"]
     assert recon["matched"][0]["transaction_id"] == transaction_key(txn)
     assert recon["matched"][0]["amount"] == "100.00"
-    assert recon["matched"][0]["statement_description"] == "Travel Agency"
+    # The statement line's OWN description (not the ledger vendor "Travel Agency").
+    assert recon["matched"][0]["statement_description"] == "TRAVEL AGENCY INC - CARD 4021"
+    # The statement line's date, serialized verbatim (ISO 8601, from datetime(2026,5,5)).
+    assert recon["matched"][0]["date"] == "2026-05-05T00:00:00"
     assert recon["to_confirm_count"] == 0
     assert recon["gap_count"] == 0
 
@@ -450,3 +477,43 @@ async def test_hst_regime_returns_200(harness: Harness):
     resp = await _get_package(harness.app)
     assert resp.status_code == 200
     assert resp.json()["tax_breakout"]["regime"] == "HST"
+
+
+# ============================================================================
+# GET /package is read-only — every input-store file byte-identical before/after
+# ============================================================================
+
+
+async def test_get_package_read_only_on_proposed(harness: Harness, tmp_path):
+    """A PROPOSED read leaves all seven input-store files byte-identical — build_package
+    only reads its stores and runs the pure skills; no on-disk store is written."""
+    await _ready_three_sources(harness)
+    before = _snapshot(tmp_path)
+    assert (await _get_package(harness.app)).json()["status"] == "proposed"
+    assert _snapshot(tmp_path) == before
+
+
+async def test_get_package_read_only_on_blocked_open(harness: Harness, tmp_path):
+    """An open-but-BLOCKED read (an unresolved flag) is likewise read-only."""
+    await harness.ledger_store.store(_flagged())
+    await _waive(harness)
+    before = _snapshot(tmp_path)
+    assert (await _get_package(harness.app)).json()["status"] == "blocked"
+    assert _snapshot(tmp_path) == before
+
+
+async def test_get_package_read_only_on_closed_period(harness: Harness, tmp_path):
+    """A closed-period read (the deferred-snapshot short-circuit) writes nothing either —
+    the short-circuit precedes the skill call and touches no store."""
+    await harness.ledger_store.store(_aws())
+    await harness.close_store.record(
+        CloseRecord(
+            period=PERIOD, signed_at=datetime(2026, 7, 5, 12, 0, 0, tzinfo=timezone.utc), signed_by="human",
+            checklist=[{"name": "period_closeable", "met": True, "reason": "ok"}],
+            transactions=[], tax={"period_total": "0"}, reconciliation={"waived": True},
+            anomalies=[], summary={}, effective_prior_period_state="2026-Q1", config_prior_period_state=None,
+        )
+    )
+    before = _snapshot(tmp_path)
+    assert (await _get_package(harness.app)).json()["status"] == "blocked"
+    assert _snapshot(tmp_path) == before

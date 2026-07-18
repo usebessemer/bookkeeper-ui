@@ -324,6 +324,31 @@ async def test_listed_but_missing_on_disk_is_404_not_500(harness: Harness):
     assert resp.status_code == 404
 
 
+async def test_listed_symlink_escaping_root_is_404_and_never_served(harness: Harness):
+    """AC-17 (the containment second-wall): a LISTED filename (`package.json`, in the
+    allow-list) whose on-disk entry is a symlink resolving OUTSIDE the exports root → 404,
+    and the outside sentinel's bytes are never served. This REACHES web.py's
+    `candidate.is_relative_to(root)` wall — the allow-list membership passes, so the
+    router-404'd traversal inputs never exercise it — pinning the defense-in-depth wall:
+    drop it and the resolved outside file leaks (200 + sentinel)."""
+    await _ready_three_sources(harness)
+    export_id = (await _post_export_json(harness.app)).json()["export_id"]
+
+    # A sentinel OUTSIDE the exports dir — the target a resolved symlink would escape to.
+    outside = harness.tmp / "outside_secret.json"
+    outside.write_bytes(b"SENTINEL-OUTSIDE-EXPORTS")
+
+    # Replace the real, listed package.json with a symlink pointing at the outside file.
+    listed = harness.export_dir / export_id / "package.json"
+    listed.unlink()
+    listed.symlink_to(outside)
+
+    async with _client(harness.app) as client:
+        resp = await client.get(f"/ui/exports/{export_id}/package.json")
+    assert resp.status_code == 404
+    assert b"SENTINEL-OUTSIDE-EXPORTS" not in resp.content
+
+
 # ============================================================================
 # Listing + nav
 # ============================================================================
@@ -461,3 +486,28 @@ async def test_post_ui_export_reobtains_and_never_rides_a_stale_preview(harness:
     assert "categorization_complete" in resp.text  # refused on the rebuilt (BLOCKED) close
     assert _log_rows(harness) == []
     assert _tree_bytes(harness.export_dir) == before
+
+
+async def test_ui_export_refusal_leaves_a_prior_export_byte_identical(harness: Harness):
+    """AC-11/12 (non-empty baseline): the refusal tests above capture `before` with no
+    prior export, so their byte-identity check reduces to `{} == {}`. This seeds one
+    SUCCESSFUL export first, so the comparison protects REAL prior bytes — after a later
+    BLOCKED `POST /ui/export`, the earlier folder + log row are left byte-identical and no
+    second folder appears (mirrors B's `test_export_blocked_after_prior_export_...`)."""
+    await _ready_three_sources(harness)
+    ok = await _post_ui_export(harness.app, PERIOD)
+    assert ok.status_code == 200
+    assert len(_export_folders(harness)) == 1
+    before = _tree_bytes(harness.export_dir)
+    assert before  # a real export is present — the baseline is genuinely non-empty
+
+    # Flip the period to BLOCKED: a fresh unresolved flag breaks categorization_complete.
+    await harness.ledger_store.store(
+        make_txn(vendor="Late Gibberish Qqzz", amount="7.00", tax="0",
+                 date=datetime(2026, 5, 20), description="")
+    )
+    resp = await _post_ui_export(harness.app, PERIOD)
+    assert resp.status_code == 200
+    assert "categorization_complete" in resp.text     # refused on the rebuilt (BLOCKED) close
+    assert _tree_bytes(harness.export_dir) == before   # prior export byte-identical
+    assert len(_export_folders(harness)) == 1          # no second folder

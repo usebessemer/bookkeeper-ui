@@ -39,9 +39,11 @@ from bookkeeper_ui.confirmations import (
     Confirmation,
     FileConfirmationStore,
 )
+from bookkeeper_ui.exporter import export_package
 from bookkeeper_ui.ledger_store import FileLedgerStore, transaction_key
 from bookkeeper_ui.reconciliations import FileReconciliationStore
 from bookkeeper_ui.statement_store import FileStatementStore
+from bookkeeper_ui.views import build_package
 from bookkeeper_ui.waivers import FileWaiverStore, Waiver
 from tests.conftest import make_stmt_line, make_txn
 
@@ -186,6 +188,26 @@ def _export_folders(harness: Harness) -> list[Path]:
     return sorted(p for p in harness.export_dir.iterdir() if p.is_dir())
 
 
+# Every input-store file `build_package` reads on the export rebuild — snapshotted to
+# prove the refusal path is read-only (a file that does not exist snapshots as None).
+_INPUT_STORE_FILES = (
+    "ledger.jsonl",
+    "confirmations.jsonl",
+    "statements.jsonl",
+    "reconciliations.jsonl",
+    "closes.jsonl",
+    "anomaly_reviews.jsonl",
+    "reconciliation_waivers.jsonl",
+)
+
+
+def _input_snapshot(data_dir: Path) -> dict[str, bytes | None]:
+    return {
+        name: ((data_dir / name).read_bytes() if (data_dir / name).exists() else None)
+        for name in _INPUT_STORE_FILES
+    }
+
+
 # ============================================================================
 # AC-15 — a successful export: four Core files, one log row, matching hashes
 # ============================================================================
@@ -226,6 +248,15 @@ async def test_successful_export_writes_four_core_files_one_row_matching_hashes(
         "accountant_format": harness.config.accountant_format,
     }
 
+    # The manifest's non-hash body fields (dropping/corrupting any of these otherwise
+    # survives — AC-15 pins only `files` + `basis`).
+    assert manifest["export_id"] == result["export_id"]
+    assert manifest["period"] == PERIOD
+    assert manifest["package_status"] == "proposed"
+    assert manifest["app_version"]  # non-empty
+    parsed = datetime.fromisoformat(manifest["exported_at"])  # parseable ISO 8601
+    assert parsed.tzinfo is not None and parsed.utcoffset().total_seconds() == 0  # UTC
+
 
 async def test_package_json_is_the_get_package_serialization_verbatim(harness: Harness):
     """package.json equals the GET /package body verbatim (same projection, serialized once)."""
@@ -258,6 +289,84 @@ async def test_reexport_same_period_appends_new_folder_and_row_prior_untouched(h
 
     after = {p.name: p.read_bytes() for p in folder1.iterdir()}
     assert after == before  # the first export was never rewritten
+
+
+async def test_export_id_collision_is_a_hard_error_prior_untouched(harness: Harness):
+    """The no-clobber defense (`exporter.py`'s `folder.mkdir(exist_ok=False)`): two
+    exports of the same period at the SAME `exported_at` map to the SAME export_id — the
+    second raises FileExistsError and the first export's bytes are left untouched (never
+    a silent overwrite). Drives `export_package` directly with a fixed timestamp, since
+    the HTTP route mints its own (microsecond-resolution) time per call — the collision
+    is otherwise unreachable through the endpoint."""
+    await _ready_three_sources(harness)
+    package = await build_package(
+        config=harness.config,
+        ledger_store=harness.ledger_store,
+        confirmation_store=harness.confirmation_store,
+        statement_store=harness.statement_store,
+        reconciliation_store=harness.reconciliation_store,
+        close_store=harness.close_store,
+        anomaly_review_store=harness.anomaly_review_store,
+        waiver_store=harness.waiver_store,
+        period=PERIOD,
+    )
+    assert package.status == "proposed"
+    fixed = datetime(2026, 7, 5, 12, 0, 0, tzinfo=timezone.utc)
+
+    first = export_package(
+        package=package, config=harness.config, export_dir=harness.export_dir,
+        exported_at=fixed, app_version="test",
+    )
+    folder = harness.export_dir / first.export_id
+    before = {p.name: p.read_bytes() for p in folder.iterdir()}
+
+    # A second export at the identical timestamp collides onto the identical folder.
+    with pytest.raises(FileExistsError):
+        export_package(
+            package=package, config=harness.config, export_dir=harness.export_dir,
+            exported_at=fixed, app_version="test",
+        )
+
+    after = {p.name: p.read_bytes() for p in folder.iterdir()}
+    assert after == before  # the prior export was never overwritten
+
+
+# ============================================================================
+# divergence_count flows package → POST result → manifest → log (exact value)
+# ============================================================================
+
+
+async def test_divergence_count_flows_package_to_result_manifest_and_log(harness: Harness):
+    """A human correction (a confirmation overriding a proposal to a DIFFERENT account)
+    makes divergence_count == 1; that exact value flows package → the POST result →
+    manifest.json → the append-only log row (a mutation hardcoding 0 anywhere on the
+    write path is caught)."""
+    aws = _aws()
+    await harness.ledger_store.store(aws)
+    await harness.ledger_store.store(_rent())
+    await harness.confirmation_store.record(  # correct AWS away from its 5100 proposal
+        Confirmation(transaction_id=transaction_key(aws), account="5000-office-supplies",
+                     source=SOURCE_HUMAN, decided_at=datetime(2026, 7, 1, tzinfo=timezone.utc))
+    )
+    await _waive(harness.waiver_store)
+
+    # The preview carries the divergence.
+    async with _client(harness.app) as client:
+        preview = (await client.get("/package", params={"period": PERIOD})).json()
+    assert preview["divergence_count"] == 1
+
+    resp = await _post_export(harness.app)
+    assert resp.status_code == 200
+    result = resp.json()
+    assert result["divergence_count"] == 1  # the POST result
+
+    folder = harness.export_dir / result["export_id"]
+    manifest = json.loads((folder / "manifest.json").read_bytes())
+    assert manifest["divergence_count"] == 1  # the manifest body
+
+    rows = _log_rows(harness)
+    assert len(rows) == 1
+    assert json.loads(rows[0])["divergence_count"] == 1  # the append-only log row
 
 
 # ============================================================================
@@ -327,14 +436,14 @@ async def test_export_rebuild_is_read_only_on_refusal(harness: Harness):
                      source=SOURCE_HUMAN, decided_at=datetime(2026, 7, 1, tzinfo=timezone.utc))
     )
     await _waive(harness.waiver_store)
-    ledger_before = (harness.data_dir / "ledger.jsonl").read_bytes()
-    conf_before = (harness.data_dir / "confirmations.jsonl").read_bytes()
+    # Sweep EVERY input store build_package reads on the rebuild — not just ledger +
+    # confirmations (it also reads statements / reconciliations / closes / waivers).
+    before = _input_snapshot(harness.data_dir)
 
     resp = await _post_export(harness.app)
     assert resp.status_code == 409
 
-    assert (harness.data_dir / "ledger.jsonl").read_bytes() == ledger_before
-    assert (harness.data_dir / "confirmations.jsonl").read_bytes() == conf_before
+    assert _input_snapshot(harness.data_dir) == before  # not one input-store byte changed
     assert not harness.export_dir.exists()
 
 

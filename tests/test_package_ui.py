@@ -124,6 +124,25 @@ def _row(html: str, needle: str) -> str:
     return matches[0]
 
 
+def _section(html: str, css_class: str) -> str:
+    """The single `<section>` whose class list contains `css_class` — scopes an
+    assertion to one block (e.g. the tax breakout) so a value in a *different* section
+    (e.g. an entry's tax cell) cannot satisfy it."""
+    m = re.search(
+        rf'<section class="[^"]*\b{re.escape(css_class)}\b[^"]*">.*?</section>',
+        html, re.DOTALL,
+    )
+    assert m, f"no <section> with class {css_class!r}"
+    return m.group(0)
+
+
+def _banner(html: str) -> str:
+    """The divergence-banner block (asserts exactly one is present)."""
+    m = re.search(r'<div class="result divergence-banner">.*?</div>', html, re.DOTALL)
+    assert m, "no divergence banner in the page"
+    return m.group(0)
+
+
 # Grounded against the shipped example config (chart + owner_policies + HST), same as
 # test_package.py:
 #   "AWS"            → owner-rule proposal (5100-software-subscriptions), conf 1.0.
@@ -313,9 +332,31 @@ async def test_overlay_diverging_confirmation_shows_badge_and_banner(harness: Ha
     assert "5000-office-supplies" in aws_row
     # Rent was not corrected → no badge on its row.
     assert "diverges-badge" not in _row(html, "Rent")
-    # The banner appears, naming the one correction.
-    assert "divergence-banner" in html
-    assert "1 correction" in html or ">1</strong>" in html
+    # The banner appears, naming the ONE correction. The template puts `</strong>`
+    # between the count and the word, so pin the real rendered tokens (count + singular
+    # grammar), not a "1 correction" contiguous literal (which never appears).
+    banner = _banner(html)
+    assert "<strong>1</strong>" in banner   # the exact count
+    assert "corrections" not in banner       # singular noun ("correction")
+    assert "are recorded" not in banner      # singular verb ("is recorded")
+
+
+async def test_overlay_two_corrections_pluralize_the_banner(harness: Harness):
+    """AC-13: with TWO corrected entries the banner pins the plural grammar —
+    `<strong>2</strong>`, "corrections" (not "correction"), and "are" (not "is") — so a
+    mutation that hardcodes the count or drops pluralization is caught."""
+    aws = _aws()
+    rent = _rent()
+    await harness.ledger_store.store(aws)
+    await harness.ledger_store.store(rent)
+    await _waive(harness)
+    await _confirm(harness, aws, "5000-office-supplies")   # corrected away from 5100
+    await _confirm(harness, rent, "5000-office-supplies")  # corrected away from 6100
+
+    banner = _banner((await _get(harness.app)).text)
+    assert "<strong>2</strong>" in banner    # the exact count
+    assert "corrections" in banner            # plural noun
+    assert "are recorded" in banner           # plural verb
 
 
 async def test_overlay_is_additive_framework_fields_identical(harness: Harness):
@@ -358,8 +399,15 @@ async def test_overlay_is_additive_framework_fields_identical(harness: Harness):
 async def test_proposed_page_renders_banner_basis_summary_and_tax_reconciliation(harness: Harness):
     """A PROPOSED package renders the 'proposed / never auto-published' banner, the
     basis line (period · method · jurisdiction · regime), the summary counts, and the
-    tax + reconciliation sections with exact-string money."""
-    await harness.ledger_store.store(_aws(amount="82.50", tax="6.50"))
+    tax + reconciliation sections with exact-string money — the tax breakout's per-target
+    reclaimable / period-total cells and the summary counts pinned to DISTINCT values
+    (scoped to their own sections) so a field-swap (reclaimable ↔ transaction_count) or a
+    dropped/hardcoded summary count is caught."""
+    await harness.ledger_store.store(_aws(amount="82.50", tax="6.50"))  # target-001
+    await harness.ledger_store.store(  # a second target so period_total != any per-target
+        make_txn(vendor="AWS", amount="30.00", tax="2.00", date=datetime(2026, 5, 4),
+                 description="cloud", attribution_target_id="target-002")
+    )
     await _waive(harness)
     html = (await _get(harness.app)).text
 
@@ -373,6 +421,24 @@ async def test_proposed_page_renders_banner_basis_summary_and_tax_reconciliation
     assert "82.50" in html
     assert "6.50" in html
     assert "82.5<" not in html  # not truncated to 82.5
+
+    # Summary counts, scoped to the summary block and asserted at their exact rendered
+    # values (a hardcoded PackageSummaryOut(0, …) or a dropped field is caught): two
+    # owner-rule proposals, nothing flagged → processed 2 / auto_filed 2 / reviewed 0 / open 0.
+    summary = _section(html, "package-summary")
+    assert "<strong>2</strong> processed" in summary
+    assert "2 auto-filed" in summary
+    assert "0 reviewed" in summary
+    assert "0 open" in summary
+
+    # Tax breakout — each per-target reclaimable + the period total, scoped to the tax
+    # block, pinned to DISTINCT values (6.50 / 2.00 / 8.50, none equal to a
+    # transaction_count of 1) so a reclaimable ↔ transaction_count field-swap, or a
+    # per-target ↔ period-total swap, is caught.
+    tax = _section(html, "package-tax")
+    assert "$6.50" in _row(tax, "target-001")  # reclaimable (with $), NOT the count (1)
+    assert "$2.00" in _row(tax, "target-002")
+    assert "$8.50" in tax  # period total = 6.50 + 2.00, distinct from both per-target rows
 
 
 async def test_export_control_requires_ack_only_when_divergences_exist(harness: Harness):

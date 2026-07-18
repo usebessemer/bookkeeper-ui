@@ -244,20 +244,19 @@ def export_package(
     folder = export_dir / export_id
     folder.mkdir(exist_ok=False)  # never overwrite an existing export
 
-    # Write the three hashed Core files, hashing the exact bytes as written.
-    package_bytes = json.dumps(package.model_dump(mode="json"), indent=2).encode("utf-8")
-    entries_bytes = _entries_csv_bytes(package)
-    tax_bytes = _tax_summary_csv_bytes(package)
-
-    (folder / PACKAGE_JSON).write_bytes(package_bytes)
-    (folder / ENTRIES_CSV).write_bytes(entries_bytes)
-    (folder / TAX_SUMMARY_CSV).write_bytes(tax_bytes)
-
-    files = [
-        _file_record(PACKAGE_JSON, package_bytes),
-        _file_record(ENTRIES_CSV, entries_bytes),
-        _file_record(TAX_SUMMARY_CSV, tax_bytes),
-    ]
+    # The three hashed Core files' exact bytes, keyed by name. Written and recorded by
+    # iterating `_HASHED_FILES` — the single source of truth for which files (and in
+    # what order) an export holds and hashes.
+    hashed_bytes = {
+        PACKAGE_JSON: json.dumps(package.model_dump(mode="json"), indent=2).encode("utf-8"),
+        ENTRIES_CSV: _entries_csv_bytes(package),
+        TAX_SUMMARY_CSV: _tax_summary_csv_bytes(package),
+    }
+    files = []
+    for name in _HASHED_FILES:
+        data = hashed_bytes[name]
+        (folder / name).write_bytes(data)  # hashing the exact bytes as written
+        files.append(_file_record(name, data))
 
     # The manifest indexes and hashes the other three; it excludes itself.
     manifest_bytes = _manifest_bytes(
