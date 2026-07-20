@@ -41,14 +41,16 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from bookkeeper.config import BookkeeperConfig
 from bookkeeper.skills.flag_anomaly import flag_anomaly
+from bookkeeper.skills.generate_package import PackageStatus
 from bookkeeper.skills.track_tax import UnknownTaxRegime
 
 from bookkeeper_ui.anomaly_reviews import (
@@ -64,6 +66,7 @@ from bookkeeper_ui.closes import (
     transaction_in_closed_period,
 )
 from bookkeeper_ui.confirmations import SOURCE_HUMAN, Confirmation, FileConfirmationStore
+from bookkeeper_ui.exporter import MANIFEST_JSON, FileExportStore, export_package
 from bookkeeper_ui.importer import TransactionImportError, import_bytes
 from bookkeeper_ui.ledger_store import FileLedgerStore, transaction_key
 from bookkeeper_ui.periods import is_quarterly_period, period_of
@@ -87,6 +90,7 @@ from bookkeeper_ui.views import (
     build_close_record,
     build_close_review,
     build_ledger,
+    build_package,
     build_reconciliation,
 )
 from bookkeeper_ui.waivers import FileWaiverStore, Waiver
@@ -112,6 +116,8 @@ def register_ui(
     close_store: FileCloseStore | None = None,
     anomaly_review_store: FileAnomalyReviewStore | None = None,
     waiver_store: FileWaiverStore | None = None,
+    export_dir: str | Path | None = None,
+    export_store: FileExportStore | None = None,
 ) -> None:
     """Mount the HTML UI on `app`, reading through the same injected stores as #2.
 
@@ -127,6 +133,14 @@ def register_ui(
     the shipped tests that mount the UI with the five kwargs keep working. Here
     only `close_store` is read — it is the closed-period truth the UI write-path
     guards below probe; the other two are threaded for issues B–E.
+
+    The Slice-4 export surface (`export_dir` / `export_store`) is threaded the same
+    way (both **optional**, default `None`, mirroring `create_app`) so pre-Slice-4
+    call sites keep working. `export_store` is the *same* append-only log
+    (`exports.jsonl`) the JSON `GET /export`(s) reads — the UI exports listing +
+    guarded download read through it, never re-reading the JSONL by hand; the
+    export action reuses B's `export_package`. When unwired the exports listing
+    renders its empty state and the download route 404s (there is nothing to serve).
     """
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -891,4 +905,233 @@ def register_ui(
             request,
             "_close_signed.html",
             {"record": CloseRecordOut.from_record(record).model_dump(), "period": period},
+        )
+
+    # --- Slice 4 · C: the accountant-package preview (read-only). The human surface
+    # over the Contract A deliverable — the SAME `views.build_package` projection the
+    # JSON `GET /package` (issue A) serializes (one projection, no second computation,
+    # no direct `generate_accountant_package` call). It renders the honest two-state
+    # picture: PROPOSED (assembled, never auto-published — the full trust trail + tax
+    # + reconciliation + the app's confirmation overlay) or BLOCKED (the framework's
+    # `unmet_close` reason verbatim, no deliverable, no export control). The Export
+    # button + acknowledgment checkbox on a PROPOSED page are client convenience only
+    # — the real §5.4 refusal gate lives server-side in issue B's `POST /export`, which
+    # re-obtains the close and refuses a non-PROPOSED package regardless of this page.
+
+    @app.get("/ui/package", response_class=HTMLResponse, summary="The accountant-package preview")
+    async def ui_package(request: Request, period: str = _DEFAULT_PERIOD) -> HTMLResponse:
+        """The accountant-package preview for `period` — proposed (assembled) or blocked.
+
+        Reads `views.build_package` and renders `package.html` — the same projection
+        the JSON `GET /package` serializes, so HTML and JSON render identical state.
+        A PROPOSED package carries the full trail (summary, the costed/categorized/taxed
+        entries with their trust trail + the additive confirmation overlay, the tax
+        breakout, the reconciliation trail); a BLOCKED package renders `unmet_close`
+        verbatim with no export control.
+
+        An unregistered `tax_regime` makes `track_tax` fail fast (`UnknownTaxRegime`);
+        it is rendered into the page as an error (the Slice-1 error-into-the-page
+        rule), never a 500.
+        """
+        try:
+            package = await build_package(
+                config=config,
+                ledger_store=ledger_store,
+                confirmation_store=confirmation_store,
+                statement_store=statement_store,
+                reconciliation_store=reconciliation_store,
+                close_store=close_store,
+                anomaly_review_store=anomaly_review_store,
+                waiver_store=waiver_store,
+                period=period,
+            )
+        except UnknownTaxRegime as exc:
+            return templates.TemplateResponse(
+                request, "package.html", {"period": period, "error": str(exc)}
+            )
+        return templates.TemplateResponse(
+            request,
+            "package.html",
+            {"period": period, "package": package},
+        )
+
+    # --- Slice 4 · D: the exports listing + guarded download + the export action.
+    # The read/serve surface over what B wrote — the SAME append-only `exports.jsonl`
+    # log the JSON `GET /exports` reads (`export_store`), never a second reader. The
+    # listing lets a human *see the log*; the download lets him *pull the local files*
+    # (`FileResponse` from the local exports dir to the local browser — the entire
+    # transport story; nothing leaves the machine). The export action (`POST /ui/export`)
+    # is the human twin of B's JSON `POST /export`: it re-obtains the package from the
+    # app's own stores and reuses B's `export_package` (no second write path).
+
+    def _download_names(record) -> list[str]:
+        """The exact filenames downloadable for one export — the log row's file-list
+        (the three hashed Core files) plus the manifest, which the row deliberately
+        excludes from its own hash set. This closed set is the download allow-list."""
+        return [str(f["name"]) for f in record.files] + [MANIFEST_JSON]
+
+    def _export_files(record) -> list[dict[str, str]]:
+        """Per-file ``{name, url}`` for one export — one guarded-download link per Core
+        file (path segments URL-encoded), for the listing rows + the export result."""
+        return [
+            {
+                "name": name,
+                "url": f"/ui/exports/{quote(record.export_id, safe='')}/{quote(name, safe='')}",
+            }
+            for name in _download_names(record)
+        ]
+
+    @app.get("/ui/exports", response_class=HTMLResponse, summary="The exports listing")
+    async def ui_exports(request: Request, period: str = _DEFAULT_PERIOD) -> HTMLResponse:
+        """The exports listing — the whole append-only log, newest-first.
+
+        A read: reads the *same* `export_store` log (`exports.jsonl`) the JSON
+        `GET /exports` serializes (never a second reader), and renders every export
+        with its id/period/status/time/divergence plus one guarded-download link per
+        Core file. `period` only carries the nav context (it never filters the log —
+        the listing shows *all* exports); an unwired export surface renders the honest
+        empty state, never a 500. Writes nothing.
+        """
+        records = list(await export_store.all()) if export_store is not None else []
+        rows = [
+            {
+                "export_id": record.export_id,
+                "period": record.period,
+                "package_status": record.package_status,
+                "exported_at": record.exported_at.isoformat(),
+                "divergence_count": record.divergence_count,
+                "files": _export_files(record),
+            }
+            for record in reversed(records)  # newest-first (reverse of insertion order)
+        ]
+        return templates.TemplateResponse(
+            request, "exports.html", {"period": period, "exports": rows}
+        )
+
+    @app.get(
+        "/ui/exports/{export_id}/{filename}",
+        summary="Download one exported Core file (guarded)",
+    )
+    async def ui_export_download(export_id: str, filename: str) -> FileResponse:
+        """Serve one exported Core file from the local exports dir — the guarded route.
+
+        The guard is the whole point (Slice-4 AC-17): the file is served *only* when
+        both `export_id` and `filename` are exact string members of the injected log —
+        `export_id` a real log row, `filename` one of that row's Core files (the
+        allow-list, never disk presence). Any name not literally in that closed set
+        (a traversal `../`, an absolute path, an unlisted name) fails membership before
+        any path is built → **404**. A second wall confirms the resolved real path is
+        inside the exports root. A listed-but-missing file is a 404, never a 500.
+        Nothing outside `exports/<export_id>/` is ever served.
+        """
+        if export_store is None or export_dir is None:
+            raise HTTPException(status_code=404, detail="no export exists.")
+
+        records = {r.export_id: r for r in await export_store.all()}
+        record = records.get(export_id)
+        if record is None:  # unknown export id — never a served file
+            raise HTTPException(
+                status_code=404, detail=f"export {export_id!r} is not in the export log."
+            )
+        if filename not in _download_names(record):  # exact-membership allow-list
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"{filename!r} is not a file of export {export_id!r} — only the "
+                    f"export's own Core files are served."
+                ),
+            )
+
+        # Build the path from the validated, listed values only — then a defensive
+        # second wall: the resolved real path must sit inside the exports root.
+        root = Path(export_dir).resolve()
+        candidate = (root / export_id / filename).resolve()
+        if not candidate.is_relative_to(root):
+            raise HTTPException(status_code=404, detail="not found.")
+        if not candidate.is_file():  # listed but missing on disk → 404, never a 500
+            raise HTTPException(status_code=404, detail="not found.")
+        return FileResponse(candidate, filename=filename)
+
+    @app.post(
+        "/ui/export",
+        response_class=HTMLResponse,
+        summary="Export the package to local files (htmx)",
+    )
+    async def ui_export(
+        request: Request,
+        period: str = Form(_DEFAULT_PERIOD),
+        acknowledged: str = Form(""),
+    ) -> HTMLResponse:
+        """Export `period`'s package to local files — the human twin of B's `POST /export`.
+
+        Does the **same** §5.4 server-side re-obtain B does: rebuilds the package from
+        the app's own stores at request time (`build_package`), never trusting the
+        previewed page or any client state (the `acknowledged` checkbox is UX-only —
+        never a server gate). Then:
+
+        - export surface unwired → an error partial (nothing written);
+        - a **non-PROPOSED** rebuild → the refusal rendered into the partial quoting
+          `unmet_close` verbatim, **writing nothing** (no folder, no log row) — the
+          web convention (a human error is a 200 partial; B's machine route keeps 409);
+        - PROPOSED → reuse B's `export_package` (the sole write path — a fresh folder +
+          exactly one appended log row) and render the export id + one guarded-download
+          link per Core file.
+
+        An unregistered `tax_regime` makes the rebuild fail fast (`UnknownTaxRegime`);
+        it is rendered into the partial as an error (the Slice-1 error-into-the-page
+        rule), never a 500.
+        """
+        if export_dir is None or export_store is None:
+            return templates.TemplateResponse(
+                request,
+                "_export_result.html",
+                {"error": "the export directory is not configured on this server."},
+            )
+
+        # Re-obtain + rebuild the package server-side — never ride the previewed page.
+        try:
+            package = await build_package(
+                config=config,
+                ledger_store=ledger_store,
+                confirmation_store=confirmation_store,
+                statement_store=statement_store,
+                reconciliation_store=reconciliation_store,
+                close_store=close_store,
+                anomaly_review_store=anomaly_review_store,
+                waiver_store=waiver_store,
+                period=period,
+            )
+        except UnknownTaxRegime as exc:
+            return templates.TemplateResponse(
+                request, "_export_result.html", {"period": period, "error": str(exc)}
+            )
+
+        # A non-PROPOSED rebuild refuses into the partial, writing nothing.
+        if package.status != PackageStatus.PROPOSED.value:
+            return templates.TemplateResponse(
+                request,
+                "_export_result.html",
+                {"period": period, "refusal": package.unmet_close},
+            )
+
+        # PROPOSED → reuse B's exporter (the sole write path); no second exporter here.
+        from bookkeeper_ui import __version__  # local: avoids the __init__↔web cycle
+
+        record = export_package(
+            package=package,
+            config=config,
+            export_dir=Path(export_dir),
+            exported_at=datetime.now(timezone.utc),
+            app_version=__version__,
+        )
+        await export_store.record(record)
+        return templates.TemplateResponse(
+            request,
+            "_export_result.html",
+            {
+                "period": period,
+                "export_id": record.export_id,
+                "files": _export_files(record),
+                "divergence_count": record.divergence_count,
+            },
         )

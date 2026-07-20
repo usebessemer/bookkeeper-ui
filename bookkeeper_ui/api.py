@@ -57,6 +57,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from bookkeeper.config import BookkeeperConfig
 from bookkeeper.skills.categorize import categorize
 from bookkeeper.skills.flag_anomaly import flag_anomaly
+from bookkeeper.skills.generate_package import PackageStatus
 from bookkeeper.skills.reconcile import reconcile_account
 from bookkeeper.skills.track_tax import UnknownTaxRegime
 
@@ -78,6 +79,7 @@ from bookkeeper_ui.confirmations import (
     Confirmation,
     FileConfirmationStore,
 )
+from bookkeeper_ui.exporter import FileExportStore, export_package
 from bookkeeper_ui.importer import TransactionImportError, import_bytes
 from bookkeeper_ui.ledger_store import FileLedgerStore, transaction_key
 from bookkeeper_ui.periods import is_quarterly_period, period_of
@@ -95,8 +97,11 @@ from bookkeeper_ui.schemas import (
     CloseRecordOut,
     CloseReviewOut,
     ConfirmationOut,
+    ExportRecordOut,
+    ExportResultOut,
     ImportResultOut,
     LedgerOut,
+    PackageOut,
     ReconcileResolutionOut,
     ReconciliationReportOut,
     ReconciliationViewOut,
@@ -117,6 +122,7 @@ from bookkeeper_ui.views import (
     build_close_record,
     build_close_review,
     build_ledger,
+    build_package,
     build_reconciliation,
 )
 from bookkeeper_ui.waivers import FileWaiverStore, Waiver
@@ -133,6 +139,7 @@ def create_app(
     close_store: FileCloseStore | None = None,
     anomaly_review_store: FileAnomalyReviewStore | None = None,
     waiver_store: FileWaiverStore | None = None,
+    export_dir: str | Path | None = None,
 ) -> FastAPI:
     """Build the API over an injected config + the four #1/Slice-2 stores.
 
@@ -152,7 +159,20 @@ def create_app(
     the append-only targets of the two Slice-3 write endpoints (`/anomalies/review` /
     `/reconciliation/waive`); each endpoint refuses a **503** if its store is unwired,
     so a Slice-1/2 app never silently no-ops a write.
+
+    `export_dir` (Slice-4 · B) is **optional** (default `None`) on the same footing:
+    the Slice-4 export write path (`POST /export`) writes the export folder under it
+    and appends to its `exports.jsonl` log (built over the dir here). When unwired
+    both export routes refuse a **503** — never a silent no-op — so every pre-Slice-4
+    call site keeps constructing the app unchanged.
     """
+    # The append-only export log lives beside the per-export folders, under the
+    # injected export dir. Unwired → no export surface (the routes 503).
+    export_store: FileExportStore | None = (
+        FileExportStore(Path(export_dir) / "exports.jsonl")
+        if export_dir is not None
+        else None
+    )
     app = FastAPI(
         title="bookkeeper-ui API",
         description=(
@@ -546,6 +566,135 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return CloseReviewOut.from_review(review)
 
+    # --- Slice 4 · A: the accountant-package preview (read-only). The read side of
+    # the Contract A deliverable — `generate_accountant_package` over the effective
+    # close (`build_package` delegates to the same `build_close_review` GET /close
+    # uses), plus the app's confirmation overlay. No exporter / write path here.
+
+    @app.get(
+        "/package",
+        response_model=PackageOut,
+        response_model_exclude_none=False,
+        summary="The accountant-package preview projection (proposed | blocked)",
+    )
+    async def package(period: str) -> PackageOut:
+        """The accountant-package preview for `period` — proposed (assembled) or blocked.
+
+        Delegates to `views.build_package`, the single projection `GET /ui/package`
+        (a later issue) will also read. A PROPOSED package (the effective close was
+        READY) is a **200** carrying the full trail; a BLOCKED package (the effective
+        close was not READY, or the period is already closed) is also a **200** with a
+        non-null `unmet_close` — a blocked package is the honest answer, not an error.
+
+        A `tax_regime` the framework does not register makes `track_tax` fail fast with
+        `UnknownTaxRegime`; it is surfaced as a **400** (mirrors `GET /close`), never
+        swallowed — the example config is `HST`, which registers.
+        """
+        try:
+            return await build_package(
+                config=config,
+                ledger_store=ledger_store,
+                confirmation_store=confirmation_store,
+                statement_store=statement_store,
+                reconciliation_store=reconciliation_store,
+                close_store=close_store,
+                anomaly_review_store=anomaly_review_store,
+                waiver_store=waiver_store,
+                period=period,
+            )
+        except UnknownTaxRegime as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # --- Slice 4 · B: the export write path. `POST /export` re-obtains the close
+    # server-side through the **same** `build_package` projection `GET /package`
+    # reads (never trusting client-supplied or previously-previewed state), gates on
+    # the freshly-rebuilt status, and only on PROPOSED writes a fresh export folder +
+    # one append-only log row. A BLOCKED rebuild is a 409 quoting `unmet_close` with
+    # nothing written. `GET /exports` lists the log in order. No transmission of any
+    # kind — local files + the local-browser download (a later UI issue) only.
+
+    @app.post(
+        "/export",
+        response_model=ExportResultOut,
+        summary="Export the accountant package to local files (§5.4)",
+    )
+    async def export(period: str) -> ExportResultOut:
+        """Export `period`'s accountant package — the §5.4 write path (`POST /export`).
+
+        The server **re-obtains the close and rebuilds the package from its own
+        stores** at request time (via `build_package`, the same projection
+        `GET /package` reads): it never trusts client-supplied state or a previously
+        previewed package. Then:
+
+        - The export directory unwired → **503** (never a silent no-op).
+        - The rebuilt package is **not PROPOSED** (`status != "proposed"` — a BLOCKED
+          close, or an already-closed period) → **409** quoting `unmet_close`
+          verbatim, and **nothing is written** (no folder, no log row). Because
+          `build_package` only reads its stores and runs the pure skills, the refusal
+          path is read-only.
+        - PROPOSED → write the fresh `exports/<export_id>/` folder (the four Core
+          files), append **exactly one** log row, and echo the `ExportResultOut`.
+
+        A `tax_regime` the framework does not register makes the rebuild fail fast with
+        `UnknownTaxRegime`, surfaced as a **400** (mirrors `GET /package`).
+        """
+        if export_dir is None or export_store is None:
+            raise HTTPException(
+                status_code=503,
+                detail="the export directory is not configured on this server.",
+            )
+
+        # Re-obtain + rebuild the package server-side — never trust client state.
+        try:
+            package = await build_package(
+                config=config,
+                ledger_store=ledger_store,
+                confirmation_store=confirmation_store,
+                statement_store=statement_store,
+                reconciliation_store=reconciliation_store,
+                close_store=close_store,
+                anomaly_review_store=anomaly_review_store,
+                waiver_store=waiver_store,
+                period=period,
+            )
+        except UnknownTaxRegime as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # A non-PROPOSED rebuild refuses, writing nothing (no folder, no log row).
+        if package.status != PackageStatus.PROPOSED.value:
+            raise HTTPException(status_code=409, detail=package.unmet_close)
+
+        # PROPOSED → the sole write path: a fresh folder + one appended log row.
+        from bookkeeper_ui import __version__  # local: avoids the __init__↔api cycle
+
+        record = export_package(
+            package=package,
+            config=config,
+            export_dir=Path(export_dir),
+            exported_at=datetime.now(timezone.utc),
+            app_version=__version__,
+        )
+        await export_store.record(record)
+        return ExportResultOut.from_record(record)
+
+    @app.get(
+        "/exports",
+        response_model=list[ExportRecordOut],
+        summary="The export log (append-only, in export order)",
+    )
+    async def exports() -> list[ExportRecordOut]:
+        """The export log for this app — every export in export (insertion) order.
+
+        Reads `exports.jsonl` through the store's `all()` (no writes). The export
+        directory unwired → **503** (mirrors `POST /export`).
+        """
+        if export_store is None:
+            raise HTTPException(
+                status_code=503,
+                detail="the export directory is not configured on this server.",
+            )
+        return [ExportRecordOut.from_record(record) for record in await export_store.all()]
+
     # --- Slice 3: the thin write endpoints (issue C). Acknowledge an anomaly flag
     # and waive a no-statement period — the two small writes that feed close review's
     # gate B (anomalies-reviewed) and gate C (statement-or-waiver). Each writes only
@@ -807,6 +956,8 @@ def create_app(
         close_store=close_store,
         anomaly_review_store=anomaly_review_store,
         waiver_store=waiver_store,
+        export_dir=export_dir,
+        export_store=export_store,
     )
 
     return app
@@ -823,6 +974,9 @@ def build_app_from_env() -> FastAPI:
                                    confirmation + reconciliation + close + anomaly
                                    review + waiver files (default ``data``); each
                                    created on first write.
+    - ``BOOKKEEPER_UI_EXPORT_DIR`` — directory the export write path writes to (the
+                                   per-export folders + the `exports.jsonl` log);
+                                   default ``<data_dir>/exports``.
 
     The wiring is deliberately thin: #3 (the UI) owns the real run surface. This
     exists so the API is runnable on its own for local development and the tests
@@ -835,6 +989,7 @@ def build_app_from_env() -> FastAPI:
     """
     config_path = os.environ.get("BOOKKEEPER_UI_CONFIG", "examples/config.json")
     data_dir = Path(os.environ.get("BOOKKEEPER_UI_DATA_DIR", "data"))
+    export_dir = Path(os.environ.get("BOOKKEEPER_UI_EXPORT_DIR", str(data_dir / "exports")))
     return create_app(
         config=load_config(config_path),
         ledger_store=FileLedgerStore(data_dir / "ledger.jsonl"),
@@ -844,4 +999,5 @@ def build_app_from_env() -> FastAPI:
         close_store=FileCloseStore(data_dir / "closes.jsonl"),
         anomaly_review_store=FileAnomalyReviewStore(data_dir / "anomaly_reviews.jsonl"),
         waiver_store=FileWaiverStore(data_dir / "reconciliation_waivers.jsonl"),
+        export_dir=export_dir,
     )

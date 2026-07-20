@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Exports &mdash; Bookkeeper{% endblock %}
+{% block content %}
+{# The exports listing (Slice 4 · D) — the whole append-only export log, newest-first.
+   A pure read of the SAME `exports.jsonl` the JSON `GET /exports` serializes (no second
+   reader, no writes). Each row carries its id/period/status/time/divergence plus one
+   guarded-download link per Core file (each → the `GET /ui/exports/{id}/{name}` route,
+   which serves the local file to the local browser — nothing is transmitted). #}
+<h1>Exports</h1>
+
+<p class="lead">
+  Every accountant package you have exported, newest first. Each file downloads to
+  this machine only &mdash; nothing is transmitted. You send it to your accountant
+  by hand.
+</p>
+
+{% if exports %}
+<table class="ledger exports">
+  <thead>
+    <tr>
+      <th>Exported at</th>
+      <th>Export ID</th>
+      <th>Period</th>
+      <th>Status</th>
+      <th>Divergences</th>
+      <th>Files</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for e in exports %}
+    <tr>
+      <td>{{ e.exported_at }}</td>
+      <td><code>{{ e.export_id }}</code></td>
+      <td>{{ e.period }}</td>
+      <td><span class="tag status-{{ e.package_status }}">{{ e.package_status }}</span></td>
+      <td>{{ e.divergence_count }}</td>
+      <td class="export-files">
+        {% for f in e.files %}
+        <a href="{{ f.url }}" download>{{ f.name }}</a>{% if not loop.last %} &middot; {% endif %}
+        {% endfor %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="result">
+  <p class="empty-state"><strong>No exports yet.</strong></p>
+  <p>Assemble a package on the
+     <a href="/ui/package?period={{ nav_period }}">package preview</a> and export it
+     &mdash; each export appears here with its download links.</p>
+</div>
+{% endif %}
+{% endblock %}
