@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Intake review — Bookkeeper{% endblock %}
+{% block content %}
+<h1>Extraction review</h1>
+<p class="lead">
+  {# aria-live so a screen reader announces the new count when a card resolves and
+     the OOB span updates (AC 21). #}
+  <span id="intake-pending-count" aria-live="polite" tabindex="-1">{{ pending }}</span>
+  receipt{{ "" if pending == 1 else "s" }} to review.
+  Extraction is a <em>proposal</em> &mdash; confirm each against the receipt itself
+  before it enters the ledger.
+</p>
+
+{# hx-on::after-swap moves keyboard focus to the live count once a card leaves, so a
+   keyboard/screen-reader user is not stranded on a removed element (AC 21). #}
+<div id="intake-queue"
+     tabindex="-1"
+     hx-on::after-swap="document.getElementById('intake-pending-count').focus()">
+  {% for entry in candidates %}
+    {% set c = entry.candidate %}
+    {% include "_intake_card.html" %}
+  {% endfor %}
+</div>
+
+{% if not candidates %}
+<p class="empty-state">
+  Nothing to review. New receipts appear here as extractors submit them.
+</p>
+{% endif %}
+{% endblock %}

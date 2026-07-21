@@ -40,6 +40,7 @@ screen can reach none of them — the same convention #21 set for `/ui/resolve`.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import quote
 
@@ -49,6 +50,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from bookkeeper.config import BookkeeperConfig
+from bookkeeper.model import Transaction
 from bookkeeper.skills.flag_anomaly import flag_anomaly
 from bookkeeper.skills.generate_package import PackageStatus
 from bookkeeper.skills.track_tax import UnknownTaxRegime
@@ -59,6 +61,12 @@ from bookkeeper_ui.anomaly_reviews import (
     derive_flag_id,
 )
 from bookkeeper_ui.candidates import (
+    ACTION_CONFIRM,
+    ACTION_REJECT,
+    LEDGER_OUTCOME_ALREADY_PRESENT,
+    LEDGER_OUTCOME_STORED,
+    SOURCE_HUMAN as CANDIDATE_SOURCE_HUMAN,
+    CandidateDecision,
     FileArtifactStore,
     FileCandidateDecisionStore,
     FileCandidateStore,
@@ -84,6 +92,7 @@ from bookkeeper_ui.reconciliations import (
 )
 from bookkeeper_ui.schemas import (
     AnomalyOut,
+    CandidateOut,
     CloseRecordOut,
     CloseReviewOut,
     TransactionOut,
@@ -94,6 +103,7 @@ from bookkeeper_ui.statement_store import FileStatementStore
 from bookkeeper_ui.views import (
     build_close_record,
     build_close_review,
+    build_intake_queue,
     build_ledger,
     build_package,
     build_reconciliation,
@@ -108,6 +118,72 @@ STATIC_DIR = _HERE / "static"
 # (import examples/ → review) is one click. It is only a form pre-fill; the store
 # still derives each transaction's real period from its own date (`period_of`).
 _DEFAULT_PERIOD = "2026-Q2"
+
+
+class _IntakeFieldError(ValueError):
+    """A re-validation failure on a confirmed intake field.
+
+    The confirm path re-runs the A1 submission gate on the human's *edited* values
+    (a form on this surface can post a mangled money string or a bad date). Unlike
+    the JSON `/intake/resolve` twin — which raises a machine 422 — the UI renders
+    the failure *into the card* (a 200 partial the human reads, edits kept), so this
+    is a plain exception the handler catches, not an `HTTPException`.
+    """
+
+
+def _revalidate_money(raw: str, field: str) -> Decimal:
+    """Parse an edited money string to a finite `Decimal`, or raise `_IntakeFieldError`.
+
+    The A1 rule, verbatim (money is a string; `NaN`/`Infinity` parse but are not
+    finite, so they are rejected; never `float()` — guardrail 4).
+    """
+    try:
+        value = Decimal(raw)
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise _IntakeFieldError(
+            f"{field} {raw!r} is not a valid amount — money is a decimal string "
+            f'(e.g. "82.50").'
+        ) from exc
+    if not value.is_finite():
+        raise _IntakeFieldError(
+            f"{field} must be a finite amount — {raw!r} (NaN/Infinity) is rejected."
+        )
+    return value
+
+
+def _revalidate_date(raw: str, field: str) -> datetime:
+    """Parse an edited ISO 8601 date string to a `datetime`, or raise `_IntakeFieldError`."""
+    try:
+        return datetime.fromisoformat(raw)
+    except (ValueError, TypeError) as exc:
+        raise _IntakeFieldError(
+            f"{field} {raw!r} is not an ISO 8601 date/datetime (e.g. 2026-06-14)."
+        ) from exc
+
+
+def _revalidate_nonblank(value: str, field: str) -> str:
+    """Return `value` if non-blank, else raise `_IntakeFieldError` naming the field."""
+    if not value.strip():
+        raise _IntakeFieldError(f"{field} is required and must not be blank.")
+    return value
+
+
+async def _intake_pending_count(
+    candidate_store: FileCandidateStore,
+    candidate_decision_store: FileCandidateDecisionStore,
+) -> int:
+    """The live count of pending candidates, recomputed off the shared projection.
+
+    Never a hand-maintained tally: the OOB counter + pulse both read *this*, off the
+    same `build_intake_queue(status="pending")` the queue page renders, so the count
+    stays honest as cards leave.
+    """
+    queue = await build_intake_queue(
+        candidate_store=candidate_store,
+        candidate_decision_store=candidate_decision_store,
+        status="pending",
+    )
+    return len(queue.candidates)
 
 
 def register_ui(
@@ -126,6 +202,7 @@ def register_ui(
     candidate_store: FileCandidateStore | None = None,
     candidate_decision_store: FileCandidateDecisionStore | None = None,
     artifact_store: FileArtifactStore | None = None,
+    attribution_target_labels: dict[str, str] | None = None,
 ) -> None:
     """Mount the HTML UI on `app`, reading through the same injected stores as #2.
 
@@ -152,13 +229,21 @@ def register_ui(
 
     The three Slice-5 intake stores (`candidate_store` / `candidate_decision_store` /
     `artifact_store`) are threaded the same way (all **optional**, default `None`,
-    mirroring `create_app`) so pre-Slice-5 call sites keep working. This issue (A)
-    only threads them through so the sibling UI slice (issue B) can mount the
-    HTML review queue over the *same* stores the JSON `/intake/*` surface writes;
-    the HTML routes themselves are that later slice's.
+    mirroring `create_app`) so pre-Slice-5 call sites keep working. Issue B mounts the
+    HTML extraction-review surface (`GET /ui/intake` + `POST /ui/intake/resolve`) over
+    the *same* stores the JSON `/intake/*` surface writes.
+
+    `attribution_target_labels` is the **app-side** sidecar map (id string → human
+    label) the intake `<select>` renders through. It is deliberately *not* a field on
+    the framework `BookkeeperConfig` (`from_mapping` silently drops unknown keys), so
+    it travels this same optional-`None`-defaulted param path — read app-side from the
+    config JSON in `build_app_from_env` — and is defaulted to `{}` in the template
+    context. The confirmed value on the wire is always the opaque id string; the label
+    map is presentation-only and never enters validation.
     """
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    intake_labels = attribution_target_labels or {}
 
     @app.get("/", response_class=HTMLResponse, summary="Import screen (home)")
     async def home(request: Request, period: str = _DEFAULT_PERIOD) -> HTMLResponse:
@@ -1148,5 +1233,244 @@ def register_ui(
                 "export_id": record.export_id,
                 "files": _export_files(record),
                 "divergence_count": record.divergence_count,
+            },
+        )
+
+    # --- Slice 5 · B: the extraction-review UI over the intake port (issue A). The
+    # §5 human-confirm gate: extraction is a *proposal* — a human confirms each
+    # candidate against the receipt itself before it enters the ledger. `GET /ui/intake`
+    # renders one editable review card per pending candidate off the SAME shared
+    # `build_intake_queue` projection the JSON `/intake/candidates` serializes;
+    # `POST /ui/intake/resolve` is the form twin of JSON `/intake/resolve` — a confirm
+    # re-validates the human's edits (the A1 gate), guards the edited date against
+    # closed periods, then constructs a framework `Transaction` and enters the EXISTING
+    # ledger store. The reachable refusals render into the card (200 partials the human
+    # reads); the JSON twin keeps the machine 4xx.
+
+    @app.get("/ui/intake", response_class=HTMLResponse, summary="The extraction-review queue")
+    async def ui_intake(request: Request, period: str = _DEFAULT_PERIOD) -> HTMLResponse:
+        """The extraction-review queue — one editable card per pending candidate.
+
+        Reads `build_intake_queue(status="pending")` (the same projection the JSON
+        `GET /intake/candidates` serializes), ordered by `submitted_at`, so HTML and
+        JSON never re-derive a candidate's standing independently — and renders only
+        pending cards, never rejected or confirmed. `period` only carries the nav
+        context: the intake queue is not period-scoped (a candidate's period is
+        derived from its date at confirm). An unwired intake port renders the honest
+        empty state, never a 500.
+        """
+        if candidate_store is None or candidate_decision_store is None:
+            candidates: list = []
+        else:
+            queue = await build_intake_queue(
+                candidate_store=candidate_store,
+                candidate_decision_store=candidate_decision_store,
+                status="pending",
+            )
+            candidates = queue.candidates
+        return templates.TemplateResponse(
+            request,
+            "intake.html",
+            {
+                "period": period,
+                "candidates": candidates,
+                "pending": len(candidates),
+                "attribution_targets": config.attribution_targets,
+                "attribution_target_labels": intake_labels,
+            },
+        )
+
+    @app.post(
+        "/ui/intake/resolve",
+        response_class=HTMLResponse,
+        summary="Confirm/correct/reject a candidate (htmx)",
+    )
+    async def ui_intake_resolve(
+        request: Request,
+        candidate_id: str = Form(...),
+        action: str = Form(...),
+        vendor: str = Form(""),
+        amount: str = Form(""),
+        tax: str = Form(""),
+        date: str = Form(""),
+        description: str = Form(""),
+        attribution_target_id: str = Form(""),
+        reject_reason: str = Form(""),
+        period: str = Form(_DEFAULT_PERIOD),
+    ) -> HTMLResponse:
+        """Record one confirm/correct/reject on a candidate, then swap the card out.
+
+        The form twin of JSON `POST /intake/resolve`. The terminal states swap a
+        defined partial into the card (never a raw error): an **unknown** candidate →
+        `_intake_gone.html` (JSON twin 404); an **already-decided** candidate →
+        `_intake_already.html` with its recorded outcome (JSON twin 409).
+
+        On **confirm** the human's edits go through the same A1 gate the machine
+        submission passed (string-Decimal money, ISO date, non-blank vendor). Ordered:
+        (1) re-validate every edited field — a failure renders `_intake_error.html`
+        into the card with the edits kept and the counter untouched (JSON twin 422),
+        and produces the parsed date step 3 consumes; (2) the `attribution_target_id`
+        is required and must be in `config.attribution_targets` — a defensive 422 (the
+        rendered `<select>` offers only valid ids), mirroring the §5.2 account guard;
+        (3) the **edited** date is checked against the closed periods via
+        `closed_periods` + `period_of` (never `transaction_in_closed_period`, which
+        probes an existing ledger row and would silently pass here — the txn is not
+        filed yet) → `_closed_refusal.html`, no ledger write, no decision row, counter
+        untouched (JSON twin 409); (4) construct the framework `Transaction` (the
+        receipt bytes ride `artifact_bytes` into the row) and persist via the existing
+        `FileLedgerStore.store()`; (5) honest dedupe — probe `contains()` **before**
+        the idempotent, silent `store()` and record `ledger_outcome` (`stored` vs
+        `already-present`) so a duplicate confirm is a **visible** no-op, never a
+        silent lost filing; (6) append the decision row (the durable candidate↔ledger
+        link). A **reject** records the decision and leaves the ledger untouched.
+
+        On success the two OOB spans in `_intake_resolved.html` update the live pending
+        counter + capture pulse (both recomputed off `build_intake_queue`), and the
+        swapped body links on to the period's confirm queue.
+        """
+        if (
+            candidate_store is None
+            or candidate_decision_store is None
+            or artifact_store is None
+        ):
+            return templates.TemplateResponse(request, "_intake_gone.html", {})
+
+        submission = await candidate_store.get(candidate_id)
+        if submission is None:  # unknown candidate — the "no longer available" swap
+            return templates.TemplateResponse(request, "_intake_gone.html", {})
+
+        prior = (await candidate_decision_store.latest_by_candidate()).get(candidate_id)
+        if prior is not None:  # already decided — its recorded outcome, not a re-open
+            return templates.TemplateResponse(
+                request,
+                "_intake_already.html",
+                {
+                    "action": prior.action,
+                    "ledger_outcome": prior.ledger_outcome,
+                    "reject_reason": prior.reject_reason,
+                },
+            )
+
+        now = datetime.now(timezone.utc)
+
+        # --- Reject: record the decision; the ledger is untouched, the card leaves. ---
+        if action == ACTION_REJECT:
+            await candidate_decision_store.record(
+                CandidateDecision(
+                    candidate_id=candidate_id,
+                    action=ACTION_REJECT,
+                    source=CANDIDATE_SOURCE_HUMAN,
+                    decided_at=now,
+                    reject_reason=reject_reason.strip() or None,
+                )
+            )
+            pending = await _intake_pending_count(
+                candidate_store, candidate_decision_store
+            )
+            return templates.TemplateResponse(
+                request,
+                "_intake_resolved.html",
+                {"action": ACTION_REJECT, "pending": pending, "period": period},
+            )
+
+        # --- Confirm ---
+        # 1. Re-validate every edited field (the A1 gate). A blank tax coalesces to
+        #    "0" (the intake boundary's own convention), matching the machine path.
+        try:
+            v_vendor = _revalidate_nonblank(vendor, "vendor")
+            v_amount = _revalidate_money(amount, "amount")
+            v_tax = Decimal("0") if not tax.strip() else _revalidate_money(tax, "tax")
+            v_date = _revalidate_date(date, "date")
+        except _IntakeFieldError as exc:
+            # Re-render the card with the human's edits kept + the failure named.
+            edited = CandidateOut.from_submission(submission).model_copy(
+                update={
+                    "vendor": vendor,
+                    "amount": amount,
+                    "tax": tax,
+                    "date": date,
+                    "description": description,
+                    "attribution_target_id": attribution_target_id or None,
+                }
+            )
+            return templates.TemplateResponse(
+                request,
+                "_intake_error.html",
+                {
+                    "c": edited,
+                    "error": str(exc),
+                    "period": period,
+                    "attribution_targets": config.attribution_targets,
+                    "attribution_target_labels": intake_labels,
+                },
+            )
+
+        # 2. Attribution — required + in config.attribution_targets (defensive 422).
+        target = attribution_target_id or None
+        if target is None or target not in config.attribution_targets:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"attribution_target_id {target!r} must be one of "
+                    f"config.attribution_targets — the resolver never invents a target."
+                ),
+            )
+
+        # 3. Closed-period guard (C1) — on the human-EDITED date being written.
+        if period_of(v_date) in await closed_periods(close_store):
+            return templates.TemplateResponse(
+                request,
+                "_closed_refusal.html",
+                {"period": period_of(v_date)},
+            )
+
+        # 4. Construct the ledger Transaction (receipt bytes ride artifact_bytes) and
+        #    persist through the EXISTING ledger store.
+        artifact_bytes = await artifact_store.get(candidate_id) or b""
+        transaction = Transaction(
+            attribution_target_id=target,
+            vendor=v_vendor,
+            amount=v_amount,
+            tax=v_tax,
+            date=v_date,
+            description=description,
+            artifact_bytes=artifact_bytes,
+        )
+        key = transaction_key(transaction)
+        # 5. Honest dedupe — probe contains() BEFORE the idempotent, silent store().
+        already = await ledger_store.contains(key)
+        await ledger_store.store(transaction)
+        outcome = (
+            LEDGER_OUTCOME_ALREADY_PRESENT if already else LEDGER_OUTCOME_STORED
+        )
+
+        # 6. Append the decision row — the durable candidate↔ledger link + dedupe signal.
+        await candidate_decision_store.record(
+            CandidateDecision(
+                candidate_id=candidate_id,
+                action=ACTION_CONFIRM,
+                source=CANDIDATE_SOURCE_HUMAN,
+                decided_at=now,
+                vendor=v_vendor,
+                amount=v_amount,
+                tax=v_tax,
+                date=v_date,
+                description=description,
+                attribution_target_id=target,
+                transaction_key=key,
+                ledger_outcome=outcome,
+            )
+        )
+
+        pending = await _intake_pending_count(candidate_store, candidate_decision_store)
+        return templates.TemplateResponse(
+            request,
+            "_intake_resolved.html",
+            {
+                "action": ACTION_CONFIRM,
+                "pending": pending,
+                "period": period,
+                "confirm_period": period_of(v_date),
+                "ledger_outcome": outcome,
             },
         )

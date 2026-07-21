@@ -51,6 +51,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import json
 import os
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -234,6 +235,7 @@ def create_app(
     candidate_decision_store: FileCandidateDecisionStore | None = None,
     artifact_store: FileArtifactStore | None = None,
     max_artifact_bytes: int | None = None,
+    attribution_target_labels: dict[str, str] | None = None,
 ) -> FastAPI:
     """Build the API over an injected config + the four #1/Slice-2 stores.
 
@@ -268,6 +270,13 @@ def create_app(
     constructing the app unchanged. `max_artifact_bytes` caps a submitted artifact's
     decoded size (default `DEFAULT_MAX_ARTIFACT_BYTES`); `build_app_from_env` reads
     the `BOOKKEEPER_UI_MAX_ARTIFACT_BYTES` env override.
+
+    `attribution_target_labels` (Slice-5 · B) is the **optional** app-side sidecar map
+    (id string → human label) the intake-review `<select>` renders through. It is *not*
+    a framework `BookkeeperConfig` field (`from_mapping` silently drops unknown keys),
+    so it is read app-side (`build_app_from_env` pulls it from the config JSON) and
+    threaded straight through to `register_ui` — default `None` → an empty map, so the
+    `<select>` falls back to the raw ids and pre-Slice-5 call sites are unchanged.
     """
     # The append-only export log lives beside the per-export folders, under the
     # injected export dir. Unwired → no export surface (the routes 503).
@@ -1411,6 +1420,7 @@ def create_app(
         candidate_store=candidate_store,
         candidate_decision_store=candidate_decision_store,
         artifact_store=artifact_store,
+        attribution_target_labels=attribution_target_labels,
     )
 
     return app
@@ -1451,6 +1461,12 @@ def build_app_from_env() -> FastAPI:
     max_artifact_bytes = int(
         os.environ.get("BOOKKEEPER_UI_MAX_ARTIFACT_BYTES", str(DEFAULT_MAX_ARTIFACT_BYTES))
     )
+    # The intake `<select>` label map — read app-side from the SAME config JSON
+    # `load_config` reads (a new read *beside* it, not a change to it), since the
+    # framework `BookkeeperConfig` has no such field and `from_mapping` would drop it.
+    # Absent → an empty map, so the `<select>` renders the raw attribution ids.
+    raw_config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    attribution_target_labels = raw_config.get("attribution_target_labels") or {}
     return create_app(
         config=load_config(config_path),
         ledger_store=FileLedgerStore(data_dir / "ledger.jsonl"),
@@ -1467,4 +1483,5 @@ def build_app_from_env() -> FastAPI:
         ),
         artifact_store=FileArtifactStore(data_dir / "artifacts"),
         max_artifact_bytes=max_artifact_bytes,
+        attribution_target_labels=attribution_target_labels,
     )

@@ -285,3 +285,25 @@ tr.diverges { background: var(--warn-bg); }
 .recon-badge.recon-matched, .recon-badge.recon-confirmed { background: var(--ok-bg); border-color: #aceebb; color: var(--ok); }
 .recon-badge.recon-gap_open, .recon-badge.recon-to_confirm { background: var(--warn-bg); border-color: #eddf8f; color: var(--warn); }
 .recon-badge.recon-rejected { background: var(--err-bg); border-color: #ffc1bc; color: var(--err); }
+
+/* --- Slice 5 · B: the extraction-review (intake) queue ---------------- */
+#intake-queue { display: grid; gap: 1rem; outline: none; }
+#intake-pending-count { font-weight: 700; color: var(--ink); outline: none; }
+.card.intake { border-left-color: var(--accent); }
+/* The receipt artifact ALONGSIDE the extracted fields — the human judges the
+   extraction against the source. Two columns on wide screens; stacked on narrow. */
+.intake-grid { display: grid; grid-template-columns: minmax(0, 260px) minmax(0, 1fr); gap: 1.25rem; align-items: start; }
+@media (max-width: 620px) { .intake-grid { grid-template-columns: 1fr; } }
+.intake-grid .artifact { display: grid; gap: 0.4rem; justify-items: start; }
+.intake-grid .artifact img { max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+.intake-grid .artifact .open-full { font-size: 0.85rem; color: var(--accent); text-decoration: none; }
+.intake-grid .artifact .open-full:hover { text-decoration: underline; }
+.intake-grid .fields { display: grid; gap: 0.75rem; }
+.intake-confirm, .intake-reject { display: grid; gap: 0.6rem; }
+.intake-confirm label, .intake-reject label { display: grid; gap: 0.25rem; font-size: 0.85rem; color: var(--muted); }
+.intake-confirm input, .intake-confirm select, .intake-reject input { max-width: 100%; }
+.intake-confirm .reason.suggested { margin: 0.15rem 0; color: var(--muted); font-size: 0.9rem; }
+.intake-confirm .confirm { justify-self: start; }
+.intake-reject { margin-top: 0.5rem; padding-top: 0.75rem; border-top: 1px dashed var(--line); }
+.intake-reject .reject { justify-self: start; background: #fff; color: var(--err); border-color: #ffc1bc; }
+.trail.intake-trail { margin-top: 0.85rem; }
