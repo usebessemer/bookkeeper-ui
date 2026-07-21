@@ -48,13 +48,18 @@ default (see its docstring) for ``uvicorn bookkeeper_ui.api:build_app_from_env
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import os
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 
 from bookkeeper.config import BookkeeperConfig
+from bookkeeper.model import Transaction
 from bookkeeper.skills.categorize import categorize
 from bookkeeper.skills.flag_anomaly import flag_anomaly
 from bookkeeper.skills.generate_package import PackageStatus
@@ -65,6 +70,19 @@ from bookkeeper_ui.anomaly_reviews import (
     AnomalyReview,
     FileAnomalyReviewStore,
     derive_flag_id,
+)
+from bookkeeper_ui.candidates import (
+    ACTION_CONFIRM,
+    ACTION_REJECT,
+    LEDGER_OUTCOME_ALREADY_PRESENT,
+    LEDGER_OUTCOME_STORED,
+    SOURCE_HUMAN as CANDIDATE_SOURCE_HUMAN,
+    CandidateDecision,
+    CandidateSubmission,
+    FileArtifactStore,
+    FileCandidateDecisionStore,
+    FileCandidateStore,
+    candidate_id as compute_candidate_id,
 )
 from bookkeeper_ui.closes import (
     FileCloseStore,
@@ -93,10 +111,15 @@ from bookkeeper_ui.reconciliations import (
 from bookkeeper_ui.schemas import (
     AnomalyReviewOut,
     AnomalyReviewRequest,
+    CandidateOut,
+    CandidateResolutionOut,
+    CandidateSubmitOut,
+    CandidateSubmitRequest,
     CategorizationReportOut,
     CloseRecordOut,
     CloseReviewOut,
     ConfirmationOut,
+    IntakeQueueOut,
     ExportRecordOut,
     ExportResultOut,
     ImportResultOut,
@@ -105,6 +128,7 @@ from bookkeeper_ui.schemas import (
     ReconcileResolutionOut,
     ReconciliationReportOut,
     ReconciliationViewOut,
+    ResolveCandidateRequest,
     ResolveReconcileRequest,
     ResolveRequest,
     SignRequest,
@@ -121,12 +145,78 @@ from bookkeeper_ui.statement_store import FileStatementStore
 from bookkeeper_ui.views import (
     build_close_record,
     build_close_review,
+    build_intake_queue,
     build_ledger,
     build_package,
     build_reconciliation,
 )
 from bookkeeper_ui.waivers import FileWaiverStore, Waiver
 from bookkeeper_ui.web import register_ui
+
+# The intake port's artifact allowlist (AC #3): the media types an extractor may
+# submit. A candidate declaring anything else is a 422 — nothing is written.
+ALLOWED_ARTIFACT_MEDIA_TYPES = frozenset(
+    {
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "image/gif",
+        "application/pdf",
+        "text/plain",
+    }
+)
+
+# The default cap on a decoded artifact's size. `BOOKKEEPER_UI_MAX_ARTIFACT_BYTES`
+# overrides it at `build_app_from_env`; a test can pass `max_artifact_bytes` to
+# `create_app` directly. A candidate whose decoded bytes exceed it is a 422.
+DEFAULT_MAX_ARTIFACT_BYTES = 10 * 1024 * 1024  # 10 MiB
+
+
+def _require_nonblank(value: str | None, field: str) -> str:
+    """Return `value` if it is a non-blank string, else raise a 422 naming the field.
+
+    The intake port's field rules are an invariant, not courtesy (AC #3): a blank
+    `source` / `submission_id` / `vendor` is a 422 with the field named, never a
+    partial write.
+    """
+    if value is None or not value.strip():
+        raise HTTPException(
+            status_code=422, detail=f"{field} is required and must be a non-blank string."
+        )
+    return value
+
+
+def _parse_money(raw: str, field: str) -> Decimal:
+    """Parse a JSON-string money value to a finite `Decimal`, else raise a 422.
+
+    Money crosses the intake wire as a **string** (a JSON number never reaches here —
+    the request schema types the field `str`). `NaN` / `Infinity` parse as valid
+    `Decimal`s but are not finite, so they are rejected too — no float bug on this
+    new path (AC #3, guardrail 4).
+    """
+    try:
+        value = Decimal(raw)
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field} {raw!r} is not a valid decimal amount (money is a string).",
+        ) from exc
+    if not value.is_finite():
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field} must be a finite amount — {raw!r} (NaN/Infinity) is rejected.",
+        )
+    return value
+
+
+def _parse_iso_datetime(raw: str, field: str) -> datetime:
+    """Parse an ISO 8601 string to a `datetime`, else raise a 422 naming the field."""
+    try:
+        return datetime.fromisoformat(raw)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=422, detail=f"{field} {raw!r} is not an ISO 8601 date/datetime."
+        ) from exc
 
 
 def create_app(
@@ -140,6 +230,10 @@ def create_app(
     anomaly_review_store: FileAnomalyReviewStore | None = None,
     waiver_store: FileWaiverStore | None = None,
     export_dir: str | Path | None = None,
+    candidate_store: FileCandidateStore | None = None,
+    candidate_decision_store: FileCandidateDecisionStore | None = None,
+    artifact_store: FileArtifactStore | None = None,
+    max_artifact_bytes: int | None = None,
 ) -> FastAPI:
     """Build the API over an injected config + the four #1/Slice-2 stores.
 
@@ -165,6 +259,15 @@ def create_app(
     and appends to its `exports.jsonl` log (built over the dir here). When unwired
     both export routes refuse a **503** — never a silent no-op — so every pre-Slice-4
     call site keeps constructing the app unchanged.
+
+    The three Slice-5 intake stores (`candidate_store` / `candidate_decision_store` /
+    `artifact_store`) are **optional** (default `None`) on the same footing: the JSON
+    `/intake/*` surface (submit a candidate → the human confirm/reject that gates it
+    into the ledger) reads/writes through them. When any is unwired the intake routes
+    refuse a **503** — never a silent no-op — so every pre-Slice-5 call site keeps
+    constructing the app unchanged. `max_artifact_bytes` caps a submitted artifact's
+    decoded size (default `DEFAULT_MAX_ARTIFACT_BYTES`); `build_app_from_env` reads
+    the `BOOKKEEPER_UI_MAX_ARTIFACT_BYTES` env override.
     """
     # The append-only export log lives beside the per-export folders, under the
     # injected export dir. Unwired → no export surface (the routes 503).
@@ -172,6 +275,10 @@ def create_app(
         FileExportStore(Path(export_dir) / "exports.jsonl")
         if export_dir is not None
         else None
+    )
+    # The intake artifact-size cap: the injected value, else the module default.
+    artifact_cap = (
+        max_artifact_bytes if max_artifact_bytes is not None else DEFAULT_MAX_ARTIFACT_BYTES
     )
     app = FastAPI(
         title="bookkeeper-ui API",
@@ -943,6 +1050,349 @@ def create_app(
         await close_store.record(record)
         return CloseRecordOut.from_record(record)
 
+    # --- Slice 5 · A: the intake port — the machine-facing half of receipt capture.
+    # An extractor POSTs a candidate (its extracted fields + its source artifact); a
+    # candidate can never touch the ledger — only a human confirm constructs a
+    # `Transaction`. The stores are the *only* thing these routes write through; when
+    # any is unwired the surface refuses a 503 rather than silently no-op.
+
+    def _require_intake() -> tuple[
+        FileCandidateStore, FileCandidateDecisionStore, FileArtifactStore
+    ]:
+        """The three intake stores, or a 503 if the port is not configured."""
+        if (
+            candidate_store is None
+            or candidate_decision_store is None
+            or artifact_store is None
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "the intake port is not configured on this app — no candidate / "
+                    "decision / artifact store is wired."
+                ),
+            )
+        return candidate_store, candidate_decision_store, artifact_store
+
+    @app.post(
+        "/intake/candidates",
+        response_model=CandidateSubmitOut,
+        status_code=201,
+        summary="Submit a candidate transaction (with its source artifact)",
+    )
+    async def submit_candidate(
+        request: CandidateSubmitRequest, response: Response
+    ) -> CandidateSubmitOut:
+        """Accept one candidate document → persist the submission row + its raw artifact.
+
+        Server-validates every field (an invariant, not courtesy): non-blank
+        `source`/`submission_id`/`vendor`, finite-`Decimal` money as strings (a JSON
+        number is a 422; `NaN`/`Infinity` rejected), an ISO date, a base64 artifact
+        that decodes non-empty and ≤ the size cap, an allowlisted media type — any
+        failure a 422 naming the field, nothing written. **Idempotent** on the
+        `(source, submission_id)` identity: a re-submission is a no-op returning 200
+        with the *existing* candidate and `duplicate: true` (first write wins; a
+        differing re-POST never mutates the stored row); a first write is a 201. A
+        submission is a machine write on the **proposal** side — it never touches the
+        ledger.
+        """
+        candidates, _decisions, artifacts = _require_intake()
+
+        source = _require_nonblank(request.source, "source")
+        submission_id = _require_nonblank(request.submission_id, "submission_id")
+        vendor = _require_nonblank(request.vendor, "vendor")
+        amount = _parse_money(request.amount, "amount")
+        tax = (
+            _parse_money(request.tax, "tax")
+            if request.tax not in (None, "")
+            else Decimal("0")
+        )
+        date = _parse_iso_datetime(request.date, "date")
+        received_at = (
+            _parse_iso_datetime(request.received_at, "received_at")
+            if request.received_at not in (None, "")
+            else None
+        )
+
+        if request.artifact_media_type not in ALLOWED_ARTIFACT_MEDIA_TYPES:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"artifact_media_type {request.artifact_media_type!r} is not "
+                    f"allowed — one of {sorted(ALLOWED_ARTIFACT_MEDIA_TYPES)}."
+                ),
+            )
+        try:
+            artifact_bytes = base64.b64decode(request.artifact, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(
+                status_code=422, detail="artifact is not valid base64."
+            ) from exc
+        if not artifact_bytes:
+            raise HTTPException(
+                status_code=422, detail="artifact decoded to empty bytes — an artifact is required."
+            )
+        if len(artifact_bytes) > artifact_cap:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"artifact is {len(artifact_bytes)} bytes — over the "
+                    f"{artifact_cap}-byte cap."
+                ),
+            )
+
+        cid = compute_candidate_id(source, submission_id)
+        existing = await candidates.get(cid)
+        if existing is not None:
+            # Idempotent no-op: the identity is already on record (first write wins).
+            response.status_code = 200
+            return CandidateSubmitOut(
+                duplicate=True, candidate=CandidateOut.from_submission(existing)
+            )
+
+        submission = CandidateSubmission(
+            candidate_id=cid,
+            source=source,
+            submission_id=submission_id,
+            vendor=vendor,
+            amount=amount,
+            tax=tax,
+            date=date,
+            description=request.description or "",
+            attribution_target_id=request.attribution_target_id,
+            source_hint=request.source_hint or "",
+            received_at=received_at,
+            artifact_media_type=request.artifact_media_type,
+            artifact_sha256=hashlib.sha256(artifact_bytes).hexdigest(),
+            submitted_at=datetime.now(timezone.utc),
+        )
+        # Artifact first (its sha256 is already on the row), then the submission row —
+        # the row is the index, so a crash between the two leaves an orphan blob, never
+        # a row pointing at missing bytes.
+        await artifacts.put(cid, artifact_bytes)
+        await candidates.add(submission)
+        response.status_code = 201
+        return CandidateSubmitOut(
+            duplicate=False, candidate=CandidateOut.from_submission(submission)
+        )
+
+    @app.get(
+        "/intake/candidates",
+        response_model=IntakeQueueOut,
+        summary="List candidates (the shared intake queue)",
+    )
+    async def list_candidates(status: str | None = None) -> IntakeQueueOut:
+        """The intake queue via the shared `build_intake_queue` projection.
+
+        `?status=pending|confirmed|rejected` filters to that standing; no filter
+        returns **all** statuses (the one projection both this route and the later UI
+        queue read, so JSON and HTML never disagree). An unknown `status` value is a
+        422. Money is echoed as exact strings.
+        """
+        candidates, decisions, _artifacts = _require_intake()
+        if status is not None and status not in ("pending", "confirmed", "rejected"):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"status {status!r} must be one of pending|confirmed|rejected "
+                    f"(omit it for all statuses)."
+                ),
+            )
+        return await build_intake_queue(
+            candidate_store=candidates,
+            candidate_decision_store=decisions,
+            status=status,  # type: ignore[arg-type]
+        )
+
+    @app.get(
+        "/intake/artifact/{candidate_id}",
+        summary="Fetch a candidate's raw source artifact",
+    )
+    async def get_artifact(candidate_id: str) -> Response:
+        """Serve a candidate's stored raw artifact bytes with its declared media type.
+
+        The `artifact_sha256` on the candidate row is the integrity/trace link; this
+        route hands back the exact bytes submitted. An unknown candidate id, or a
+        candidate whose bytes are missing on disk, is a 404.
+        """
+        candidates, _decisions, artifacts = _require_intake()
+        submission = await candidates.get(candidate_id)
+        if submission is None:
+            raise HTTPException(
+                status_code=404, detail=f"no candidate {candidate_id!r} on record."
+            )
+        data = await artifacts.get(candidate_id)
+        if data is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no artifact on disk for candidate {candidate_id!r}.",
+            )
+        return Response(content=data, media_type=submission.artifact_media_type)
+
+    @app.post(
+        "/intake/resolve",
+        response_model=CandidateResolutionOut,
+        summary="Confirm/reject a candidate (the review gate before the ledger)",
+    )
+    async def resolve_candidate(request: ResolveCandidateRequest) -> CandidateResolutionOut:
+        """Gate a candidate: a human **confirm** constructs and files a ledger
+        `Transaction`; a **reject** records the decision and leaves the ledger untouched.
+
+        Errors: **404** an unknown `candidate_id`; **409** an already-decided candidate
+        (its recorded outcome returned — re-opening is out of scope); **422** a bad
+        confirmed field. On confirm the human's edits go through the same gate the
+        submission did (finite-Decimal money, ISO date, non-blank vendor), the
+        `attribution_target_id` must be one of `config.attribution_targets` (§ the
+        resolver never invents a target), and the **edited** date is checked against the
+        closed periods (`closed_periods` + `period_of`) — a date in a signed-closed
+        period is a **409** with no ledger write and no decision row. Honest dedupe: the
+        ledger `store()` is idempotent and silent, so this probes `contains()` first and
+        records `ledger_outcome` — a duplicate confirm no-ops the ledger but says so
+        (`already-present`), never a silent lost filing.
+        """
+        candidates, decisions, artifacts = _require_intake()
+
+        cid = request.candidate_id
+        submission = await candidates.get(cid)
+        if submission is None:
+            raise HTTPException(
+                status_code=404, detail=f"no candidate {cid!r} — nothing to resolve."
+            )
+
+        prior = (await decisions.latest_by_candidate()).get(cid)
+        if prior is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": (
+                        f"candidate {cid!r} is already {prior.action}ed — re-opening a "
+                        f"decided candidate is out of scope."
+                    ),
+                    "candidate_id": cid,
+                    "action": prior.action,
+                    "ledger_outcome": prior.ledger_outcome,
+                    "reject_reason": prior.reject_reason,
+                },
+            )
+
+        now = datetime.now(timezone.utc)
+
+        if request.action == ACTION_REJECT:
+            decision = CandidateDecision(
+                candidate_id=cid,
+                action=ACTION_REJECT,
+                source=CANDIDATE_SOURCE_HUMAN,
+                decided_at=now,
+                reject_reason=request.reject_reason,
+            )
+            await decisions.record(decision)
+            return CandidateResolutionOut(
+                candidate_id=cid,
+                action=ACTION_REJECT,
+                standing="rejected",
+                reject_reason=request.reject_reason,
+                decided_at=now.isoformat(),
+                message=(
+                    "Candidate rejected — the ledger is untouched; the submission row "
+                    "and its artifact remain on disk (append-only audit trail)."
+                ),
+            )
+
+        # CONFIRM — every effective field value (the human's edit, else the
+        # candidate's own value) re-validated through the submission's gate.
+        vendor = _require_nonblank(
+            request.vendor if request.vendor is not None else submission.vendor, "vendor"
+        )
+        amount = (
+            _parse_money(request.amount, "amount")
+            if request.amount is not None
+            else submission.amount
+        )
+        tax = (
+            _parse_money(request.tax, "tax") if request.tax is not None else submission.tax
+        )
+        date = (
+            _parse_iso_datetime(request.date, "date")
+            if request.date is not None
+            else submission.date
+        )
+        description = (
+            request.description if request.description is not None else submission.description
+        )
+        target = (
+            request.attribution_target_id
+            if request.attribution_target_id is not None
+            else submission.attribution_target_id
+        )
+        if target is None or target not in config.attribution_targets:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"attribution_target_id {target!r} must be one of "
+                    f"config.attribution_targets — the resolver never invents a target."
+                ),
+            )
+
+        # C1 closed-guard — on the **human-edited** date being written (the date can
+        # change in the form). `closed_periods` + `period_of`, never
+        # `transaction_in_closed_period` (which silently passes here — the txn is not
+        # in the ledger yet). Refused → 409, no ledger write, no decision row.
+        if period_of(date) in await closed_periods(close_store):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"the edited date {date.date().isoformat()} falls in closed period "
+                    f"{period_of(date)!r} — its books are write-guarded (§5.7: a signed "
+                    f"close is durable). No transaction was filed."
+                ),
+            )
+
+        artifact_bytes = await artifacts.get(cid) or b""
+        transaction = Transaction(
+            attribution_target_id=target,
+            vendor=vendor,
+            amount=amount,
+            tax=tax,
+            date=date,
+            description=description,
+            artifact_bytes=artifact_bytes,
+        )
+        key = transaction_key(transaction)
+        already = await ledger_store.contains(key)  # probe BEFORE the idempotent store
+        await ledger_store.store(transaction)
+        outcome = LEDGER_OUTCOME_ALREADY_PRESENT if already else LEDGER_OUTCOME_STORED
+
+        decision = CandidateDecision(
+            candidate_id=cid,
+            action=ACTION_CONFIRM,
+            source=CANDIDATE_SOURCE_HUMAN,
+            decided_at=now,
+            vendor=vendor,
+            amount=amount,
+            tax=tax,
+            date=date,
+            description=description,
+            attribution_target_id=target,
+            transaction_key=key,
+            ledger_outcome=outcome,
+        )
+        await decisions.record(decision)
+        message = (
+            "Confirmed — this transaction is already in the ledger (a duplicate of an "
+            "existing filing); no new row was written."
+            if already
+            else "Confirmed and filed to the ledger."
+        )
+        return CandidateResolutionOut(
+            candidate_id=cid,
+            action=ACTION_CONFIRM,
+            standing="confirmed",
+            ledger_outcome=outcome,
+            transaction_key=key,
+            decided_at=now.isoformat(),
+            message=message,
+        )
+
     # #3 — the thin UI (Jinja + htmx) over these same stores, mounted on this app
     # so `uvicorn bookkeeper_ui.api:build_app_from_env --factory` serves both the
     # JSON API (root paths) and the HTML surface (GET / and the /ui/* routes).
@@ -958,6 +1408,9 @@ def create_app(
         waiver_store=waiver_store,
         export_dir=export_dir,
         export_store=export_store,
+        candidate_store=candidate_store,
+        candidate_decision_store=candidate_decision_store,
+        artifact_store=artifact_store,
     )
 
     return app
@@ -977,19 +1430,27 @@ def build_app_from_env() -> FastAPI:
     - ``BOOKKEEPER_UI_EXPORT_DIR`` — directory the export write path writes to (the
                                    per-export folders + the `exports.jsonl` log);
                                    default ``<data_dir>/exports``.
+    - ``BOOKKEEPER_UI_MAX_ARTIFACT_BYTES`` — cap on a submitted intake artifact's
+                                   decoded size (default ``DEFAULT_MAX_ARTIFACT_BYTES``,
+                                   10 MiB); a larger artifact is a 422.
 
     The wiring is deliberately thin: #3 (the UI) owns the real run surface. This
     exists so the API is runnable on its own for local development and the tests
     exercise `create_app` directly with injected temp paths. The files
     (`ledger.jsonl` / `statements.jsonl` / `confirmations.jsonl` /
     `reconciliations.jsonl` / `closes.jsonl` / `anomaly_reviews.jsonl` /
-    `reconciliation_waivers.jsonl`) stay distinct — a resolution or a close never
-    touches the ledger or the statement it snapshots. This is the construction
-    site for the three Slice-3 stores (not `create_app`, which takes them injected).
+    `reconciliation_waivers.jsonl` / `candidates.jsonl` / `candidate_decisions.jsonl`
+    + the `artifacts/` blob dir) stay distinct — a resolution, a close, or a
+    candidate decision never touches the ledger or the statement it snapshots. This
+    is the construction site for the Slice-3 **and** Slice-5 stores (not
+    `create_app`, which takes them injected).
     """
     config_path = os.environ.get("BOOKKEEPER_UI_CONFIG", "examples/config.json")
     data_dir = Path(os.environ.get("BOOKKEEPER_UI_DATA_DIR", "data"))
     export_dir = Path(os.environ.get("BOOKKEEPER_UI_EXPORT_DIR", str(data_dir / "exports")))
+    max_artifact_bytes = int(
+        os.environ.get("BOOKKEEPER_UI_MAX_ARTIFACT_BYTES", str(DEFAULT_MAX_ARTIFACT_BYTES))
+    )
     return create_app(
         config=load_config(config_path),
         ledger_store=FileLedgerStore(data_dir / "ledger.jsonl"),
@@ -1000,4 +1461,10 @@ def build_app_from_env() -> FastAPI:
         anomaly_review_store=FileAnomalyReviewStore(data_dir / "anomaly_reviews.jsonl"),
         waiver_store=FileWaiverStore(data_dir / "reconciliation_waivers.jsonl"),
         export_dir=export_dir,
+        candidate_store=FileCandidateStore(data_dir / "candidates.jsonl"),
+        candidate_decision_store=FileCandidateDecisionStore(
+            data_dir / "candidate_decisions.jsonl"
+        ),
+        artifact_store=FileArtifactStore(data_dir / "artifacts"),
+        max_artifact_bytes=max_artifact_bytes,
     )

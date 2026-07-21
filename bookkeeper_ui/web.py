@@ -58,6 +58,11 @@ from bookkeeper_ui.anomaly_reviews import (
     FileAnomalyReviewStore,
     derive_flag_id,
 )
+from bookkeeper_ui.candidates import (
+    FileArtifactStore,
+    FileCandidateDecisionStore,
+    FileCandidateStore,
+)
 from bookkeeper_ui.closes import (
     FileCloseStore,
     closed_import_refusal,
@@ -118,6 +123,9 @@ def register_ui(
     waiver_store: FileWaiverStore | None = None,
     export_dir: str | Path | None = None,
     export_store: FileExportStore | None = None,
+    candidate_store: FileCandidateStore | None = None,
+    candidate_decision_store: FileCandidateDecisionStore | None = None,
+    artifact_store: FileArtifactStore | None = None,
 ) -> None:
     """Mount the HTML UI on `app`, reading through the same injected stores as #2.
 
@@ -141,6 +149,13 @@ def register_ui(
     guarded download read through it, never re-reading the JSONL by hand; the
     export action reuses B's `export_package`. When unwired the exports listing
     renders its empty state and the download route 404s (there is nothing to serve).
+
+    The three Slice-5 intake stores (`candidate_store` / `candidate_decision_store` /
+    `artifact_store`) are threaded the same way (all **optional**, default `None`,
+    mirroring `create_app`) so pre-Slice-5 call sites keep working. This issue (A)
+    only threads them through so the sibling UI slice (issue B) can mount the
+    HTML review queue over the *same* stores the JSON `/intake/*` surface writes;
+    the HTML routes themselves are that later slice's.
     """
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

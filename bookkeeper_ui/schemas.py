@@ -48,6 +48,7 @@ from bookkeeper.skills.reconcile import (
 from bookkeeper.skills.track_tax import TaxFlag, TaxSummary
 
 from bookkeeper_ui.anomaly_reviews import AnomalyReview
+from bookkeeper_ui.candidates import CandidateDecision, CandidateSubmission
 from bookkeeper_ui.confirmations import Confirmation
 from bookkeeper_ui.ledger_store import transaction_key
 from bookkeeper_ui.reconciliations import Reconciliation
@@ -1189,3 +1190,197 @@ def _export_record_fields(record: "ExportRecord") -> dict[str, object]:
         ],
         "divergence_count": record.divergence_count,
     }
+
+
+# --- Slice 5 · A: the intake port (candidate ingest + the shared queue) -------
+#
+# A candidate is a proposal that can never touch the ledger (only a human confirm
+# constructs a `Transaction`). These are the wire shapes for the JSON intake API
+# (`POST /intake/candidates`, `GET /intake/candidates`, `POST /intake/resolve`) and
+# the shared `build_intake_queue` projection both JSON and (later) HTML read — so a
+# candidate's standing is computed once, not re-derived per surface. Money is exact
+# strings, mirroring the rest of this boundary.
+
+# Where a candidate stands: `pending` (no human decision yet), `confirmed` (a human
+# confirmed it into the ledger), or `rejected`. Overlaid by `build_intake_queue`.
+IntakeStanding = Literal["pending", "confirmed", "rejected"]
+
+
+class CandidateOut(BaseModel):
+    """A submitted candidate on the wire — money as exact strings, dates ISO 8601.
+
+    Carries the extracted fields (no category, by design — category is a downstream
+    skill), the optional `attribution_target_id` (null when the extractor didn't
+    resolve one; the human assigns it at confirm), and the `artifact_sha256` / media
+    type that link the row to its raw source bytes (fetched via `GET /intake/artifact`).
+    The raw base64 artifact is **never** echoed here — it is served on its own route.
+    """
+
+    candidate_id: str = Field(description="sha256(source + submission_id) — the stable id.")
+    source: str
+    submission_id: str
+    vendor: str
+    amount: str = Field(description="Exact Decimal as a string (never a lossy float).")
+    tax: str
+    date: str = Field(description="ISO 8601.")
+    description: str
+    attribution_target_id: str | None = None
+    source_hint: str
+    received_at: str | None = Field(default=None, description="ISO 8601, or null.")
+    artifact_media_type: str
+    artifact_sha256: str
+    submitted_at: str = Field(description="ISO 8601 server receive time (UTC).")
+
+    @classmethod
+    def from_submission(cls, submission: CandidateSubmission) -> "CandidateOut":
+        return cls(
+            candidate_id=submission.candidate_id,
+            source=submission.source,
+            submission_id=submission.submission_id,
+            vendor=submission.vendor,
+            amount=str(submission.amount),
+            tax=str(submission.tax),
+            date=submission.date.isoformat(),
+            description=submission.description,
+            attribution_target_id=submission.attribution_target_id,
+            source_hint=submission.source_hint,
+            received_at=(
+                submission.received_at.isoformat()
+                if submission.received_at is not None
+                else None
+            ),
+            artifact_media_type=submission.artifact_media_type,
+            artifact_sha256=submission.artifact_sha256,
+            submitted_at=submission.submitted_at.isoformat(),
+        )
+
+
+class CandidateSubmitOut(BaseModel):
+    """The outcome of `POST /intake/candidates` — the stored candidate + a dupe flag.
+
+    `duplicate` is `True` when the `(source, submission_id)` was already on record
+    (the idempotent no-op: the route returns 200 with the **existing** candidate,
+    unchanged, and writes nothing); `False` on a first write (201).
+    """
+
+    duplicate: bool
+    candidate: CandidateOut
+
+
+class CandidateSubmitRequest(BaseModel):
+    """A candidate document POSTed by an extractor (money as JSON **strings**).
+
+    `amount` / `tax` are JSON strings parsing to a finite `Decimal` — a JSON *number*
+    is a 422 (never re-introduce the float bug on this new path). `artifact` is the
+    base64 of the source bytes; `artifact_media_type` is validated against the
+    allowlist in the handler. Optional fields absent → their documented defaults
+    (`tax` → `"0"`, `description`/`source_hint` → `""`, the rest → null).
+    """
+
+    source: str
+    submission_id: str
+    vendor: str
+    amount: str
+    tax: str | None = None
+    date: str
+    description: str | None = None
+    attribution_target_id: str | None = None
+    source_hint: str | None = None
+    received_at: str | None = None
+    artifact: str = Field(description="base64 of the raw source artifact bytes.")
+    artifact_media_type: str
+
+
+class ResolveCandidateRequest(BaseModel):
+    """A human confirm/reject decision on a candidate.
+
+    `action` is `confirm` or `reject`. On a **confirm**, the optional field values
+    are the human's final edits — each absent field falls back to the candidate's own
+    submitted value, and every effective value is re-validated through the same gate
+    the submission passed (finite-Decimal money as strings, ISO date, non-blank
+    vendor; `attribution_target_id` required and in `config.attribution_targets`). On
+    a **reject**, only `reject_reason` is used; the ledger is untouched.
+    """
+
+    candidate_id: str
+    action: Literal["confirm", "reject"]
+    # confirm-only edited final values (absent → fall back to the candidate's value)
+    vendor: str | None = None
+    amount: str | None = None
+    tax: str | None = None
+    date: str | None = None
+    description: str | None = None
+    attribution_target_id: str | None = None
+    # reject-only
+    reject_reason: str | None = None
+
+
+class CandidateResolutionOut(BaseModel):
+    """The recorded outcome of `POST /intake/resolve` — echoed so the caller sees it.
+
+    On a confirm, `ledger_outcome` is the honest-dedupe signal (`stored` when a new
+    ledger row was written, `already-present` when the confirmed business fields
+    matched an already-filed transaction — a **visible** no-op, never silent) and
+    `transaction_key` is the durable link to the ledger row. `message` states the
+    outcome in words. On a reject, `reject_reason` carries the note.
+    """
+
+    candidate_id: str
+    action: str
+    standing: IntakeStanding
+    ledger_outcome: str | None = None
+    transaction_key: str | None = None
+    reject_reason: str | None = None
+    decided_at: str = Field(description="ISO 8601 audit timestamp (UTC).")
+    message: str
+
+
+class CandidateEntryOut(BaseModel):
+    """One candidate in the intake queue, with its current standing.
+
+    The shared `build_intake_queue` projection overlays the decision trail on the
+    submissions: `standing` is `pending` / `confirmed` / `rejected`, and the decision
+    fields (`action`, `ledger_outcome`, `transaction_key`, `reject_reason`,
+    `decided_at`) carry the resolution when the candidate is decided (all null while
+    pending). Both the JSON list route and the later UI queue read this one shape.
+    """
+
+    candidate: CandidateOut
+    standing: IntakeStanding
+    action: str | None = None
+    ledger_outcome: str | None = None
+    transaction_key: str | None = None
+    reject_reason: str | None = None
+    decided_at: str | None = None
+
+    @classmethod
+    def build(
+        cls,
+        submission: CandidateSubmission,
+        decision: CandidateDecision | None,
+    ) -> "CandidateEntryOut":
+        """Project a submission + its latest decision (or none) into a queue entry."""
+        if decision is None:
+            return cls(candidate=CandidateOut.from_submission(submission), standing="pending")
+        standing: IntakeStanding = "confirmed" if decision.action == "confirm" else "rejected"
+        return cls(
+            candidate=CandidateOut.from_submission(submission),
+            standing=standing,
+            action=decision.action,
+            ledger_outcome=decision.ledger_outcome,
+            transaction_key=decision.transaction_key,
+            reject_reason=decision.reject_reason,
+            decided_at=decision.decided_at.isoformat(),
+        )
+
+
+class IntakeQueueOut(BaseModel):
+    """The intake queue for the JSON list route — every candidate with its standing.
+
+    `status` echoes the applied filter (null = all statuses). `candidates` is the
+    shared `build_intake_queue` projection in submission (insertion) order, filtered
+    to `status` when one is given.
+    """
+
+    status: IntakeStanding | None = None
+    candidates: list[CandidateEntryOut]

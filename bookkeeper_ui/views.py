@@ -46,6 +46,10 @@ from bookkeeper.skills.reconcile import (
 from bookkeeper.skills.track_tax import TaxSummary, track_tax
 
 from bookkeeper_ui.anomaly_reviews import FileAnomalyReviewStore, derive_flag_id
+from bookkeeper_ui.candidates import (
+    FileCandidateDecisionStore,
+    FileCandidateStore,
+)
 from bookkeeper_ui.closes import CloseRecord, FileCloseStore
 from bookkeeper_ui.confirmations import SOURCE_HUMAN, FileConfirmationStore
 from bookkeeper_ui.ledger_store import FileLedgerStore, transaction_key
@@ -56,8 +60,11 @@ from bookkeeper_ui.reconciliations import (
     FileReconciliationStore,
 )
 from bookkeeper_ui.schemas import (
+    CandidateEntryOut,
     GapItemOut,
     GapOut,
+    IntakeQueueOut,
+    IntakeStanding,
     LedgerEntryOut,
     LedgerOut,
     MatchedItemOut,
@@ -184,6 +191,34 @@ async def build_ledger(
         signed_at=record.signed_at.isoformat() if record is not None else None,
         signed_by=record.signed_by if record is not None else None,
     )
+
+
+async def build_intake_queue(
+    *,
+    candidate_store: FileCandidateStore,
+    candidate_decision_store: FileCandidateDecisionStore,
+    status: IntakeStanding | None = None,
+) -> IntakeQueueOut:
+    """The intake queue — every candidate (in submission order) with its standing.
+
+    The `build_ledger` discipline at the candidate stage: compute each candidate's
+    standing **once** — `pending` (no decision), `confirmed`, or `rejected` — by
+    overlaying the decision trail (`latest_by_candidate`, last-write-wins) on the
+    submissions. Both the JSON list route and the later UI queue read *this* one
+    projection, so JSON and HTML never re-derive candidate standing independently.
+
+    `status` filters to that standing (`None` → all statuses). Order is the store's
+    submission (insertion) order, preserved so the surfaces render identically.
+    """
+    submissions = await candidate_store.all()
+    decisions = await candidate_decision_store.latest_by_candidate()
+    entries = [
+        CandidateEntryOut.build(submission, decisions.get(submission.candidate_id))
+        for submission in submissions
+    ]
+    if status is not None:
+        entries = [entry for entry in entries if entry.standing == status]
+    return IntakeQueueOut(status=status, candidates=entries)
 
 
 def _reconciliation_by_transaction(
