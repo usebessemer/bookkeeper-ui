@@ -1,0 +1,123 @@
+{# One extraction-review card. `c` is a CandidateOut (the `.candidate` of a pending
+   IntakeQueueOut entry). The artifact renders ALONGSIDE the extracted fields (the
+   charter-§1 source link made visible: the human judges the extraction against the
+   receipt itself), the fields as an EDITABLE form pre-filled verbatim, and the
+   attribution target as a <select>. Confirm and Reject both post to
+   /ui/intake/resolve targeting this card for an outerHTML swap, so a resolved card
+   leaves the queue. `attribution_targets` (opaque id strings) + the app-side
+   `attribution_target_labels` sidecar map + `period` (nav) come from the page.
+   `error` (optional) is a re-validation failure rendered in place, edits kept.
+
+   Deliberately NO confidence and NO category/account element anywhere (AC 5): the
+   extractor emits no confidence, and the account is proposed downstream by the
+   existing confirm queue — rendering either here would fabricate trust. #}
+<div class="card intake" id="card-{{ c.candidate_id }}">
+  {% if error %}
+  {# Re-validation failure — the human keeps their edits and sees which field failed;
+     the card is not removed and the pending counter is left untouched. #}
+  <div class="result error">
+    <p><strong>Not saved.</strong> {{ error }}</p>
+    <p>Fix the field and confirm again &mdash; your edits are kept.</p>
+  </div>
+  {% endif %}
+
+  <div class="intake-grid">
+    <div class="artifact">
+      {% if c.artifact_media_type.startswith("image/") %}
+      <img src="/intake/artifact/{{ c.candidate_id }}" alt="receipt from {{ c.vendor }}">
+      {% elif c.artifact_media_type == "application/pdf" %}
+      <a class="button" href="/intake/artifact/{{ c.candidate_id }}" target="_blank" rel="noopener">Open receipt (PDF)</a>
+      {% else %}
+      <a class="button" href="/intake/artifact/{{ c.candidate_id }}" target="_blank" rel="noopener">Download artifact</a>
+      {% endif %}
+      <a class="open-full" href="/intake/artifact/{{ c.candidate_id }}" target="_blank" rel="noopener">open &nearr;</a>
+    </div>
+
+    <div class="fields">
+      {# The extracted fields as an editable form, pre-filled verbatim. Money inputs
+         are type=text (NEVER type=number, which mangles "82.50" and drops trailing
+         zeros like "45.990"); the value is the exact string the extractor sent. #}
+      <form class="intake-confirm"
+            hx-post="/ui/intake/resolve"
+            hx-target="#card-{{ c.candidate_id }}"
+            hx-swap="outerHTML">
+        <input type="hidden" name="candidate_id" value="{{ c.candidate_id }}">
+        <input type="hidden" name="action" value="confirm">
+        <input type="hidden" name="period" value="{{ period }}">
+
+        <label>Vendor
+          <input type="text" name="vendor" value="{{ c.vendor }}" required>
+        </label>
+        <label>Amount
+          <input type="text" name="amount" value="{{ c.amount }}" inputmode="decimal" required>
+        </label>
+        <label>Tax
+          <input type="text" name="tax" value="{{ c.tax }}" inputmode="decimal">
+        </label>
+        <label>Date
+          <input type="text" name="date" value="{{ c.date }}" required>
+        </label>
+        <label>Description
+          <input type="text" name="description" value="{{ c.description }}">
+        </label>
+        <label>Attribution target
+          {# The id strings render with their human label when the sidecar map has
+             one, else the raw id; the <option value> and the pre-select both use the
+             id string (AC 16), never a warm name. A null-attribution candidate opens
+             on a disabled "choose…" placeholder — Confirm is blocked (required + the
+             server's defensive 422) until the human picks a target. #}
+          <select name="attribution_target_id" required>
+            {% if c.attribution_target_id is none %}
+            <option value="" selected disabled>choose&hellip;</option>
+            {% endif %}
+            {% for t in attribution_targets %}
+            <option value="{{ t }}"{% if t == c.attribution_target_id %} selected{% endif %}>{{ attribution_target_labels.get(t, t) }}</option>
+            {% endfor %}
+          </select>
+        </label>
+
+        {# The reason line (M3) — ONLY when a target was suggested (non-null), so a
+           failure reason folded into a null-attribution candidate's source_hint is
+           never mis-rendered as attribution provenance. Sits ABOVE the Confirm
+           button (H4) so a rapid one-tap confirm still passes the human's eye over
+           the suggested job. Never a manufactured confidence — the source_hint is
+           the trust signal, and it is true. #}
+        {% if c.attribution_target_id is not none %}
+        <p class="reason suggested">
+          {% if c.source == "receipt-intake" %}
+          from the email subject: '{{ c.source_hint }}'
+          {% else %}
+          suggested &mdash; {{ c.source_hint }}
+          {% endif %}
+        </p>
+        {% endif %}
+
+        <button type="submit" class="confirm">Confirm</button>
+      </form>
+
+      {# Reject is its own form (no field edits carried) — the candidate leaves the
+         queue, the ledger is untouched, the submission row + artifact stay on disk. #}
+      <form class="intake-reject"
+            hx-post="/ui/intake/resolve"
+            hx-target="#card-{{ c.candidate_id }}"
+            hx-swap="outerHTML">
+        <input type="hidden" name="candidate_id" value="{{ c.candidate_id }}">
+        <input type="hidden" name="action" value="reject">
+        <input type="hidden" name="period" value="{{ period }}">
+        <label>Reject reason (optional)
+          <input type="text" name="reject_reason" value="">
+        </label>
+        <button type="submit" class="reject">Reject</button>
+      </form>
+    </div>
+  </div>
+
+  {# Read-only trust trail — muted chips. No confidence chip, no category element. #}
+  <div class="trail intake-trail">
+    <span class="tag">source: {{ c.source }}</span>
+    <span class="tag">submission: {{ c.submission_id }}</span>
+    {% if c.source_hint %}<span class="tag">hint: {{ c.source_hint }}</span>{% endif %}
+    {% if c.received_at %}<span class="tag">received: {{ c.received_at[:10] }}</span>{% endif %}
+    <span class="tag">submitted: {{ c.submitted_at[:10] }}</span>
+  </div>
+</div>

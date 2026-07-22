@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% from "_closed_banner.html" import closed_banner %}
+{% block title %}Receipts — Bookkeeper{% endblock %}
+{% block content %}
+
+{% if closed_banners %}
+{# Every signed-closed period still surfaces on the front door (the closed-period
+   import/confirm guards refuse a write touching one). Kept from the old import
+   home so the two cross-cutting home-content tests stay green. #}
+{% for b in closed_banners %}{{ closed_banner(b.period, b.signed_at, b.signed_by) }}{% endfor %}
+{% endif %}
+
+<h1>Receipts</h1>
+
+{# --- Zone A: the capture pulse ---------------------------------------------
+   One honest line from data that already exists — no dashboard, no new
+   instrumentation. "N to review" is the only call-to-action number (there is no
+   all-periods roll-up to draw a completeness % from, and none is invented). It is
+   OOB-recomputed off build_intake_queue after each resolve via #intake-pulse-count
+   (one of the OOB spans the resolve partial targets). "M filed today" is the day's
+   stored-only tally (a dedupe no-op does not inflate it), recomputed per render AND
+   OOB-refreshed after each confirm via #intake-filed-count (so a live confirm bumps
+   it without a full reload). No confidence, no completeness % anywhere. #}
+<p class="capture-pulse">
+  <span class="pulse-primary"><span id="intake-pulse-count" class="pulse-count">{{ pending }}</span> to review</span>
+  <span class="pulse-sep" aria-hidden="true">·</span>
+  <span class="pulse-secondary"><span id="intake-filed-count" class="pulse-filed">{{ filed_today }}</span> filed today</span>
+</p>
+
+{% if candidates %}
+{# --- The hero review queue: one card per PENDING candidate ------------------
+   Only pending — never a rejected or confirmed card on the landing. The queue is
+   the app's showpiece; each card renders the receipt alongside the editable
+   verbatim fields (no proposed category, no confidence — extraction is a proposal).
+   hx-on::after-swap moves focus to the live pending counter once a card LEAVES, so a
+   keyboard / screen-reader user is not stranded on the removed card (AC 21) — but ONLY
+   when the card left. A re-validation failure re-renders the card in place (its
+   response still carries the `intake-confirm` form), so the guard skips the focus-move
+   and leaves the human on the field they must correct, rather than yanking focus to the
+   counter. #}
+<h2 class="queue-heading">
+  Reviewing
+  <span id="intake-pending-count" aria-live="polite" tabindex="-1">{{ pending }}</span>
+  receipt{{ "" if pending == 1 else "s" }} — confirm each against the receipt itself.
+</h2>
+<div id="intake-queue"
+     tabindex="-1"
+     hx-on::after-swap="if (event.detail.xhr && event.detail.xhr.responseText.indexOf('intake-confirm') === -1) document.getElementById('intake-pending-count').focus()">
+  {% for entry in candidates %}
+    {% set c = entry.candidate %}
+    {% include "_intake_card.html" %}
+  {% endfor %}
+</div>
+{# A3: the offline drop-scan is discoverable while reviewing too — a script may have
+   dropped more receipts. Gated on the feature being wired (drop_dir_enabled). #}
+{% if drop_dir_enabled %}
+<form class="scan-drop-form" hx-post="/ui/intake/scan" hx-target="#intake-scan-result" hx-swap="innerHTML">
+  <button type="submit" class="button scan-drop-button">Scan drop folder</button>
+  <small class="scan-hint">Ingest receipts a script dropped in the folder &mdash; nothing leaves this machine.</small>
+</form>
+{% endif %}
+{% else %}
+{# --- The win state (H3): a win, not a blank -------------------------------
+   Exactly "All receipts reviewed" — NOT "all caught up" (that would overclaim
+   across the drop folder and the downstream categorize step). Paired always with
+   the day's stored tally. Categorize is promoted to the PRIMARY next action only
+   here, at queue-clear — pointing downstream is only honest once the pile is empty.
+   The "scan drop folder to check for new" prompt (A3) renders only when the drop-dir
+   feature is enabled — it is what keeps "All receipts reviewed" from reading as a
+   false all-clear when un-scanned receipts may still sit in the drop folder. Gated so
+   the MUST headline never hard-depends on this SHOULD feature. #}
+<div class="win-state">
+  <h2>All receipts reviewed</h2>
+  <p class="win-tally">You filed {{ filed_today }} today.</p>
+  <p><a class="button" href="/ui/queue?period={{ period }}">Categorize what you filed &rarr;</a></p>
+  {% if drop_dir_enabled %}
+  <form class="scan-drop-form" hx-post="/ui/intake/scan" hx-target="#intake-scan-result" hx-swap="innerHTML">
+    <button type="submit" class="button scan-drop-button">Scan drop folder to check for new</button>
+  </form>
+  {% endif %}
+</div>
+{% endif %}
+
+{# The scan outcome (ingested / already-on-file / per-file errors) swaps in here —
+   one shared target for the queue-branch button and the win-state prompt. #}
+<div id="intake-scan-result"></div>
+
+{# --- The subordinate downstream rail --------------------------------------
+   Capture is the front door; the downstream stages stay discoverable (flat, not
+   hidden behind a hamburger) but visibly subordinate to the review queue above. #}
+<nav class="downstream-rail" aria-label="Downstream stages">
+  <span class="rail-label">Then:</span>
+  <a href="/ui/import-files?period={{ period }}">Import files</a>
+  <a href="/ui/queue?period={{ period }}">Confirm queue</a>
+  <a href="/ui/reconcile?period={{ period }}">Reconcile</a>
+  <a href="/ui/ledger?period={{ period }}">Ledger</a>
+  <a href="/ui/close?period={{ period }}">Close review</a>
+</nav>
+{% endblock %}

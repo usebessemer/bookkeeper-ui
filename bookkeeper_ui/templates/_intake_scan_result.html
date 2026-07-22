@@ -1,0 +1,31 @@
+{# Partial swapped into #intake-scan-result after "Scan drop folder" posts /ui/intake/scan
+   (Slice 5 · A3 — the offline drop-scan htmx twin). Two shapes:
+   - `error`  — the drop folder is not configured on this server: render the message for
+     the human, not a 500. Nothing scanned.
+   - success  — the scan ran: the tally (new / already-on-file / skipped) + the per-file
+     error list (a malformed file is a VISIBLE line, never silently dropped — AC 11). A
+     refresh-the-queue link appears only when new candidates actually landed. #}
+{% if error %}
+<div class="result error">
+  <p><strong>Scan failed.</strong> {{ error }}</p>
+  <p>Nothing was scanned.</p>
+</div>
+{% else %}
+<div class="result ok">
+  <p><strong>Scanned {{ scanned }} file{{ "" if scanned == 1 else "s" }}.</strong>
+     {{ ingested }} new,
+     {{ duplicates }} already on file{% if errors %},
+     {{ errors|length }} skipped{% endif %}.</p>
+  {% if ingested %}
+  <p><a class="button" href="/">Refresh the queue &mdash; {{ ingested }} new to review &rarr;</a></p>
+  {% endif %}
+  {% if errors %}
+  <p class="scan-errors-label">Skipped (fix and re-scan &mdash; the valid files were still ingested):</p>
+  <ul class="scan-errors">
+    {% for e in errors %}
+    <li><code>{{ e.file }}</code> &mdash; {{ e.error }}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</div>
+{% endif %}

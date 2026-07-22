@@ -3,8 +3,11 @@
 Slice 1 (categorize) and Slice 2 (reconcile) screens over the #2 stores,
 server-rendered, **no Node/build step**:
 
-- ``GET  /``            — **import**: upload a transactions CSV/JSON *and* a
-  statement CSV/JSON, pick the period to review.
+- ``GET  /``            — **capture home** (Slice 5 · B+): the extraction-review
+  queue as the front door — the capture pulse, one review card per pending
+  candidate (or the win state when clear). The CSV/statement importer demoted to
+  ``GET /ui/import-files`` (upload a transactions CSV/JSON *and* a statement
+  CSV/JSON, pick the period to review).
 - ``GET  /ui/queue``    — the **confirm queue** (Slice 1 core): one card per
   proposal rendering the full **trust trail** (proposed account · confidence ·
   the rule that fired), plus flagged transactions with their reason. Confirm /
@@ -40,6 +43,7 @@ screen can reach none of them — the same convention #21 set for `/ui/resolve`.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import quote
 
@@ -49,6 +53,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from bookkeeper.config import BookkeeperConfig
+from bookkeeper.model import Transaction
 from bookkeeper.skills.flag_anomaly import flag_anomaly
 from bookkeeper.skills.generate_package import PackageStatus
 from bookkeeper.skills.track_tax import UnknownTaxRegime
@@ -57,6 +62,15 @@ from bookkeeper_ui.anomaly_reviews import (
     AnomalyReview,
     FileAnomalyReviewStore,
     derive_flag_id,
+)
+from bookkeeper_ui.candidates import (
+    ACTION_CONFIRM,
+    ACTION_REJECT,
+    SOURCE_HUMAN as CANDIDATE_SOURCE_HUMAN,
+    CandidateDecision,
+    FileArtifactStore,
+    FileCandidateDecisionStore,
+    FileCandidateStore,
 )
 from bookkeeper_ui.closes import (
     FileCloseStore,
@@ -68,6 +82,12 @@ from bookkeeper_ui.closes import (
 from bookkeeper_ui.confirmations import SOURCE_HUMAN, Confirmation, FileConfirmationStore
 from bookkeeper_ui.exporter import MANIFEST_JSON, FileExportStore, export_package
 from bookkeeper_ui.importer import TransactionImportError, import_bytes
+from bookkeeper_ui.intake_confirm import (
+    ConfirmArtifactMissingError,
+    ConfirmClosedPeriodError,
+    apply_confirm,
+)
+from bookkeeper_ui.intake_scan import DEFAULT_MAX_ARTIFACT_BYTES, scan_drop_dir
 from bookkeeper_ui.ledger_store import FileLedgerStore, transaction_key
 from bookkeeper_ui.periods import is_quarterly_period, period_of
 from bookkeeper_ui.reconciliations import (
@@ -79,6 +99,7 @@ from bookkeeper_ui.reconciliations import (
 )
 from bookkeeper_ui.schemas import (
     AnomalyOut,
+    CandidateOut,
     CloseRecordOut,
     CloseReviewOut,
     TransactionOut,
@@ -89,9 +110,11 @@ from bookkeeper_ui.statement_store import FileStatementStore
 from bookkeeper_ui.views import (
     build_close_record,
     build_close_review,
+    build_intake_queue,
     build_ledger,
     build_package,
     build_reconciliation,
+    count_filed_today,
 )
 from bookkeeper_ui.waivers import FileWaiverStore, Waiver
 
@@ -103,6 +126,79 @@ STATIC_DIR = _HERE / "static"
 # (import examples/ → review) is one click. It is only a form pre-fill; the store
 # still derives each transaction's real period from its own date (`period_of`).
 _DEFAULT_PERIOD = "2026-Q2"
+
+
+class _IntakeFieldError(ValueError):
+    """A re-validation failure on a confirmed intake field.
+
+    The confirm path re-runs the A1 submission gate on the human's *edited* values
+    (a form on this surface can post a mangled money string or a bad date). Unlike
+    the JSON `/intake/resolve` twin — which raises a machine 422 — the UI renders
+    the failure *into the card* (a 200 partial the human reads, edits kept), so this
+    is a plain exception the handler catches, not an `HTTPException`.
+    """
+
+
+def _revalidate_money(raw: str, field: str) -> Decimal:
+    """Parse an edited money string to a finite `Decimal`, or raise `_IntakeFieldError`.
+
+    The A1 rule, verbatim (money is a string; `NaN`/`Infinity` parse but are not
+    finite, so they are rejected; never `float()` — guardrail 4).
+    """
+    try:
+        value = Decimal(raw)
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise _IntakeFieldError(
+            f"{field} {raw!r} is not a valid amount — money is a decimal string "
+            f'(e.g. "82.50").'
+        ) from exc
+    if not value.is_finite():
+        raise _IntakeFieldError(
+            f"{field} must be a finite amount — {raw!r} (NaN/Infinity) is rejected."
+        )
+    # Exponent notation (`1E+2`) parses finite but round-trips as E-notation, yielding a
+    # different `transaction_key` than the equal `100` — refuse it (A1's rule, verbatim).
+    if "e" in raw.lower():
+        raise _IntakeFieldError(
+            f"{field} {raw!r} uses exponent notation — money is a plain decimal "
+            f'string (e.g. "82.50", not "1E+2").'
+        )
+    return value
+
+
+def _revalidate_date(raw: str, field: str) -> datetime:
+    """Parse an edited ISO 8601 date string to a `datetime`, or raise `_IntakeFieldError`."""
+    try:
+        return datetime.fromisoformat(raw)
+    except (ValueError, TypeError) as exc:
+        raise _IntakeFieldError(
+            f"{field} {raw!r} is not an ISO 8601 date/datetime (e.g. 2026-06-14)."
+        ) from exc
+
+
+def _revalidate_nonblank(value: str, field: str) -> str:
+    """Return `value` if non-blank, else raise `_IntakeFieldError` naming the field."""
+    if not value.strip():
+        raise _IntakeFieldError(f"{field} is required and must not be blank.")
+    return value
+
+
+async def _intake_pending_count(
+    candidate_store: FileCandidateStore,
+    candidate_decision_store: FileCandidateDecisionStore,
+) -> int:
+    """The live count of pending candidates, recomputed off the shared projection.
+
+    Never a hand-maintained tally: the OOB counter + pulse both read *this*, off the
+    same `build_intake_queue(status="pending")` the queue page renders, so the count
+    stays honest as cards leave.
+    """
+    queue = await build_intake_queue(
+        candidate_store=candidate_store,
+        candidate_decision_store=candidate_decision_store,
+        status="pending",
+    )
+    return len(queue.candidates)
 
 
 def register_ui(
@@ -118,6 +214,12 @@ def register_ui(
     waiver_store: FileWaiverStore | None = None,
     export_dir: str | Path | None = None,
     export_store: FileExportStore | None = None,
+    candidate_store: FileCandidateStore | None = None,
+    candidate_decision_store: FileCandidateDecisionStore | None = None,
+    artifact_store: FileArtifactStore | None = None,
+    intake_drop_dir: str | Path | None = None,
+    max_artifact_bytes: int | None = None,
+    attribution_target_labels: dict[str, str] | None = None,
 ) -> None:
     """Mount the HTML UI on `app`, reading through the same injected stores as #2.
 
@@ -141,19 +243,114 @@ def register_ui(
     guarded download read through it, never re-reading the JSONL by hand; the
     export action reuses B's `export_package`. When unwired the exports listing
     renders its empty state and the download route 404s (there is nothing to serve).
+
+    The three Slice-5 intake stores (`candidate_store` / `candidate_decision_store` /
+    `artifact_store`) are threaded the same way (all **optional**, default `None`,
+    mirroring `create_app`) so pre-Slice-5 call sites keep working. Issue B mounts the
+    HTML extraction-review surface (`GET /ui/intake` + `POST /ui/intake/resolve`) over
+    the *same* stores the JSON `/intake/*` surface writes.
+
+    `intake_drop_dir` (Slice-5 · A3) threads through the same optional-`None`-defaulted
+    path so the UI can gate the offline drop-scan affordances: `drop_dir_enabled =
+    intake_drop_dir is not None` is exposed to the capture-home / win-state templates, so
+    the "Scan drop folder" button and the win-state "scan drop folder to check for new"
+    prompt render **only** when the feature is wired (the MUST capture flow never depends
+    on this SHOULD feature). `POST /ui/intake/scan` is the htmx twin of the JSON
+    `POST /intake/scan` — it runs the *same* `scan_drop_dir` and renders the result into a
+    partial; unwired it renders an error partial (nothing scanned). `max_artifact_bytes`
+    is the same decoded-size cap the JSON scan enforces, threaded so both surfaces agree.
+
+    `attribution_target_labels` is the **app-side** sidecar map (id string → human
+    label) the intake `<select>` renders through. It is deliberately *not* a field on
+    the framework `BookkeeperConfig` (`from_mapping` silently drops unknown keys), so
+    it travels this same optional-`None`-defaulted param path — read app-side from the
+    config JSON in `build_app_from_env` — and is defaulted to `{}` in the template
+    context. The confirmed value on the wire is always the opaque id string; the label
+    map is presentation-only and never enters validation.
     """
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    intake_labels = attribution_target_labels or {}
+    drop_dir_enabled = intake_drop_dir is not None
+    artifact_cap = (
+        max_artifact_bytes if max_artifact_bytes is not None else DEFAULT_MAX_ARTIFACT_BYTES
+    )
 
-    @app.get("/", response_class=HTMLResponse, summary="Import screen (home)")
-    async def home(request: Request, period: str = _DEFAULT_PERIOD) -> HTMLResponse:
-        """The import screen: upload a transactions and/or a statement file, choose
-        the period to review.
+    @app.get("/", response_class=HTMLResponse, summary="Capture home (the receipts landing)")
+    async def home(request: Request) -> HTMLResponse:
+        """The capture home: the extraction-review queue as the app's front door.
 
-        Surfaces a closed banner for **every** signed-closed period (an import
-        touching a closed period is refused whole), read from the one closed-period
-        truth `close_store.by_period()`. `period` only pre-fills the form / carries
-        the nav context; the store still derives each row's real period from its date.
+        Re-homed (Slice-5 · B+) from the CSV/statement importer, which demotes to
+        `GET /ui/import-files`. Renders the capture pulse (N to review · M filed
+        today), then the hero review queue — one card per **pending** candidate off
+        the *same* `build_intake_queue(status="pending")` projection `GET /ui/intake`
+        and the JSON list share (never a rejected or confirmed card on the landing) —
+        or the win state when the queue is clear.
+
+        **Period-agnostic:** the intake queue is all-periods (a candidate's period is
+        derived from its own date at confirm), so `/` takes no `period` param — the
+        shared nav's `nav_period` falls back via `base.html` (see the nav note there).
+        Still reads `close_store.by_period()` so every signed-closed period surfaces
+        its banner on the front door. An unwired intake port renders the win state
+        (nothing pending), never a 500.
+        """
+        closed_banners = [
+            {"period": p, "signed_at": r.signed_at.isoformat(), "signed_by": r.signed_by}
+            for p, r in sorted((await close_store.by_period()).items())
+        ] if close_store is not None else []
+
+        if candidate_store is None or candidate_decision_store is None:
+            candidates: list = []
+            filed_today = 0
+        else:
+            queue = await build_intake_queue(
+                candidate_store=candidate_store,
+                candidate_decision_store=candidate_decision_store,
+                status="pending",
+            )
+            candidates = queue.candidates
+            # "M filed today": stored-only confirms on the server-local day (AC 15) —
+            # recomputed off the full decision trail per render, never a stored tally.
+            filed_today = count_filed_today(
+                await candidate_decision_store.all(),
+                today=datetime.now().date(),
+            )
+
+        return templates.TemplateResponse(
+            request,
+            "capture_home.html",
+            {
+                # The card's hidden `period` field is nav context only (the confirm
+                # period is derived from the edited date); a constant keeps it
+                # non-blank without re-introducing a `/` query param.
+                "period": _DEFAULT_PERIOD,
+                "closed_banners": closed_banners,
+                "candidates": candidates,
+                "pending": len(candidates),
+                "filed_today": filed_today,
+                "attribution_targets": config.attribution_targets,
+                "attribution_target_labels": intake_labels,
+                # A3: gate the "scan drop folder" button + win-state prompt on the
+                # feature being wired — the MUST capture flow never depends on it.
+                "drop_dir_enabled": drop_dir_enabled,
+            },
+        )
+
+    @app.get(
+        "/ui/import-files",
+        response_class=HTMLResponse,
+        summary="Import files (CSV transactions / statement)",
+    )
+    async def import_files(request: Request, period: str = _DEFAULT_PERIOD) -> HTMLResponse:
+        """The CSV/statement importer — demoted from `/` to a downstream stage (B+).
+
+        Renders the *same* `import.html` (both upload forms) verbatim at the new
+        route: the re-home moved the route, not the behavior — the forms still POST
+        `/ui/import` and `/ui/statements/import`, so a real import lands transactions
+        in the ledger exactly as Slice 1 did (AC 23). Keeps the closed-banner read so
+        an import touching a signed-closed period is still visibly refused. `period`
+        only pre-fills the form / carries nav context; the store derives each row's
+        real period from its date.
         """
         closed_banners = [
             {"period": p, "signed_at": r.signed_at.isoformat(), "signed_by": r.signed_by}
@@ -1133,5 +1330,324 @@ def register_ui(
                 "export_id": record.export_id,
                 "files": _export_files(record),
                 "divergence_count": record.divergence_count,
+            },
+        )
+
+    # --- Slice 5 · B: the extraction-review UI over the intake port (issue A). The
+    # §5 human-confirm gate: extraction is a *proposal* — a human confirms each
+    # candidate against the receipt itself before it enters the ledger. `GET /ui/intake`
+    # renders one editable review card per pending candidate off the SAME shared
+    # `build_intake_queue` projection the JSON `/intake/candidates` serializes;
+    # `POST /ui/intake/resolve` is the form twin of JSON `/intake/resolve` — a confirm
+    # re-validates the human's edits (the A1 gate), guards the edited date against
+    # closed periods, then constructs a framework `Transaction` and enters the EXISTING
+    # ledger store. The reachable refusals render into the card (200 partials the human
+    # reads); the JSON twin keeps the machine 4xx.
+
+    @app.get("/ui/intake", response_class=HTMLResponse, summary="The extraction-review queue")
+    async def ui_intake(request: Request, period: str = _DEFAULT_PERIOD) -> HTMLResponse:
+        """The extraction-review queue — one editable card per pending candidate.
+
+        Reads `build_intake_queue(status="pending")` (the same projection the JSON
+        `GET /intake/candidates` serializes), ordered by `submitted_at`, so HTML and
+        JSON never re-derive a candidate's standing independently — and renders only
+        pending cards, never rejected or confirmed. `period` only carries the nav
+        context: the intake queue is not period-scoped (a candidate's period is
+        derived from its date at confirm). An unwired intake port renders the honest
+        empty state, never a 500.
+        """
+        if candidate_store is None or candidate_decision_store is None:
+            candidates: list = []
+        else:
+            queue = await build_intake_queue(
+                candidate_store=candidate_store,
+                candidate_decision_store=candidate_decision_store,
+                status="pending",
+            )
+            candidates = queue.candidates
+        return templates.TemplateResponse(
+            request,
+            "intake.html",
+            {
+                "period": period,
+                "candidates": candidates,
+                "pending": len(candidates),
+                "attribution_targets": config.attribution_targets,
+                "attribution_target_labels": intake_labels,
+            },
+        )
+
+    @app.post(
+        "/ui/intake/resolve",
+        response_class=HTMLResponse,
+        summary="Confirm/correct/reject a candidate (htmx)",
+    )
+    async def ui_intake_resolve(
+        request: Request,
+        candidate_id: str = Form(...),
+        action: str = Form(...),
+        vendor: str = Form(""),
+        amount: str = Form(""),
+        tax: str = Form(""),
+        date: str = Form(""),
+        description: str = Form(""),
+        attribution_target_id: str = Form(""),
+        reject_reason: str = Form(""),
+        period: str = Form(_DEFAULT_PERIOD),
+    ) -> HTMLResponse:
+        """Record one confirm/correct/reject on a candidate, then swap the card out.
+
+        The form twin of JSON `POST /intake/resolve`. The terminal states swap a
+        defined partial into the card (never a raw error): an **unknown** candidate →
+        `_intake_gone.html` (JSON twin 404); an **already-decided** candidate →
+        `_intake_already.html` with its recorded outcome (JSON twin 409).
+
+        On **confirm** the human's edits go through the same A1 gate the machine
+        submission passed (string-Decimal money, ISO date, non-blank vendor). Ordered:
+        (1) re-validate every edited field — a failure renders `_intake_error.html`
+        into the card with the edits kept and the counter untouched (JSON twin 422),
+        and produces the parsed date step 3 consumes; (2) the `attribution_target_id`
+        is required and must be in `config.attribution_targets` — a defensive 422 (the
+        rendered `<select>` offers only valid ids), mirroring the §5.2 account guard;
+        (3) the **edited** date is checked against the closed periods via
+        `closed_periods` + `period_of` (never `transaction_in_closed_period`, which
+        probes an existing ledger row and would silently pass here — the txn is not
+        filed yet) → `_closed_refusal.html`, no ledger write, no decision row, counter
+        untouched (JSON twin 409); (4) construct the framework `Transaction` (the
+        receipt bytes ride `artifact_bytes` into the row) and persist via the existing
+        `FileLedgerStore.store()`; (5) honest dedupe — probe `contains()` **before**
+        the idempotent, silent `store()` and record `ledger_outcome` (`stored` vs
+        `already-present`) so a duplicate confirm is a **visible** no-op, never a
+        silent lost filing; (6) append the decision row (the durable candidate↔ledger
+        link). A **reject** records the decision and leaves the ledger untouched.
+
+        On success the two OOB spans in `_intake_resolved.html` update the live pending
+        counter + capture pulse (both recomputed off `build_intake_queue`), and the
+        swapped body links on to the period's confirm queue.
+        """
+        if (
+            candidate_store is None
+            or candidate_decision_store is None
+            or artifact_store is None
+        ):
+            # No intake wired — there is no queue to recount, so the bare gone swap.
+            return templates.TemplateResponse(request, "_intake_gone.html", {})
+
+        submission = await candidate_store.get(candidate_id)
+        if submission is None:  # unknown candidate — the "no longer available" swap
+            # The card still leaves the visible queue, so recompute the pending pulse
+            # OOB — else the counter reads stale (too high) until the human refreshes.
+            pending = await _intake_pending_count(candidate_store, candidate_decision_store)
+            return templates.TemplateResponse(
+                request, "_intake_gone.html", {"pending": pending}
+            )
+
+        prior = (await candidate_decision_store.latest_by_candidate()).get(candidate_id)
+        if prior is not None:  # already decided — its recorded outcome, not a re-open
+            # Same: the card leaves, so recompute the pending pulse OOB (the counter
+            # was showing this now-decided card in its tally).
+            pending = await _intake_pending_count(candidate_store, candidate_decision_store)
+            return templates.TemplateResponse(
+                request,
+                "_intake_already.html",
+                {
+                    "pending": pending,
+                    "action": prior.action,
+                    "ledger_outcome": prior.ledger_outcome,
+                    "reject_reason": prior.reject_reason,
+                },
+            )
+
+        now = datetime.now(timezone.utc)
+
+        # --- Reject: record the decision; the ledger is untouched, the card leaves. ---
+        if action == ACTION_REJECT:
+            await candidate_decision_store.record(
+                CandidateDecision(
+                    candidate_id=candidate_id,
+                    action=ACTION_REJECT,
+                    source=CANDIDATE_SOURCE_HUMAN,
+                    decided_at=now,
+                    reject_reason=reject_reason.strip() or None,
+                )
+            )
+            pending = await _intake_pending_count(
+                candidate_store, candidate_decision_store
+            )
+            # A reject files nothing, so "M filed today" is unchanged — but the resolved
+            # partial always carries the OOB filed span, so recompute (not blank) it.
+            filed_today = count_filed_today(
+                await candidate_decision_store.all(), today=datetime.now().date()
+            )
+            return templates.TemplateResponse(
+                request,
+                "_intake_resolved.html",
+                {
+                    "action": ACTION_REJECT,
+                    "pending": pending,
+                    "filed_today": filed_today,
+                    "period": period,
+                },
+            )
+
+        # --- Confirm ---
+        # 1. Re-validate every edited field (the A1 gate). A blank tax coalesces to
+        #    "0" (the intake boundary's own convention), matching the machine path.
+        try:
+            v_vendor = _revalidate_nonblank(vendor, "vendor")
+            v_amount = _revalidate_money(amount, "amount")
+            v_tax = Decimal("0") if not tax.strip() else _revalidate_money(tax, "tax")
+            v_date = _revalidate_date(date, "date")
+        except _IntakeFieldError as exc:
+            # Re-render the card with the human's edits kept + the failure named.
+            edited = CandidateOut.from_submission(submission).model_copy(
+                update={
+                    "vendor": vendor,
+                    "amount": amount,
+                    "tax": tax,
+                    "date": date,
+                    "description": description,
+                    "attribution_target_id": attribution_target_id or None,
+                }
+            )
+            return templates.TemplateResponse(
+                request,
+                "_intake_error.html",
+                {
+                    "c": edited,
+                    "error": str(exc),
+                    "period": period,
+                    "attribution_targets": config.attribution_targets,
+                    "attribution_target_labels": intake_labels,
+                },
+            )
+
+        # 2. Attribution — required + in config.attribution_targets (defensive 422).
+        target = attribution_target_id or None
+        if target is None or target not in config.attribution_targets:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"attribution_target_id {target!r} must be one of "
+                    f"config.attribution_targets — the resolver never invents a target."
+                ),
+            )
+
+        # 3-6. Apply the confirm through the ONE write core both twins share — the C1
+        #      closed guard on the edited date, the missing-artifact refusal, and the
+        #      honest-dedupe probe-before-store ordering all live there, so they cannot
+        #      drift from the JSON twin. Its two typed refusals render this surface's
+        #      partials (never a raw error): a closed period → `_closed_refusal.html`,
+        #      a lost artifact → the failure into the card (edits kept, counter untouched).
+        try:
+            result = await apply_confirm(
+                candidate_id=candidate_id,
+                vendor=v_vendor,
+                amount=v_amount,
+                tax=v_tax,
+                date=v_date,
+                description=description,
+                attribution_target_id=target,
+                now=now,
+                ledger_store=ledger_store,
+                artifact_store=artifact_store,
+                decision_store=candidate_decision_store,
+                close_store=close_store,
+            )
+        except ConfirmClosedPeriodError as exc:
+            return templates.TemplateResponse(
+                request,
+                "_closed_refusal.html",
+                {"period": exc.period},
+            )
+        except ConfirmArtifactMissingError:
+            edited = CandidateOut.from_submission(submission).model_copy(
+                update={
+                    "vendor": vendor,
+                    "amount": amount,
+                    "tax": tax,
+                    "date": date,
+                    "description": description,
+                    "attribution_target_id": attribution_target_id or None,
+                }
+            )
+            return templates.TemplateResponse(
+                request,
+                "_intake_error.html",
+                {
+                    "c": edited,
+                    "error": (
+                        "the receipt artifact for this candidate is missing — a confirm "
+                        "files the receipt bytes with the ledger row, so it cannot be "
+                        "filed without them."
+                    ),
+                    "period": period,
+                    "attribution_targets": config.attribution_targets,
+                    "attribution_target_labels": intake_labels,
+                },
+            )
+
+        pending = await _intake_pending_count(candidate_store, candidate_decision_store)
+        # "M filed today" is the pulse's second number — a confirm that filed a fresh row
+        # bumps it, so recompute it OOB too (off the same `count_filed_today` the full
+        # render uses, server-local day) rather than leaving it stale until the next GET.
+        filed_today = count_filed_today(
+            await candidate_decision_store.all(), today=datetime.now().date()
+        )
+        return templates.TemplateResponse(
+            request,
+            "_intake_resolved.html",
+            {
+                "action": ACTION_CONFIRM,
+                "pending": pending,
+                "filed_today": filed_today,
+                "period": period,
+                "confirm_period": period_of(v_date),
+                "ledger_outcome": result.ledger_outcome,
+            },
+        )
+
+    # --- Slice 5 · A3: the offline drop-scan htmx twin. The human presses "Scan drop
+    # folder" (on the queue or in the win state — gated on `drop_dir_enabled`); this runs
+    # the SAME `scan_drop_dir` the JSON `POST /intake/scan` runs and swaps the outcome
+    # (ingested / already-on-file / per-file errors) into a result partial.
+
+    @app.post(
+        "/ui/intake/scan",
+        response_class=HTMLResponse,
+        summary="Scan the drop folder for candidate documents (htmx twin)",
+    )
+    async def ui_intake_scan(request: Request) -> HTMLResponse:
+        """Scan the drop folder → ingest new candidates, render the outcome (Slice 5 · A3).
+
+        The human twin of the JSON `POST /intake/scan`: runs the *same* `scan_drop_dir`
+        over the *same* stores, then renders the tally (new / already-on-file / skipped)
+        and the per-file error list into `_intake_scan_result.html` — the app's
+        error-into-the-page convention, so a malformed file is a visible line the human
+        reads, never a 500. When the drop feature is unwired, or the intake stores are
+        absent, it renders an error partial (nothing scanned). If new candidates landed it
+        offers a refresh-the-queue link back to the capture home (the pending set changed);
+        the scan itself never re-renders the whole queue out-of-band.
+        """
+        if intake_drop_dir is None or candidate_store is None or artifact_store is None:
+            return templates.TemplateResponse(
+                request,
+                "_intake_scan_result.html",
+                {"error": "the drop folder is not configured on this server."},
+            )
+        summary = await scan_drop_dir(
+            drop_dir=intake_drop_dir,
+            candidate_store=candidate_store,
+            artifact_store=artifact_store,
+            max_artifact_bytes=artifact_cap,
+        )
+        return templates.TemplateResponse(
+            request,
+            "_intake_scan_result.html",
+            {
+                "scanned": summary.scanned,
+                "ingested": summary.ingested,
+                "duplicates": summary.duplicates,
+                "errors": summary.errors,
             },
         )

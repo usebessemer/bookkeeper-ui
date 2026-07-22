@@ -127,10 +127,11 @@ async def _view(client: httpx.AsyncClient) -> dict:
 # --- Statement upload --------------------------------------------------------
 
 
-async def test_home_renders_both_import_forms(ui: ReconUi):
-    """The home screen carries the transactions upload *and* the statement upload."""
+async def test_import_files_renders_both_import_forms(ui: ReconUi):
+    """B+ re-home: BOTH uploads (transactions *and* statement) demote from `/` to
+    GET /ui/import-files — the re-home moved the route, not the forms."""
     async with _client(ui.app) as client:
-        resp = await client.get("/")
+        resp = await client.get("/ui/import-files")
         assert resp.status_code == 200
         assert 'hx-post="/ui/import"' in resp.text
         assert 'hx-post="/ui/statements/import"' in resp.text

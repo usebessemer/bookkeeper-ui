@@ -13,6 +13,10 @@
   "tax_regime": "HST",
   "accountant_format": "generic-export",
   "attribution_targets": ["target-001", "target-002"],
+  "attribution_target_labels": {
+    "target-001": "Main Business",
+    "target-002": "Side Project"
+  },
   "books_location": "local-file-store",
   "intake_channel": "manual-import",
   "confidence_thresholds": {

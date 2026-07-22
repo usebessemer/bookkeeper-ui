@@ -1,0 +1,19 @@
+{# Terminal-decision swap: this candidate was already reviewed (a second decision
+   is refused — re-opening a decided candidate is out of scope). Its recorded
+   outcome is shown in place of the card. The card still LEAVES the visible queue,
+   so the pending pulse is recomputed OOB (else the counter reads stale until a
+   refresh) — the same two spans the resolve partial targets. The JSON twin
+   (POST /intake/resolve) returns a machine 409. #}
+{% if pending is defined %}
+<span id="intake-pending-count" hx-swap-oob="innerHTML">{{ pending }}</span>
+<span id="intake-pulse-count" hx-swap-oob="innerHTML">{{ pending }}</span>
+{% endif %}
+<div class="result">
+  <p><strong>Already reviewed.</strong>
+  {% if action == "confirm" %}
+    This candidate was confirmed{% if ledger_outcome == "already-present" %} (a duplicate of an existing ledger filing; no new row was written){% endif %}.
+  {% else %}
+    This candidate was rejected{% if reject_reason %} &mdash; {{ reject_reason }}{% endif %}.
+  {% endif %}
+  Reload the queue to see the current receipts.</p>
+</div>

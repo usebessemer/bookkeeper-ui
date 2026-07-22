@@ -1,0 +1,29 @@
+{# The /ui/intake/resolve success swap — the _resolved.html idiom EXTENDED with the
+   pulse OOB spans. THREE out-of-band spans (distinct ids) recompute the live pulse:
+   the pending counter and "N to review" (both off build_intake_queue(status="pending")),
+   and "M filed today" (off count_filed_today) — so a confirm that files a fresh row
+   bumps BOTH pulse numbers live, never leaving "filed today" stale until the next GET.
+   The body below swaps into the card target (hx-swap="outerHTML"), so the resolved card
+   leaves the queue and reports the outcome honestly — a duplicate confirm is shown as
+   already-present, never a silent lost filing.
+
+   The OOB strategy is innerHTML (not the default outerHTML) so each counter's own
+   element — the pending counter's aria-live region + focus target (AC 21) — is
+   preserved across resolves and the text change reliably announces, rather than being
+   replaced by a fresh element. #}
+<span id="intake-pending-count" hx-swap-oob="innerHTML">{{ pending }}</span>
+<span id="intake-pulse-count" hx-swap-oob="innerHTML">{{ pending }}</span>
+<span id="intake-filed-count" hx-swap-oob="innerHTML">{{ filed_today }}</span>
+<div class="result ok">
+  {% if action == "reject" %}
+  <p><strong>Rejected.</strong> The ledger is untouched; the receipt and its
+     submission row stay on disk (append-only audit trail).</p>
+  {% elif ledger_outcome == "already-present" %}
+  <p><strong>Confirmed.</strong> This transaction is already in the ledger &mdash; a
+     receipt with identical business fields exists, so no new row was written.</p>
+  <p><a class="button" href="/ui/queue?period={{ confirm_period }}">Review the confirm queue for {{ confirm_period }} &rarr;</a></p>
+  {% else %}
+  <p><strong>Confirmed and filed to the ledger.</strong></p>
+  <p><a class="button" href="/ui/queue?period={{ confirm_period }}">Review the confirm queue for {{ confirm_period }} &rarr;</a></p>
+  {% endif %}
+</div>

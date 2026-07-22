@@ -1,0 +1,6 @@
+{# The re-validation-failure swap. Renders the review card again with the human's
+   edits kept and an inline error naming the failure (the banner lives INSIDE the
+   card so a later re-submit replaces it cleanly), swapped INTO the card target so
+   the card is not removed and the pending counter is left untouched. The JSON twin
+   (POST /intake/resolve) returns a machine 422 for the same field failure. #}
+{% include "_intake_card.html" %}

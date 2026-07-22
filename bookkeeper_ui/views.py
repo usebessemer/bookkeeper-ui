@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 from bookkeeper.config import BookkeeperConfig
 from bookkeeper.model import Transaction
@@ -46,6 +46,13 @@ from bookkeeper.skills.reconcile import (
 from bookkeeper.skills.track_tax import TaxSummary, track_tax
 
 from bookkeeper_ui.anomaly_reviews import FileAnomalyReviewStore, derive_flag_id
+from bookkeeper_ui.candidates import (
+    ACTION_CONFIRM,
+    LEDGER_OUTCOME_STORED,
+    CandidateDecision,
+    FileCandidateDecisionStore,
+    FileCandidateStore,
+)
 from bookkeeper_ui.closes import CloseRecord, FileCloseStore
 from bookkeeper_ui.confirmations import SOURCE_HUMAN, FileConfirmationStore
 from bookkeeper_ui.ledger_store import FileLedgerStore, transaction_key
@@ -56,8 +63,11 @@ from bookkeeper_ui.reconciliations import (
     FileReconciliationStore,
 )
 from bookkeeper_ui.schemas import (
+    CandidateEntryOut,
     GapItemOut,
     GapOut,
+    IntakeQueueOut,
+    IntakeStanding,
     LedgerEntryOut,
     LedgerOut,
     MatchedItemOut,
@@ -183,6 +193,60 @@ async def build_ledger(
         closed=record is not None,
         signed_at=record.signed_at.isoformat() if record is not None else None,
         signed_by=record.signed_by if record is not None else None,
+    )
+
+
+async def build_intake_queue(
+    *,
+    candidate_store: FileCandidateStore,
+    candidate_decision_store: FileCandidateDecisionStore,
+    status: IntakeStanding | None = None,
+) -> IntakeQueueOut:
+    """The intake queue — every candidate (in submission order) with its standing.
+
+    The `build_ledger` discipline at the candidate stage: compute each candidate's
+    standing **once** — `pending` (no decision), `confirmed`, or `rejected` — by
+    overlaying the decision trail (`latest_by_candidate`, last-write-wins) on the
+    submissions. Both the JSON list route and the later UI queue read *this* one
+    projection, so JSON and HTML never re-derive candidate standing independently.
+
+    `status` filters to that standing (`None` → all statuses). Order is the store's
+    submission (insertion) order, preserved so the surfaces render identically.
+    """
+    submissions = await candidate_store.all()
+    decisions = await candidate_decision_store.latest_by_candidate()
+    entries = [
+        CandidateEntryOut.build(submission, decisions.get(submission.candidate_id))
+        for submission in submissions
+    ]
+    if status is not None:
+        entries = [entry for entry in entries if entry.standing == status]
+    return IntakeQueueOut(status=status, candidates=entries)
+
+
+def count_filed_today(decisions: list[CandidateDecision], *, today: date) -> int:
+    """The honest "M filed today" pulse count — confirms that FILED a fresh row today.
+
+    Two honesty rules the capture-pulse (Slice-5 · B+ AC 15) is built on:
+
+    - **Stored-only.** Counts a decision only when ``action == "confirm"`` **and**
+      ``ledger_outcome == "stored"``. A dedupe no-op (``already-present``) resolved a
+      candidate but wrote no new ledger row, so it must **not** inflate the tally —
+      counting it would claim a filing that never happened.
+    - **Deployment-local day.** ``decided_at`` is stored UTC-aware; a receipt filed at
+      7pm local belongs to *today*, not tomorrow. Compare in the server's local time
+      (``decided_at.astimezone()`` converts the aware UTC instant to local) against
+      ``today`` (the caller's local ``date.today()``), never in UTC.
+
+    Pure over the full decision trail so the honesty rules are unit-testable without a
+    request; the landing recomputes it per render off ``candidate_decision_store.all()``.
+    """
+    return sum(
+        1
+        for d in decisions
+        if d.action == ACTION_CONFIRM
+        and d.ledger_outcome == LEDGER_OUTCOME_STORED
+        and d.decided_at.astimezone().date() == today
     )
 
 

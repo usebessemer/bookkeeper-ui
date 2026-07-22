@@ -75,10 +75,33 @@ def _cards(html: str) -> dict[str, dict[str, str]]:
     }
 
 
-async def test_home_renders_import_form(ui: UiHarness):
-    """AC: the import screen renders — an htmx upload form with a period field."""
+async def test_home_renders_capture_home(ui: UiHarness):
+    """AC 14/12 (the re-home): `GET /` re-homes to the capture home — the pulse
+    strip and the subordinate downstream rail, with 'Receipts' first in the nav and
+    the Receipts link period-agnostic. The CSV/statement importer is NO LONGER the
+    front door (it moved to /ui/import-files)."""
     async with _client(ui.app) as client:
         resp = await client.get("/")
+        assert resp.status_code == 200
+        html = resp.text
+        # Zone A — the capture pulse (the only call-to-action number).
+        assert 'id="intake-pulse-count"' in html
+        assert "to review" in html
+        # The importer is gone from the front door.
+        assert 'hx-post="/ui/import"' not in html
+        # Nav: 'Receipts' leads and carries NO ?period=; the importer demoted.
+        assert '<a href="/">Receipts</a>' in html
+        assert '/ui/import-files' in html
+        # The subordinate downstream rail keeps the next stages discoverable.
+        assert 'class="downstream-rail"' in html
+
+
+async def test_import_files_renders_import_form(ui: UiHarness):
+    """AC 14/23: the CSV/statement importer is reachable at GET /ui/import-files,
+    rendering the same htmx upload form (with its period field) verbatim — the
+    re-home moved the route, not the behavior."""
+    async with _client(ui.app) as client:
+        resp = await client.get("/ui/import-files")
         assert resp.status_code == 200
         assert 'hx-post="/ui/import"' in resp.text
         assert 'type="file"' in resp.text
@@ -96,6 +119,30 @@ async def test_import_renders_result_with_queue_link(ui: UiHarness):
         assert '/ui/queue?period=2026-Q1' in resp.text  # GitHub row lands in Q1
     # The upload persisted through the same #1 store the API writes.
     assert ui.ledger_path.exists()
+
+
+async def test_import_post_through_rehomed_context_lands_transactions(ui: UiHarness):
+    """Pin 21: a real POST driven through the re-homed importer lands transactions
+    exactly as Slice 1 — asserted at the LEDGER, not just that the file exists. The
+    re-home (B+) moved the form to `GET /ui/import-files` but its POST target
+    (`/ui/import`) and store path are untouched, so the rows land with exact money."""
+    import json
+
+    async with _client(ui.app) as client:
+        # The re-homed page still targets the unchanged POST route.
+        form = (await client.get("/ui/import-files")).text
+        assert 'hx-post="/ui/import"' in form
+        resp = await _import_csv(client, ui.examples_dir / "transactions.csv")
+        assert resp.status_code == 200
+        assert "Imported 6" in resp.text
+    # The rows actually landed in the ledger (money exact as strings, never a float).
+    rows = [
+        json.loads(line)
+        for line in ui.ledger_path.read_text().splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == 6
+    assert all(isinstance(r["amount"], str) for r in rows)
 
 
 async def test_import_bad_file_renders_error_not_500(ui: UiHarness):
