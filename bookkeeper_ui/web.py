@@ -84,6 +84,7 @@ from bookkeeper_ui.closes import (
 from bookkeeper_ui.confirmations import SOURCE_HUMAN, Confirmation, FileConfirmationStore
 from bookkeeper_ui.exporter import MANIFEST_JSON, FileExportStore, export_package
 from bookkeeper_ui.importer import TransactionImportError, import_bytes
+from bookkeeper_ui.intake_scan import DEFAULT_MAX_ARTIFACT_BYTES, scan_drop_dir
 from bookkeeper_ui.ledger_store import FileLedgerStore, transaction_key
 from bookkeeper_ui.periods import is_quarterly_period, period_of
 from bookkeeper_ui.reconciliations import (
@@ -206,6 +207,8 @@ def register_ui(
     candidate_store: FileCandidateStore | None = None,
     candidate_decision_store: FileCandidateDecisionStore | None = None,
     artifact_store: FileArtifactStore | None = None,
+    intake_drop_dir: str | Path | None = None,
+    max_artifact_bytes: int | None = None,
     attribution_target_labels: dict[str, str] | None = None,
 ) -> None:
     """Mount the HTML UI on `app`, reading through the same injected stores as #2.
@@ -237,6 +240,16 @@ def register_ui(
     HTML extraction-review surface (`GET /ui/intake` + `POST /ui/intake/resolve`) over
     the *same* stores the JSON `/intake/*` surface writes.
 
+    `intake_drop_dir` (Slice-5 · A3) threads through the same optional-`None`-defaulted
+    path so the UI can gate the offline drop-scan affordances: `drop_dir_enabled =
+    intake_drop_dir is not None` is exposed to the capture-home / win-state templates, so
+    the "Scan drop folder" button and the win-state "scan drop folder to check for new"
+    prompt render **only** when the feature is wired (the MUST capture flow never depends
+    on this SHOULD feature). `POST /ui/intake/scan` is the htmx twin of the JSON
+    `POST /intake/scan` — it runs the *same* `scan_drop_dir` and renders the result into a
+    partial; unwired it renders an error partial (nothing scanned). `max_artifact_bytes`
+    is the same decoded-size cap the JSON scan enforces, threaded so both surfaces agree.
+
     `attribution_target_labels` is the **app-side** sidecar map (id string → human
     label) the intake `<select>` renders through. It is deliberately *not* a field on
     the framework `BookkeeperConfig` (`from_mapping` silently drops unknown keys), so
@@ -248,6 +261,10 @@ def register_ui(
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     intake_labels = attribution_target_labels or {}
+    drop_dir_enabled = intake_drop_dir is not None
+    artifact_cap = (
+        max_artifact_bytes if max_artifact_bytes is not None else DEFAULT_MAX_ARTIFACT_BYTES
+    )
 
     @app.get("/", response_class=HTMLResponse, summary="Capture home (the receipts landing)")
     async def home(request: Request) -> HTMLResponse:
@@ -303,6 +320,9 @@ def register_ui(
                 "filed_today": filed_today,
                 "attribution_targets": config.attribution_targets,
                 "attribution_target_labels": intake_labels,
+                # A3: gate the "scan drop folder" button + win-state prompt on the
+                # feature being wired — the MUST capture flow never depends on it.
+                "drop_dir_enabled": drop_dir_enabled,
             },
         )
 
@@ -1539,5 +1559,50 @@ def register_ui(
                 "period": period,
                 "confirm_period": period_of(v_date),
                 "ledger_outcome": outcome,
+            },
+        )
+
+    # --- Slice 5 · A3: the offline drop-scan htmx twin. The human presses "Scan drop
+    # folder" (on the queue or in the win state — gated on `drop_dir_enabled`); this runs
+    # the SAME `scan_drop_dir` the JSON `POST /intake/scan` runs and swaps the outcome
+    # (ingested / already-on-file / per-file errors) into a result partial.
+
+    @app.post(
+        "/ui/intake/scan",
+        response_class=HTMLResponse,
+        summary="Scan the drop folder for candidate documents (htmx twin)",
+    )
+    async def ui_intake_scan(request: Request) -> HTMLResponse:
+        """Scan the drop folder → ingest new candidates, render the outcome (Slice 5 · A3).
+
+        The human twin of the JSON `POST /intake/scan`: runs the *same* `scan_drop_dir`
+        over the *same* stores, then renders the tally (new / already-on-file / skipped)
+        and the per-file error list into `_intake_scan_result.html` — the app's
+        error-into-the-page convention, so a malformed file is a visible line the human
+        reads, never a 500. When the drop feature is unwired, or the intake stores are
+        absent, it renders an error partial (nothing scanned). If new candidates landed it
+        offers a refresh-the-queue link back to the capture home (the pending set changed);
+        the scan itself never re-renders the whole queue out-of-band.
+        """
+        if intake_drop_dir is None or candidate_store is None or artifact_store is None:
+            return templates.TemplateResponse(
+                request,
+                "_intake_scan_result.html",
+                {"error": "the drop folder is not configured on this server."},
+            )
+        summary = await scan_drop_dir(
+            drop_dir=intake_drop_dir,
+            candidate_store=candidate_store,
+            artifact_store=artifact_store,
+            max_artifact_bytes=artifact_cap,
+        )
+        return templates.TemplateResponse(
+            request,
+            "_intake_scan_result.html",
+            {
+                "scanned": summary.scanned,
+                "ingested": summary.ingested,
+                "duplicates": summary.duplicates,
+                "errors": summary.errors,
             },
         )

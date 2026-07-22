@@ -46,20 +46,39 @@
     {% include "_intake_card.html" %}
   {% endfor %}
 </div>
+{# A3: the offline drop-scan is discoverable while reviewing too — a script may have
+   dropped more receipts. Gated on the feature being wired (drop_dir_enabled). #}
+{% if drop_dir_enabled %}
+<form class="scan-drop-form" hx-post="/ui/intake/scan" hx-target="#intake-scan-result" hx-swap="innerHTML">
+  <button type="submit" class="button scan-drop-button">Scan drop folder</button>
+  <small class="scan-hint">Ingest receipts a script dropped in the folder &mdash; nothing leaves this machine.</small>
+</form>
+{% endif %}
 {% else %}
 {# --- The win state (H3): a win, not a blank -------------------------------
    Exactly "All receipts reviewed" — NOT "all caught up" (that would overclaim
    across the drop folder and the downstream categorize step). Paired always with
    the day's stored tally. Categorize is promoted to the PRIMARY next action only
    here, at queue-clear — pointing downstream is only honest once the pile is empty.
-   (The "scan drop folder" prompt renders only when the A3 drop-dir feature is
-   enabled; it is absent in this slice, so the win state stands on headline + tally.) #}
+   The "scan drop folder to check for new" prompt (A3) renders only when the drop-dir
+   feature is enabled — it is what keeps "All receipts reviewed" from reading as a
+   false all-clear when un-scanned receipts may still sit in the drop folder. Gated so
+   the MUST headline never hard-depends on this SHOULD feature. #}
 <div class="win-state">
   <h2>All receipts reviewed</h2>
   <p class="win-tally">You filed {{ filed_today }} today.</p>
   <p><a class="button" href="/ui/queue?period={{ period }}">Categorize what you filed &rarr;</a></p>
+  {% if drop_dir_enabled %}
+  <form class="scan-drop-form" hx-post="/ui/intake/scan" hx-target="#intake-scan-result" hx-swap="innerHTML">
+    <button type="submit" class="button scan-drop-button">Scan drop folder to check for new</button>
+  </form>
+  {% endif %}
 </div>
 {% endif %}
+
+{# The scan outcome (ingested / already-on-file / per-file errors) swaps in here —
+   one shared target for the queue-branch button and the win-state prompt. #}
+<div id="intake-scan-result"></div>
 
 {# --- The subordinate downstream rail --------------------------------------
    Capture is the front door; the downstream stages stay discoverable (flat, not
