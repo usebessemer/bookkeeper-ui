@@ -1,18 +1,19 @@
-{# The /ui/intake/resolve success swap — the _resolved.html idiom EXTENDED with a
-   second OOB span. TWO out-of-band spans (distinct ids) update the live pending
-   counter and the capture pulse ("N to review"), both recomputed off
-   build_intake_queue(status="pending"). The body below swaps into the card target
-   (hx-swap="outerHTML"), so the resolved card leaves the queue and reports the
-   outcome honestly — a duplicate confirm is shown as already-present, never a
-   silent lost filing.
+{# The /ui/intake/resolve success swap — the _resolved.html idiom EXTENDED with the
+   pulse OOB spans. THREE out-of-band spans (distinct ids) recompute the live pulse:
+   the pending counter and "N to review" (both off build_intake_queue(status="pending")),
+   and "M filed today" (off count_filed_today) — so a confirm that files a fresh row
+   bumps BOTH pulse numbers live, never leaving "filed today" stale until the next GET.
+   The body below swaps into the card target (hx-swap="outerHTML"), so the resolved card
+   leaves the queue and reports the outcome honestly — a duplicate confirm is shown as
+   already-present, never a silent lost filing.
 
-   The OOB strategy is innerHTML (not the default outerHTML) so the counter's own
-   element — its aria-live region + focus target (AC 21) — is preserved across
-   resolves and the text change reliably announces, rather than being replaced by a
-   fresh element. The pulse span targets B+'s future "N to review" element; when
-   that target is absent (this slice) the OOB swap is a harmless no-op. #}
+   The OOB strategy is innerHTML (not the default outerHTML) so each counter's own
+   element — the pending counter's aria-live region + focus target (AC 21) — is
+   preserved across resolves and the text change reliably announces, rather than being
+   replaced by a fresh element. #}
 <span id="intake-pending-count" hx-swap-oob="innerHTML">{{ pending }}</span>
 <span id="intake-pulse-count" hx-swap-oob="innerHTML">{{ pending }}</span>
+<span id="intake-filed-count" hx-swap-oob="innerHTML">{{ filed_today }}</span>
 <div class="result ok">
   {% if action == "reject" %}
   <p><strong>Rejected.</strong> The ledger is untouched; the receipt and its

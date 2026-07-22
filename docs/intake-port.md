@@ -53,7 +53,7 @@ nothing is written on a validation failure (never a partial write).
 | `source` | yes | non-blank string — the extractor's identity; it namespaces `submission_id` |
 | `submission_id` | yes | non-blank string — the extractor's **stable** id for this artifact (the idempotency key) |
 | `vendor` | yes | non-blank string |
-| `amount` | yes | a JSON **string** parsing to a finite `Decimal` (`"82.50"`). A JSON **number** is a 422. `"NaN"` / `"Infinity"` are rejected |
+| `amount` | yes | a JSON **string** parsing to a finite `Decimal` (`"82.50"`). A JSON **number** is a 422. `"NaN"` / `"Infinity"` and **exponent notation** (`"1E+2"`) are rejected — send a plain decimal string |
 | `tax` | no | same string-`Decimal` rule; absent or blank → `"0"` (the books never hold null money) |
 | `date` | yes | ISO 8601 (`2026-06-14` or `2026-06-14T15:02:11+00:00`) |
 | `description` | no | string; absent → `""` |
@@ -65,7 +65,17 @@ nothing is written on a validation failure (never a partial write).
 
 **Money is always a string on the wire.** `amount` and `tax` carry the exact
 `Decimal` as text so nothing is lost to floating point. Sending `82.50` as a JSON
-number is a 422 — send `"82.50"`.
+number is a 422 — send `"82.50"`. Exponent notation (`"1E+2"`) is refused too: it
+round-trips as a different string than the economically-equal `"100"`, which would
+weaken the ledger's honest de-duplication — send the plain decimal form.
+
+> **Deployment note (artifact size).** The size cap is enforced **after** the
+> base64 artifact is decoded into memory, so a grossly oversized upload is still
+> read and decoded before it is rejected (it is never *written* — the over-cap path
+> stores nothing). This is a correctness-safe but DoS-shaped ordering; for a
+> hardened deployment, cap the request body size upstream at the reverse proxy or
+> uvicorn (`--limit-max-requests` / a proxy `client_max_body_size`) so an oversized
+> payload is refused before it reaches the app.
 
 A candidate carries **no category**. Categorization is a downstream skill driven by
 the deployment's chart of accounts, not something an extractor reports.
@@ -117,6 +127,13 @@ payload does **not** mutate the stored candidate.
 Give each artifact a stable `submission_id` and a retry (after a dropped connection,
 say) is a safe no-op rather than a double-file.
 
+A re-POST is recognized as a duplicate **only when its payload still validates.** The
+field gate runs before the identity is looked up, so a re-POST of a known
+`(source, submission_id)` that carries an *invalid* field is a **422** (naming the
+field), not a short-circuit 200 — the stored candidate is left unchanged either way,
+so this is never a partial write, just a stricter (and safe) response on a malformed
+retry.
+
 ---
 
 ## Routes
@@ -167,9 +184,11 @@ submission passed, and any field left out falls back to the candidate's own valu
 ledger untouched. The submission row and its artifact stay on disk — the trail is
 append-only.
 
-Errors: **404** an unknown `candidate_id`; **409** an already-decided candidate (its
-recorded outcome is returned — re-opening a decided candidate is out of scope);
-**422** a bad confirmed field.
+Errors: **404** an unknown `candidate_id`, **or** a candidate whose source artifact is
+missing at confirm (a confirm files the receipt bytes with the ledger row, so it refuses
+rather than filing a row with no artifact); **409** an already-decided candidate (its
+recorded outcome is returned — re-opening a decided candidate is out of scope), **or** a
+confirm whose (edited) date falls in a signed-closed period; **422** a bad confirmed field.
 
 ---
 

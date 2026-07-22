@@ -66,8 +66,6 @@ from bookkeeper_ui.anomaly_reviews import (
 from bookkeeper_ui.candidates import (
     ACTION_CONFIRM,
     ACTION_REJECT,
-    LEDGER_OUTCOME_ALREADY_PRESENT,
-    LEDGER_OUTCOME_STORED,
     SOURCE_HUMAN as CANDIDATE_SOURCE_HUMAN,
     CandidateDecision,
     FileArtifactStore,
@@ -84,6 +82,11 @@ from bookkeeper_ui.closes import (
 from bookkeeper_ui.confirmations import SOURCE_HUMAN, Confirmation, FileConfirmationStore
 from bookkeeper_ui.exporter import MANIFEST_JSON, FileExportStore, export_package
 from bookkeeper_ui.importer import TransactionImportError, import_bytes
+from bookkeeper_ui.intake_confirm import (
+    ConfirmArtifactMissingError,
+    ConfirmClosedPeriodError,
+    apply_confirm,
+)
 from bookkeeper_ui.intake_scan import DEFAULT_MAX_ARTIFACT_BYTES, scan_drop_dir
 from bookkeeper_ui.ledger_store import FileLedgerStore, transaction_key
 from bookkeeper_ui.periods import is_quarterly_period, period_of
@@ -152,6 +155,13 @@ def _revalidate_money(raw: str, field: str) -> Decimal:
     if not value.is_finite():
         raise _IntakeFieldError(
             f"{field} must be a finite amount — {raw!r} (NaN/Infinity) is rejected."
+        )
+    # Exponent notation (`1E+2`) parses finite but round-trips as E-notation, yielding a
+    # different `transaction_key` than the equal `100` — refuse it (A1's rule, verbatim).
+    if "e" in raw.lower():
+        raise _IntakeFieldError(
+            f"{field} {raw!r} uses exponent notation — money is a plain decimal "
+            f'string (e.g. "82.50", not "1E+2").'
         )
     return value
 
@@ -1420,18 +1430,28 @@ def register_ui(
             or candidate_decision_store is None
             or artifact_store is None
         ):
+            # No intake wired — there is no queue to recount, so the bare gone swap.
             return templates.TemplateResponse(request, "_intake_gone.html", {})
 
         submission = await candidate_store.get(candidate_id)
         if submission is None:  # unknown candidate — the "no longer available" swap
-            return templates.TemplateResponse(request, "_intake_gone.html", {})
+            # The card still leaves the visible queue, so recompute the pending pulse
+            # OOB — else the counter reads stale (too high) until the human refreshes.
+            pending = await _intake_pending_count(candidate_store, candidate_decision_store)
+            return templates.TemplateResponse(
+                request, "_intake_gone.html", {"pending": pending}
+            )
 
         prior = (await candidate_decision_store.latest_by_candidate()).get(candidate_id)
         if prior is not None:  # already decided — its recorded outcome, not a re-open
+            # Same: the card leaves, so recompute the pending pulse OOB (the counter
+            # was showing this now-decided card in its tally).
+            pending = await _intake_pending_count(candidate_store, candidate_decision_store)
             return templates.TemplateResponse(
                 request,
                 "_intake_already.html",
                 {
+                    "pending": pending,
                     "action": prior.action,
                     "ledger_outcome": prior.ledger_outcome,
                     "reject_reason": prior.reject_reason,
@@ -1454,10 +1474,20 @@ def register_ui(
             pending = await _intake_pending_count(
                 candidate_store, candidate_decision_store
             )
+            # A reject files nothing, so "M filed today" is unchanged — but the resolved
+            # partial always carries the OOB filed span, so recompute (not blank) it.
+            filed_today = count_filed_today(
+                await candidate_decision_store.all(), today=datetime.now().date()
+            )
             return templates.TemplateResponse(
                 request,
                 "_intake_resolved.html",
-                {"action": ACTION_REJECT, "pending": pending, "period": period},
+                {
+                    "action": ACTION_REJECT,
+                    "pending": pending,
+                    "filed_today": filed_today,
+                    "period": period,
+                },
             )
 
         # --- Confirm ---
@@ -1503,62 +1533,77 @@ def register_ui(
                 ),
             )
 
-        # 3. Closed-period guard (C1) — on the human-EDITED date being written.
-        if period_of(v_date) in await closed_periods(close_store):
-            return templates.TemplateResponse(
-                request,
-                "_closed_refusal.html",
-                {"period": period_of(v_date)},
-            )
-
-        # 4. Construct the ledger Transaction (receipt bytes ride artifact_bytes) and
-        #    persist through the EXISTING ledger store.
-        artifact_bytes = await artifact_store.get(candidate_id) or b""
-        transaction = Transaction(
-            attribution_target_id=target,
-            vendor=v_vendor,
-            amount=v_amount,
-            tax=v_tax,
-            date=v_date,
-            description=description,
-            artifact_bytes=artifact_bytes,
-        )
-        key = transaction_key(transaction)
-        # 5. Honest dedupe — probe contains() BEFORE the idempotent, silent store().
-        already = await ledger_store.contains(key)
-        await ledger_store.store(transaction)
-        outcome = (
-            LEDGER_OUTCOME_ALREADY_PRESENT if already else LEDGER_OUTCOME_STORED
-        )
-
-        # 6. Append the decision row — the durable candidate↔ledger link + dedupe signal.
-        await candidate_decision_store.record(
-            CandidateDecision(
+        # 3-6. Apply the confirm through the ONE write core both twins share — the C1
+        #      closed guard on the edited date, the missing-artifact refusal, and the
+        #      honest-dedupe probe-before-store ordering all live there, so they cannot
+        #      drift from the JSON twin. Its two typed refusals render this surface's
+        #      partials (never a raw error): a closed period → `_closed_refusal.html`,
+        #      a lost artifact → the failure into the card (edits kept, counter untouched).
+        try:
+            result = await apply_confirm(
                 candidate_id=candidate_id,
-                action=ACTION_CONFIRM,
-                source=CANDIDATE_SOURCE_HUMAN,
-                decided_at=now,
                 vendor=v_vendor,
                 amount=v_amount,
                 tax=v_tax,
                 date=v_date,
                 description=description,
                 attribution_target_id=target,
-                transaction_key=key,
-                ledger_outcome=outcome,
+                now=now,
+                ledger_store=ledger_store,
+                artifact_store=artifact_store,
+                decision_store=candidate_decision_store,
+                close_store=close_store,
             )
-        )
+        except ConfirmClosedPeriodError as exc:
+            return templates.TemplateResponse(
+                request,
+                "_closed_refusal.html",
+                {"period": exc.period},
+            )
+        except ConfirmArtifactMissingError:
+            edited = CandidateOut.from_submission(submission).model_copy(
+                update={
+                    "vendor": vendor,
+                    "amount": amount,
+                    "tax": tax,
+                    "date": date,
+                    "description": description,
+                    "attribution_target_id": attribution_target_id or None,
+                }
+            )
+            return templates.TemplateResponse(
+                request,
+                "_intake_error.html",
+                {
+                    "c": edited,
+                    "error": (
+                        "the receipt artifact for this candidate is missing — a confirm "
+                        "files the receipt bytes with the ledger row, so it cannot be "
+                        "filed without them."
+                    ),
+                    "period": period,
+                    "attribution_targets": config.attribution_targets,
+                    "attribution_target_labels": intake_labels,
+                },
+            )
 
         pending = await _intake_pending_count(candidate_store, candidate_decision_store)
+        # "M filed today" is the pulse's second number — a confirm that filed a fresh row
+        # bumps it, so recompute it OOB too (off the same `count_filed_today` the full
+        # render uses, server-local day) rather than leaving it stale until the next GET.
+        filed_today = count_filed_today(
+            await candidate_decision_store.all(), today=datetime.now().date()
+        )
         return templates.TemplateResponse(
             request,
             "_intake_resolved.html",
             {
                 "action": ACTION_CONFIRM,
                 "pending": pending,
+                "filed_today": filed_today,
                 "period": period,
                 "confirm_period": period_of(v_date),
-                "ledger_outcome": outcome,
+                "ledger_outcome": result.ledger_outcome,
             },
         )
 

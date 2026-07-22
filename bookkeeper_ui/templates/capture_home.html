@@ -17,13 +17,14 @@
    instrumentation. "N to review" is the only call-to-action number (there is no
    all-periods roll-up to draw a completeness % from, and none is invented). It is
    OOB-recomputed off build_intake_queue after each resolve via #intake-pulse-count
-   (the second OOB span the resolve partial targets). "M filed today" is the day's
-   stored-only tally (a dedupe no-op does not inflate it), recomputed per render.
-   No confidence, no completeness % anywhere. #}
+   (one of the OOB spans the resolve partial targets). "M filed today" is the day's
+   stored-only tally (a dedupe no-op does not inflate it), recomputed per render AND
+   OOB-refreshed after each confirm via #intake-filed-count (so a live confirm bumps
+   it without a full reload). No confidence, no completeness % anywhere. #}
 <p class="capture-pulse">
   <span class="pulse-primary"><span id="intake-pulse-count" class="pulse-count">{{ pending }}</span> to review</span>
   <span class="pulse-sep" aria-hidden="true">·</span>
-  <span class="pulse-secondary"><span class="pulse-filed">{{ filed_today }}</span> filed today</span>
+  <span class="pulse-secondary"><span id="intake-filed-count" class="pulse-filed">{{ filed_today }}</span> filed today</span>
 </p>
 
 {% if candidates %}
@@ -31,8 +32,12 @@
    Only pending — never a rejected or confirmed card on the landing. The queue is
    the app's showpiece; each card renders the receipt alongside the editable
    verbatim fields (no proposed category, no confidence — extraction is a proposal).
-   hx-on::after-swap moves focus to the live pending counter once a card leaves, so
-   a keyboard / screen-reader user is not stranded on the removed card (AC 21). #}
+   hx-on::after-swap moves focus to the live pending counter once a card LEAVES, so a
+   keyboard / screen-reader user is not stranded on the removed card (AC 21) — but ONLY
+   when the card left. A re-validation failure re-renders the card in place (its
+   response still carries the `intake-confirm` form), so the guard skips the focus-move
+   and leaves the human on the field they must correct, rather than yanking focus to the
+   counter. #}
 <h2 class="queue-heading">
   Reviewing
   <span id="intake-pending-count" aria-live="polite" tabindex="-1">{{ pending }}</span>
@@ -40,7 +45,7 @@
 </h2>
 <div id="intake-queue"
      tabindex="-1"
-     hx-on::after-swap="document.getElementById('intake-pending-count').focus()">
+     hx-on::after-swap="if (event.detail.xhr && event.detail.xhr.responseText.indexOf('intake-confirm') === -1) document.getElementById('intake-pending-count').focus()">
   {% for entry in candidates %}
     {% set c = entry.candidate %}
     {% include "_intake_card.html" %}

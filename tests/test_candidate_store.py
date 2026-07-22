@@ -98,6 +98,26 @@ async def test_candidate_add_is_idempotent_first_write_wins(tmp_path):
     assert everything[0].vendor == "Home Depot"
 
 
+async def test_candidate_add_appends_one_raw_row_on_reinsert(tmp_path):
+    """Store-level idempotency pinned at the FILE, not transitively via `all()`.
+
+    `all()` re-dedupes first-write-wins, so a broken `add()` that appended a second row
+    for the same id would still read back as one candidate through `all()` — the store's
+    own `candidate_id` no-op stays untested. This reads `candidates.jsonl` directly: a
+    re-`add()` of the same identity must append NOTHING, leaving exactly one raw line.
+    """
+    import json
+
+    path = tmp_path / "candidates.jsonl"
+    store = FileCandidateStore(path)
+    await store.add(_submission(vendor="Home Depot"))
+    await store.add(_submission(vendor="Different Vendor"))  # same identity → no-op
+
+    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) == 1  # exactly one row on disk — the no-op appended nothing
+    assert json.loads(lines[0])["vendor"] == "Home Depot"  # the first write persisted
+
+
 async def test_candidate_absent_tax_coalesces_to_zero(tmp_path):
     """A row with a null tax reads back as Decimal('0') (never None-money)."""
     store = FileCandidateStore(tmp_path / "candidates.jsonl")
