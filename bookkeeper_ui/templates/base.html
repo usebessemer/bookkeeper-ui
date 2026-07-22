@@ -12,10 +12,15 @@
   <script src="/static/htmx.min.js"></script>
 </head>
 <body>
+  {# Flat spine, capture-first: "Receipts" (the re-homed extraction-review queue at
+     `/`) leads, then the demoted CSV/statement importer, then the downstream stages.
+     The Receipts link is period-agnostic (`href="/"`, no `?period=`) — the intake
+     queue is all-periods; every OTHER link keeps threading `nav_period` (the Package
+     link in particular is asserted with its `?period=`). #}
   <nav>
     <span class="brand">Bookkeeper</span>
-    <a href="/?period={{ nav_period }}">Import</a>
-    <a href="/ui/intake?period={{ nav_period }}">Intake</a>
+    <a href="/">Receipts</a>
+    <a href="/ui/import-files?period={{ nav_period }}">Import files</a>
     <a href="/ui/queue?period={{ nav_period }}">Confirm queue</a>
     <a href="/ui/reconcile?period={{ nav_period }}">Reconcile</a>
     <a href="/ui/ledger?period={{ nav_period }}">Ledger</a>

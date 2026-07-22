@@ -75,10 +75,33 @@ def _cards(html: str) -> dict[str, dict[str, str]]:
     }
 
 
-async def test_home_renders_import_form(ui: UiHarness):
-    """AC: the import screen renders — an htmx upload form with a period field."""
+async def test_home_renders_capture_home(ui: UiHarness):
+    """AC 14/12 (the re-home): `GET /` re-homes to the capture home — the pulse
+    strip and the subordinate downstream rail, with 'Receipts' first in the nav and
+    the Receipts link period-agnostic. The CSV/statement importer is NO LONGER the
+    front door (it moved to /ui/import-files)."""
     async with _client(ui.app) as client:
         resp = await client.get("/")
+        assert resp.status_code == 200
+        html = resp.text
+        # Zone A — the capture pulse (the only call-to-action number).
+        assert 'id="intake-pulse-count"' in html
+        assert "to review" in html
+        # The importer is gone from the front door.
+        assert 'hx-post="/ui/import"' not in html
+        # Nav: 'Receipts' leads and carries NO ?period=; the importer demoted.
+        assert '<a href="/">Receipts</a>' in html
+        assert '/ui/import-files' in html
+        # The subordinate downstream rail keeps the next stages discoverable.
+        assert 'class="downstream-rail"' in html
+
+
+async def test_import_files_renders_import_form(ui: UiHarness):
+    """AC 14/23: the CSV/statement importer is reachable at GET /ui/import-files,
+    rendering the same htmx upload form (with its period field) verbatim — the
+    re-home moved the route, not the behavior."""
+    async with _client(ui.app) as client:
+        resp = await client.get("/ui/import-files")
         assert resp.status_code == 200
         assert 'hx-post="/ui/import"' in resp.text
         assert 'type="file"' in resp.text

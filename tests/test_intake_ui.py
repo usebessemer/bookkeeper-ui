@@ -15,7 +15,7 @@ from __future__ import annotations
 import base64
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -24,10 +24,17 @@ from fastapi import FastAPI
 
 from bookkeeper_ui.api import create_app
 from bookkeeper_ui.candidates import (
+    ACTION_CONFIRM,
+    ACTION_REJECT,
+    LEDGER_OUTCOME_ALREADY_PRESENT,
+    LEDGER_OUTCOME_STORED,
+    SOURCE_HUMAN,
+    CandidateDecision,
     FileArtifactStore,
     FileCandidateDecisionStore,
     FileCandidateStore,
 )
+from bookkeeper_ui.views import count_filed_today
 from bookkeeper_ui.closes import CloseRecord, FileCloseStore
 from bookkeeper_ui.config_loader import load_config
 from bookkeeper_ui.confirmations import FileConfirmationStore
@@ -532,3 +539,148 @@ async def test_intake_queue_reads_examples_config_labels(tmp_path, examples_dir)
         await _seed(client)
         html = (await client.get("/ui/intake")).text
     assert data["attribution_target_labels"]["target-001"] in html
+
+
+# ===========================================================================
+# Slice 5 · B+: the capture-home landing (GET / re-homed to the intake queue)
+# ===========================================================================
+
+
+async def test_capture_home_renders_hero_queue_with_pending_card(
+    intake_ui: IntakeUiHarness,
+):
+    """AC 14: `GET /` renders the hero review queue — one card per pending candidate
+    off build_intake_queue(status='pending') — with the honest 'N to review' pulse and
+    NO confidence / completeness % / category anywhere on the landing."""
+    async with _client(intake_ui.app) as client:
+        cid = await _seed(client)
+        home = (await client.get("/")).text
+    # Zone A — the pulse's call-to-action count is the pending count.
+    assert 'id="intake-pulse-count" class="pulse-count">1</span>' in home
+    assert "to review" in home
+    # The hero card for the pending candidate, in the focus-managed queue.
+    assert f'id="card-{cid}"' in home
+    assert 'id="intake-queue"' in home
+    # No fabricated trust: no confidence, no completeness %, no category picker.
+    assert "confiden" not in home.lower()
+    assert "% complete" not in home
+    assert "chart_of_accounts" not in home
+    assert 'name="account"' not in home
+
+
+async def test_capture_home_shows_only_pending_never_rejected_or_confirmed(
+    intake_ui: IntakeUiHarness,
+):
+    """AC 14: the landing hero renders only PENDING candidates — a rejected/confirmed
+    candidate never appears (it reads build_intake_queue(status='pending'))."""
+    async with _client(intake_ui.app) as client:
+        pending = await _seed(client, submission_id="p", vendor="Pending Vendor")
+        rejected = await _seed(client, submission_id="r", vendor="Rejected Vendor")
+        await client.post(
+            "/ui/intake/resolve",
+            data={"candidate_id": rejected, "action": "reject", "period": "2026-Q2"},
+        )
+        home = (await client.get("/")).text
+    assert f"card-{pending}" in home and "Pending Vendor" in home
+    assert f"card-{rejected}" not in home and "Rejected Vendor" not in home
+
+
+async def test_capture_home_win_state_when_queue_clear(intake_ui: IntakeUiHarness):
+    """AC 19 (H3): at zero pending the queue zone reads exactly 'All receipts
+    reviewed' (NOT 'all caught up'), pairs the day's stored tally, and promotes
+    categorize to the primary next action — only here, at queue-clear."""
+    async with _client(intake_ui.app) as client:
+        home = (await client.get("/")).text  # nothing seeded → nothing pending
+    assert "All receipts reviewed" in home
+    assert "all caught up" not in home.lower()  # must not overclaim
+    assert "filed today" in home  # the tally is paired always
+    # Categorize promoted to the primary next action (a button) at queue-clear.
+    assert 'class="button" href="/ui/queue?period=' in home
+
+
+async def test_capture_home_pulse_counts_stored_confirms_only(
+    intake_ui: IntakeUiHarness,
+):
+    """AC 15 (honest pulse): 'M filed today' counts only action=='confirm' AND
+    ledger_outcome=='stored' — a dedupe no-op (already-present) does NOT inflate it."""
+    async with _client(intake_ui.app) as client:
+        cid1 = await _seed(client, submission_id="a")
+        cid2 = await _seed(client, submission_id="b")  # identical business fields
+        common = {
+            "action": "confirm",
+            "vendor": "Home Depot",
+            "amount": "82.50",
+            "tax": "10.73",
+            "date": "2026-06-14",
+            "description": "Lumber and fasteners",
+            "attribution_target_id": "target-001",
+            "period": "2026-Q2",
+        }
+        await client.post("/ui/intake/resolve", data={"candidate_id": cid1, **common})
+        await client.post("/ui/intake/resolve", data={"candidate_id": cid2, **common})
+        home = (await client.get("/")).text
+    # One row actually filed; the dedupe no-op is NOT counted (1, never 2).
+    assert '<span class="pulse-filed">1</span>' in home
+    assert '<span class="pulse-filed">2</span>' not in home
+
+
+async def test_capture_home_no_period_on_receipts_link(intake_ui: IntakeUiHarness):
+    """AC 14: the nav lists 'Receipts' first and its link carries NO ?period= (the
+    intake queue is all-periods); every other link keeps threading the period."""
+    async with _client(intake_ui.app) as client:
+        home = (await client.get("/")).text
+    assert '<a href="/">Receipts</a>' in home
+    assert '<a href="/?period=' not in home  # the Receipts link is period-agnostic
+    assert '/ui/package?period=' in home  # non-Receipts links keep the period
+
+
+# --- count_filed_today: the honesty rules, unit-tested off the pure helper ---------
+
+
+def _stored_confirm(decided_at: datetime) -> CandidateDecision:
+    return CandidateDecision(
+        candidate_id="c",
+        action=ACTION_CONFIRM,
+        source=SOURCE_HUMAN,
+        decided_at=decided_at,
+        ledger_outcome=LEDGER_OUTCOME_STORED,
+    )
+
+
+def test_count_filed_today_counts_stored_confirms_today():
+    now = datetime.now(timezone.utc)
+    today = datetime.now().date()
+    assert count_filed_today([_stored_confirm(now), _stored_confirm(now)], today=today) == 2
+
+
+def test_count_filed_today_excludes_dedupe_noops_and_rejects():
+    now = datetime.now(timezone.utc)
+    today = datetime.now().date()
+    decisions = [
+        _stored_confirm(now),
+        CandidateDecision(  # dedupe no-op — a decision, but no fresh filing
+            candidate_id="d", action=ACTION_CONFIRM, source=SOURCE_HUMAN,
+            decided_at=now, ledger_outcome=LEDGER_OUTCOME_ALREADY_PRESENT,
+        ),
+        CandidateDecision(  # reject — the ledger is untouched
+            candidate_id="e", action=ACTION_REJECT, source=SOURCE_HUMAN, decided_at=now,
+        ),
+    ]
+    assert count_filed_today(decisions, today=today) == 1
+
+
+def test_count_filed_today_excludes_other_days():
+    today = datetime.now().date()
+    yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+    assert count_filed_today([_stored_confirm(yesterday)], today=today) == 0
+
+
+def test_count_filed_today_buckets_by_server_local_day_not_utc():
+    """The day boundary is the deployment-LOCAL day: a stored confirm at 7pm local
+    counts as today even though its stored UTC instant may fall on a different date.
+    Round-trips a 7pm-local wall time through UTC (how the app stores decided_at)."""
+    local_now = datetime.now().astimezone()  # server-local, tz-aware
+    today = local_now.date()
+    seven_pm_local = local_now.replace(hour=19, minute=0, second=0, microsecond=0)
+    decided_as_stored = seven_pm_local.astimezone(timezone.utc)  # the app stores UTC
+    assert count_filed_today([_stored_confirm(decided_as_stored)], today=today) == 1

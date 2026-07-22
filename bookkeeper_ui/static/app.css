@@ -307,3 +307,53 @@ tr.diverges { background: var(--warn-bg); }
 .intake-reject { margin-top: 0.5rem; padding-top: 0.75rem; border-top: 1px dashed var(--line); }
 .intake-reject .reject { justify-self: start; background: #fff; color: var(--err); border-color: #ffc1bc; }
 .trail.intake-trail { margin-top: 0.85rem; }
+
+/* --- Slice 5 · B+: the capture-home landing --------------------------- */
+/* Zone A — the capture pulse. One honest line: the call-to-action count + the
+   day's stored tally. The muted secondary uses --muted on --bg (~4.7:1, WCAG AA)
+   so "quiet" stays legible. */
+.capture-pulse {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.6rem;
+  margin: 0 0 1.25rem;
+  font-size: 1.05rem;
+}
+.capture-pulse .pulse-count { font-size: 1.6rem; font-weight: 700; color: var(--accent); }
+.capture-pulse .pulse-primary { font-weight: 600; }
+.capture-pulse .pulse-sep { color: var(--muted); }
+.capture-pulse .pulse-secondary { color: var(--muted); }
+.capture-pulse .pulse-filed { font-weight: 700; color: var(--ink); }
+
+/* The hero queue heading. The pending counter is the aria-live focus target the
+   post-swap hook moves focus to (AC 21). */
+.queue-heading { font-size: 1.05rem; font-weight: 600; color: var(--ink); margin: 0 0 1rem; }
+.queue-heading #intake-pending-count { font-weight: 700; color: var(--accent); outline: none; }
+
+/* The win state (H3) — a win, not a blank. */
+.win-state {
+  padding: 1.5rem 1.6rem;
+  background: var(--ok-bg);
+  border: 1px solid #aceebb;
+  border-radius: 12px;
+  text-align: center;
+}
+.win-state h2 { margin: 0 0 0.4rem; font-size: 1.3rem; color: var(--ok); }
+.win-state .win-tally { margin: 0 0 1rem; color: var(--ink); }
+
+/* The subordinate downstream rail — flat + discoverable, visibly quieter than the
+   review queue it sits below. */
+.downstream-rail {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 1rem;
+  margin-top: 2rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+  font-size: 0.92rem;
+}
+.downstream-rail .rail-label { color: var(--muted); font-weight: 600; }
+.downstream-rail a { color: var(--accent); text-decoration: none; }
+.downstream-rail a:hover { text-decoration: underline; }
