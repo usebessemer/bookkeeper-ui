@@ -100,6 +100,7 @@ from bookkeeper_ui.confirmations import (
 )
 from bookkeeper_ui.exporter import FileExportStore, export_package
 from bookkeeper_ui.importer import TransactionImportError, import_bytes
+from bookkeeper_ui.intake_scan import scan_drop_dir
 from bookkeeper_ui.ledger_store import FileLedgerStore, transaction_key
 from bookkeeper_ui.periods import is_quarterly_period, period_of
 from bookkeeper_ui.reconciliations import (
@@ -132,6 +133,8 @@ from bookkeeper_ui.schemas import (
     ResolveCandidateRequest,
     ResolveReconcileRequest,
     ResolveRequest,
+    ScanFileErrorOut,
+    ScanResultOut,
     SignRequest,
     StatementImportResultOut,
     StatementLineOut,
@@ -234,6 +237,7 @@ def create_app(
     candidate_store: FileCandidateStore | None = None,
     candidate_decision_store: FileCandidateDecisionStore | None = None,
     artifact_store: FileArtifactStore | None = None,
+    intake_drop_dir: str | Path | None = None,
     max_artifact_bytes: int | None = None,
     attribution_target_labels: dict[str, str] | None = None,
 ) -> FastAPI:
@@ -270,6 +274,15 @@ def create_app(
     constructing the app unchanged. `max_artifact_bytes` caps a submitted artifact's
     decoded size (default `DEFAULT_MAX_ARTIFACT_BYTES`); `build_app_from_env` reads
     the `BOOKKEEPER_UI_MAX_ARTIFACT_BYTES` env override.
+
+    `intake_drop_dir` (Slice-5 · A3) is the **optional** offline drop directory a scan
+    ingests candidate `*.json` files from — the second front door onto the *same* A1
+    validate/store path (`POST /intake/scan` + its UI twin). The feature is **enabled iff
+    `intake_drop_dir is not None`**: when unset the scan routes refuse a **503** (never a
+    silent no-op — the export-route precedent) and the UI hides the scan button + the
+    win-state "scan drop folder" prompt, so the MUST capture flow never depends on this
+    SHOULD feature. `build_app_from_env` always passes a default path (so the running app
+    has it enabled); a test constructs `create_app` without it to exercise the disabled path.
 
     `attribution_target_labels` (Slice-5 · B) is the **optional** app-side sidecar map
     (id string → human label) the intake-review `<select>` renders through. It is *not*
@@ -1402,6 +1415,51 @@ def create_app(
             message=message,
         )
 
+    # --- Slice 5 · A3: the offline drop-directory intake — a second front door onto the
+    # A1 validate/store path. An extractor that cannot POST drops candidate `*.json` files
+    # into the drop dir; this on-demand scan ingests them (no watcher, no poller). Enabled
+    # iff `intake_drop_dir is not None` — unwired the route 503s (the export-route
+    # precedent), never a silent no-op.
+
+    @app.post(
+        "/intake/scan",
+        response_model=ScanResultOut,
+        summary="Scan the drop directory for candidate documents (offline intake)",
+    )
+    async def scan_intake_drop() -> ScanResultOut:
+        """Scan the drop dir → ingest each valid candidate document through the A1 path.
+
+        The offline / push-can't-reach intake mode (Slice 5 · A3): a script or scanner
+        that cannot POST drops candidate `*.json` files into the drop dir; this on-demand
+        scan ingests each through the *same* validate + store path `POST /intake/candidates`
+        uses. **Idempotent** — ingest rides the store's `candidate_id` dedupe, so a second
+        scan over the unchanged dir writes nothing new (every file a `duplicate`). One
+        malformed file is reported in `errors` **without** aborting the scan or blocking the
+        valid files (AC 11). The drop feature is enabled iff a drop dir is wired — unwired →
+        a **503** (never a silent no-op), mirroring the export routes.
+        """
+        if intake_drop_dir is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "the intake drop directory is not configured on this app — the "
+                    "offline drop-scan mode is disabled."
+                ),
+            )
+        candidates, _decisions, artifacts = _require_intake()
+        summary = await scan_drop_dir(
+            drop_dir=intake_drop_dir,
+            candidate_store=candidates,
+            artifact_store=artifacts,
+            max_artifact_bytes=artifact_cap,
+        )
+        return ScanResultOut(
+            scanned=summary.scanned,
+            ingested=summary.ingested,
+            duplicates=summary.duplicates,
+            errors=[ScanFileErrorOut(file=e.file, error=e.error) for e in summary.errors],
+        )
+
     # #3 — the thin UI (Jinja + htmx) over these same stores, mounted on this app
     # so `uvicorn bookkeeper_ui.api:build_app_from_env --factory` serves both the
     # JSON API (root paths) and the HTML surface (GET / and the /ui/* routes).
@@ -1420,6 +1478,8 @@ def create_app(
         candidate_store=candidate_store,
         candidate_decision_store=candidate_decision_store,
         artifact_store=artifact_store,
+        intake_drop_dir=intake_drop_dir,
+        max_artifact_bytes=artifact_cap,
         attribution_target_labels=attribution_target_labels,
     )
 
@@ -1443,6 +1503,10 @@ def build_app_from_env() -> FastAPI:
     - ``BOOKKEEPER_UI_MAX_ARTIFACT_BYTES`` — cap on a submitted intake artifact's
                                    decoded size (default ``DEFAULT_MAX_ARTIFACT_BYTES``,
                                    10 MiB); a larger artifact is a 422.
+    - ``BOOKKEEPER_UI_INTAKE_DROP_DIR`` — the offline drop directory `POST /intake/scan`
+                                   ingests candidate `*.json` files from; default
+                                   ``<data_dir>/intake_drop`` (so the running app always
+                                   has the drop-scan mode enabled).
 
     The wiring is deliberately thin: #3 (the UI) owns the real run surface. This
     exists so the API is runnable on its own for local development and the tests
@@ -1458,6 +1522,9 @@ def build_app_from_env() -> FastAPI:
     config_path = os.environ.get("BOOKKEEPER_UI_CONFIG", "examples/config.json")
     data_dir = Path(os.environ.get("BOOKKEEPER_UI_DATA_DIR", "data"))
     export_dir = Path(os.environ.get("BOOKKEEPER_UI_EXPORT_DIR", str(data_dir / "exports")))
+    intake_drop_dir = Path(
+        os.environ.get("BOOKKEEPER_UI_INTAKE_DROP_DIR", str(data_dir / "intake_drop"))
+    )
     max_artifact_bytes = int(
         os.environ.get("BOOKKEEPER_UI_MAX_ARTIFACT_BYTES", str(DEFAULT_MAX_ARTIFACT_BYTES))
     )
@@ -1482,6 +1549,7 @@ def build_app_from_env() -> FastAPI:
             data_dir / "candidate_decisions.jsonl"
         ),
         artifact_store=FileArtifactStore(data_dir / "artifacts"),
+        intake_drop_dir=intake_drop_dir,
         max_artifact_bytes=max_artifact_bytes,
         attribution_target_labels=attribution_target_labels,
     )

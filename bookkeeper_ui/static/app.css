@@ -342,6 +342,28 @@ tr.diverges { background: var(--warn-bg); }
 .win-state h2 { margin: 0 0 0.4rem; font-size: 1.3rem; color: var(--ok); }
 .win-state .win-tally { margin: 0 0 1rem; color: var(--ink); }
 
+/* --- A3: the offline drop-scan affordance ------------------------------- */
+/* A quieter, secondary control — subordinate to the primary capture/categorize
+   actions. Shown while reviewing (under the queue) and in the win state (gated on
+   the drop-dir feature being wired). */
+.scan-drop-form { margin-top: 1.25rem; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.6rem; }
+.win-state .scan-drop-form { justify-content: center; margin-top: 0.5rem; }
+.scan-drop-button {
+  display: inline-block;
+  padding: 0.45rem 0.9rem;
+  border-radius: 7px;
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.scan-drop-form .scan-hint { color: var(--muted); font-size: 0.85rem; }
+.scan-errors-label { margin: 0.75rem 0 0.35rem; font-size: 0.9rem; color: var(--muted); }
+.scan-errors { margin: 0; padding-left: 1.2rem; font-size: 0.9rem; }
+.scan-errors li { margin: 0.15rem 0; }
+
 /* The subordinate downstream rail — flat + discoverable, visibly quieter than the
    review queue it sits below. */
 .downstream-rail {

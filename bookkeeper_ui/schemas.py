@@ -1384,3 +1384,31 @@ class IntakeQueueOut(BaseModel):
 
     status: IntakeStanding | None = None
     candidates: list[CandidateEntryOut]
+
+
+class ScanFileErrorOut(BaseModel):
+    """One per-file failure in a drop-dir scan — the file name and why it was skipped.
+
+    A malformed drop file is reported here (never a partial write, never an aborted
+    scan): the valid files alongside it still ingest (Slice 5 · A3, AC 11).
+    """
+
+    file: str
+    error: str
+
+
+class ScanResultOut(BaseModel):
+    """The outcome of `POST /intake/scan` — the drop-dir ingest tally + per-file errors.
+
+    `scanned` is every `*.json` file seen; `ingested` the new candidate rows written
+    this scan; `duplicates` the files whose `(source, submission_id)` was already stored
+    (the store's idempotent no-op made visible — a second scan over the unchanged dir is
+    all `duplicates`, `ingested: 0`); `errors` the per-file failures. Money on the
+    ingested rows stays an exact `Decimal` string end to end — this surface reports only
+    counts, so no money crosses it.
+    """
+
+    scanned: int
+    ingested: int
+    duplicates: int
+    errors: list[ScanFileErrorOut]
