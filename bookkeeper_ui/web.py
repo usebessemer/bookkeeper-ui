@@ -3,8 +3,11 @@
 Slice 1 (categorize) and Slice 2 (reconcile) screens over the #2 stores,
 server-rendered, **no Node/build step**:
 
-- ``GET  /``            — **import**: upload a transactions CSV/JSON *and* a
-  statement CSV/JSON, pick the period to review.
+- ``GET  /``            — **capture home** (Slice 5 · B+): the extraction-review
+  queue as the front door — the capture pulse, one review card per pending
+  candidate (or the win state when clear). The CSV/statement importer demoted to
+  ``GET /ui/import-files`` (upload a transactions CSV/JSON *and* a statement
+  CSV/JSON, pick the period to review).
 - ``GET  /ui/queue``    — the **confirm queue** (Slice 1 core): one card per
   proposal rendering the full **trust trail** (proposed account · confidence ·
   the rule that fired), plus flagged transactions with their reason. Confirm /
@@ -107,6 +110,7 @@ from bookkeeper_ui.views import (
     build_ledger,
     build_package,
     build_reconciliation,
+    count_filed_today,
 )
 from bookkeeper_ui.waivers import FileWaiverStore, Waiver
 
@@ -245,15 +249,78 @@ def register_ui(
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     intake_labels = attribution_target_labels or {}
 
-    @app.get("/", response_class=HTMLResponse, summary="Import screen (home)")
-    async def home(request: Request, period: str = _DEFAULT_PERIOD) -> HTMLResponse:
-        """The import screen: upload a transactions and/or a statement file, choose
-        the period to review.
+    @app.get("/", response_class=HTMLResponse, summary="Capture home (the receipts landing)")
+    async def home(request: Request) -> HTMLResponse:
+        """The capture home: the extraction-review queue as the app's front door.
 
-        Surfaces a closed banner for **every** signed-closed period (an import
-        touching a closed period is refused whole), read from the one closed-period
-        truth `close_store.by_period()`. `period` only pre-fills the form / carries
-        the nav context; the store still derives each row's real period from its date.
+        Re-homed (Slice-5 · B+) from the CSV/statement importer, which demotes to
+        `GET /ui/import-files`. Renders the capture pulse (N to review · M filed
+        today), then the hero review queue — one card per **pending** candidate off
+        the *same* `build_intake_queue(status="pending")` projection `GET /ui/intake`
+        and the JSON list share (never a rejected or confirmed card on the landing) —
+        or the win state when the queue is clear.
+
+        **Period-agnostic:** the intake queue is all-periods (a candidate's period is
+        derived from its own date at confirm), so `/` takes no `period` param — the
+        shared nav's `nav_period` falls back via `base.html` (see the nav note there).
+        Still reads `close_store.by_period()` so every signed-closed period surfaces
+        its banner on the front door. An unwired intake port renders the win state
+        (nothing pending), never a 500.
+        """
+        closed_banners = [
+            {"period": p, "signed_at": r.signed_at.isoformat(), "signed_by": r.signed_by}
+            for p, r in sorted((await close_store.by_period()).items())
+        ] if close_store is not None else []
+
+        if candidate_store is None or candidate_decision_store is None:
+            candidates: list = []
+            filed_today = 0
+        else:
+            queue = await build_intake_queue(
+                candidate_store=candidate_store,
+                candidate_decision_store=candidate_decision_store,
+                status="pending",
+            )
+            candidates = queue.candidates
+            # "M filed today": stored-only confirms on the server-local day (AC 15) —
+            # recomputed off the full decision trail per render, never a stored tally.
+            filed_today = count_filed_today(
+                await candidate_decision_store.all(),
+                today=datetime.now().date(),
+            )
+
+        return templates.TemplateResponse(
+            request,
+            "capture_home.html",
+            {
+                # The card's hidden `period` field is nav context only (the confirm
+                # period is derived from the edited date); a constant keeps it
+                # non-blank without re-introducing a `/` query param.
+                "period": _DEFAULT_PERIOD,
+                "closed_banners": closed_banners,
+                "candidates": candidates,
+                "pending": len(candidates),
+                "filed_today": filed_today,
+                "attribution_targets": config.attribution_targets,
+                "attribution_target_labels": intake_labels,
+            },
+        )
+
+    @app.get(
+        "/ui/import-files",
+        response_class=HTMLResponse,
+        summary="Import files (CSV transactions / statement)",
+    )
+    async def import_files(request: Request, period: str = _DEFAULT_PERIOD) -> HTMLResponse:
+        """The CSV/statement importer — demoted from `/` to a downstream stage (B+).
+
+        Renders the *same* `import.html` (both upload forms) verbatim at the new
+        route: the re-home moved the route, not the behavior — the forms still POST
+        `/ui/import` and `/ui/statements/import`, so a real import lands transactions
+        in the ledger exactly as Slice 1 did (AC 23). Keeps the closed-banner read so
+        an import touching a signed-closed period is still visibly refused. `period`
+        only pre-fills the form / carries nav context; the store derives each row's
+        real period from its date.
         """
         closed_banners = [
             {"period": p, "signed_at": r.signed_at.isoformat(), "signed_by": r.signed_by}
