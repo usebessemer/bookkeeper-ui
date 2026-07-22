@@ -1,0 +1,7 @@
+{# Terminal-decision swap: the candidate is unknown — never submitted, or gone from
+   this now-stale queue. Refuse into the card and tell the human to refresh; nothing
+   changed. The JSON twin (POST /intake/resolve) returns a machine 404. #}
+<div class="result error">
+  <p><strong>No longer available.</strong> This candidate is not in the intake queue
+     &mdash; refresh to see the current receipts.</p>
+</div>
