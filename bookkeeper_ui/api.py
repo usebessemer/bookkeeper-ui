@@ -100,6 +100,11 @@ from bookkeeper_ui.confirmations import (
 )
 from bookkeeper_ui.exporter import FileExportStore, export_package
 from bookkeeper_ui.importer import TransactionImportError, import_bytes
+from bookkeeper_ui.intake_confirm import (
+    ConfirmArtifactMissingError,
+    ConfirmClosedPeriodError,
+    apply_confirm,
+)
 from bookkeeper_ui.intake_scan import scan_drop_dir
 from bookkeeper_ui.ledger_store import FileLedgerStore, transaction_key
 from bookkeeper_ui.periods import is_quarterly_period, period_of
@@ -142,6 +147,7 @@ from bookkeeper_ui.schemas import (
     TransactionOut,
     WaiveRequest,
     WaiverOut,
+    standing_for_action,
 )
 from bookkeeper_ui.statement_importer import StatementImportError
 from bookkeeper_ui.statement_importer import import_bytes as import_statement_bytes
@@ -209,6 +215,18 @@ def _parse_money(raw: str, field: str) -> Decimal:
         raise HTTPException(
             status_code=422,
             detail=f"{field} must be a finite amount — {raw!r} (NaN/Infinity) is rejected.",
+        )
+    # Exponent/scientific notation (`1E+2`) parses to a finite `Decimal` with no float
+    # leak, but it round-trips as canonical E-notation — so it yields a **different**
+    # `transaction_key` than the economically-equal `100`, weakening honest dedupe.
+    # Money on this wire is a plain decimal string; refuse the ambiguous form.
+    if "e" in raw.lower():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{field} {raw!r} uses exponent notation — money is a plain decimal "
+                f'string (e.g. "100", not "1E+2").'
+            ),
         )
     return value
 
@@ -1311,7 +1329,7 @@ def create_app(
             return CandidateResolutionOut(
                 candidate_id=cid,
                 action=ACTION_REJECT,
-                standing="rejected",
+                standing=standing_for_action(ACTION_REJECT),
                 reject_reason=request.reject_reason,
                 decided_at=now.isoformat(),
                 message=(
@@ -1330,8 +1348,13 @@ def create_app(
             if request.amount is not None
             else submission.amount
         )
+        # A blank tax (`""`) coalesces to `Decimal("0")` — matching the submit boundary
+        # (`request.tax not in (None, "")`), so the two paths never disagree on an
+        # explicitly-cleared tax field. `None` still falls back to the submitted value.
         tax = (
-            _parse_money(request.tax, "tax") if request.tax is not None else submission.tax
+            _parse_money(request.tax, "tax")
+            if request.tax not in (None, "")
+            else (submission.tax if request.tax is None else Decimal("0"))
         )
         date = (
             _parse_iso_datetime(request.date, "date")
@@ -1355,50 +1378,45 @@ def create_app(
                 ),
             )
 
-        # C1 closed-guard — on the **human-edited** date being written (the date can
-        # change in the form). `closed_periods` + `period_of`, never
-        # `transaction_in_closed_period` (which silently passes here — the txn is not
-        # in the ledger yet). Refused → 409, no ledger write, no decision row.
-        if period_of(date) in await closed_periods(close_store):
+        # Apply the confirm through the ONE write core both twins share (the C1 closed
+        # guard on the edited date, the missing-artifact refusal, and the honest-dedupe
+        # probe-before-store ordering all live there — they cannot drift from the HTML
+        # twin). Its two typed refusals surface as this route's machine codes.
+        try:
+            result = await apply_confirm(
+                candidate_id=cid,
+                vendor=vendor,
+                amount=amount,
+                tax=tax,
+                date=date,
+                description=description,
+                attribution_target_id=target,
+                now=now,
+                ledger_store=ledger_store,
+                artifact_store=artifacts,
+                decision_store=decisions,
+                close_store=close_store,
+            )
+        except ConfirmClosedPeriodError as exc:
             raise HTTPException(
                 status_code=409,
                 detail=(
                     f"the edited date {date.date().isoformat()} falls in closed period "
-                    f"{period_of(date)!r} — its books are write-guarded (§5.7: a signed "
+                    f"{exc.period!r} — its books are write-guarded (§5.7: a signed "
                     f"close is durable). No transaction was filed."
                 ),
-            )
+            ) from exc
+        except ConfirmArtifactMissingError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"the source artifact for candidate {cid!r} is missing — a confirm "
+                    f"files the receipt bytes with the ledger row, so it cannot proceed "
+                    f"without them. No transaction was filed."
+                ),
+            ) from exc
 
-        artifact_bytes = await artifacts.get(cid) or b""
-        transaction = Transaction(
-            attribution_target_id=target,
-            vendor=vendor,
-            amount=amount,
-            tax=tax,
-            date=date,
-            description=description,
-            artifact_bytes=artifact_bytes,
-        )
-        key = transaction_key(transaction)
-        already = await ledger_store.contains(key)  # probe BEFORE the idempotent store
-        await ledger_store.store(transaction)
-        outcome = LEDGER_OUTCOME_ALREADY_PRESENT if already else LEDGER_OUTCOME_STORED
-
-        decision = CandidateDecision(
-            candidate_id=cid,
-            action=ACTION_CONFIRM,
-            source=CANDIDATE_SOURCE_HUMAN,
-            decided_at=now,
-            vendor=vendor,
-            amount=amount,
-            tax=tax,
-            date=date,
-            description=description,
-            attribution_target_id=target,
-            transaction_key=key,
-            ledger_outcome=outcome,
-        )
-        await decisions.record(decision)
+        already = result.ledger_outcome == LEDGER_OUTCOME_ALREADY_PRESENT
         message = (
             "Confirmed — this transaction is already in the ledger (a duplicate of an "
             "existing filing); no new row was written."
@@ -1408,9 +1426,9 @@ def create_app(
         return CandidateResolutionOut(
             candidate_id=cid,
             action=ACTION_CONFIRM,
-            standing="confirmed",
-            ledger_outcome=outcome,
-            transaction_key=key,
+            standing=standing_for_action(ACTION_CONFIRM),
+            ledger_outcome=result.ledger_outcome,
+            transaction_key=result.transaction_key,
             decided_at=now.isoformat(),
             message=message,
         )

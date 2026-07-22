@@ -168,6 +168,20 @@ async def test_amount_as_json_number_is_422_and_writes_nothing(intake: IntakeHar
     assert not intake.artifacts_dir.exists() or not any(intake.artifacts_dir.iterdir())
 
 
+async def test_amount_scientific_notation_is_422_and_writes_nothing(intake: IntakeHarness):
+    """`1E+2` parses to a finite Decimal (no float leak) but round-trips as canonical
+    E-notation — a DIFFERENT transaction_key than the economically-equal `100`, which
+    would weaken honest dedupe. Money on the wire is a plain decimal string, so the
+    exponent form is a 422 with nothing written (pin 1)."""
+    async with _client(intake.app) as client:
+        amt = await client.post("/intake/candidates", json=_payload(amount="1E+2"))
+        tax = await client.post("/intake/candidates", json=_payload(tax="1e2"))
+    assert amt.status_code == 422 and "amount" in json.dumps(amt.json())
+    assert tax.status_code == 422 and "tax" in json.dumps(tax.json())
+    assert _rows(intake.candidates_path) == []
+    assert not intake.artifacts_dir.exists() or not any(intake.artifacts_dir.iterdir())
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -437,6 +451,124 @@ async def test_confirm_edited_date_out_of_closed_period_succeeds(tmp_path, examp
         )
     assert resp.status_code == 200  # 2026-Q3 is open
     assert len(_rows(harness.ledger_path)) == 1
+
+
+async def test_confirm_edited_INTO_closed_period_is_409(tmp_path, examples_dir):
+    """The guard reads the EDITED date in the CLOSED direction too (pin 2): a candidate
+    whose STORED date sits in an OPEN period, edited so the confirmed date lands in a
+    CLOSED period, is refused. Distinguishes 'reads the edited date' from 'reads the
+    stored date' — a guard that only checked the stored date would slip this through."""
+    close_store = FileCloseStore(tmp_path / "closes.jsonl")
+    # Close 2026-Q3 — NOT the candidate's own period (its date 2026-06-14 is 2026-Q2, open).
+    await close_store.record(
+        CloseRecord(
+            period="2026-Q3",
+            signed_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
+            signed_by="owner",
+            checklist=(),
+            transactions=(),
+            tax={},
+            reconciliation={},
+            anomalies=(),
+            effective_prior_period_state=None,
+            config_prior_period_state=None,
+        )
+    )
+    harness = _harness(tmp_path, examples_dir, close_store=close_store)
+    async with _client(harness.app) as client:
+        cid = (await client.post("/intake/candidates", json=_payload())).json()[
+            "candidate"
+        ]["candidate_id"]
+        resp = await client.post(
+            "/intake/resolve",
+            json={"candidate_id": cid, "action": "confirm", "date": "2026-08-01"},
+        )
+    assert resp.status_code == 409  # 2026-08-01 → 2026-Q3 (closed)
+    assert "2026-Q3" in json.dumps(resp.json())
+    assert _rows(harness.ledger_path) == []  # no ledger write
+    assert _rows(harness.decisions_path) == []  # no decision row
+
+
+async def test_confirm_missing_artifact_is_404_and_writes_nothing(intake: IntakeHarness):
+    """A confirm files the ledger row that carries the receipt bytes (the §1 source-trace
+    link). If the artifact blob is lost between submit and confirm, coalescing to `b""`
+    would file a row with NO artifact — undetectable downstream (transaction_key excludes
+    artifact_bytes). Confirm 404s instead, writing nothing (pin 3)."""
+    async with _client(intake.app) as client:
+        cid = (await client.post("/intake/candidates", json=_payload())).json()[
+            "candidate"
+        ]["candidate_id"]
+        # Simulate the blob going missing between submit and confirm.
+        (intake.artifacts_dir / cid).unlink()
+        resp = await client.post(
+            "/intake/resolve", json={"candidate_id": cid, "action": "confirm"}
+        )
+    assert resp.status_code == 404
+    assert _rows(intake.ledger_path) == []  # no ledger row filed with empty bytes
+    assert _rows(intake.decisions_path) == []  # no decision row
+
+
+async def test_confirm_attribution_422_runs_before_closed_guard(tmp_path, examples_dir):
+    """AC-18 sequencing (pin 15): the attribution check runs BEFORE the closed guard.
+    A confirm into a closed period carrying an INVALID attribution target is a 422
+    (attribution), not a 409 (closed) — proving the fixed order."""
+    close_store = FileCloseStore(tmp_path / "closes.jsonl")
+    await close_store.record(
+        CloseRecord(
+            period="2026-Q2",  # the candidate's own period is closed
+            signed_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            signed_by="owner",
+            checklist=(),
+            transactions=(),
+            tax={},
+            reconciliation={},
+            anomalies=(),
+            effective_prior_period_state=None,
+            config_prior_period_state=None,
+        )
+    )
+    harness = _harness(tmp_path, examples_dir, close_store=close_store)
+    async with _client(harness.app) as client:
+        cid = (await client.post("/intake/candidates", json=_payload())).json()[
+            "candidate"
+        ]["candidate_id"]
+        resp = await client.post(
+            "/intake/resolve",
+            json={
+                "candidate_id": cid,
+                "action": "confirm",
+                "attribution_target_id": "nope",  # invalid → 422 before the 409 guard
+            },
+        )
+    assert resp.status_code == 422  # attribution wins over the closed-period 409
+    assert _rows(harness.ledger_path) == []
+    assert _rows(harness.decisions_path) == []
+
+
+async def test_confirm_blank_tax_coalesces_to_zero_like_submit(intake: IntakeHarness):
+    """Pin 6: an explicit empty-string `tax` on confirm coalesces to Decimal('0') —
+    matching the submit boundary (`tax not in (None, "")`), so the two paths never
+    disagree on a cleared tax field. `amount` stays required (an empty string is a 422 on
+    both paths), so the symmetry holds where it should and the required field is unchanged."""
+    async with _client(intake.app) as client:
+        blank_tax_cid = (await client.post("/intake/candidates", json=_payload())).json()[
+            "candidate"
+        ]["candidate_id"]
+        blank_tax = await client.post(
+            "/intake/resolve",
+            json={"candidate_id": blank_tax_cid, "action": "confirm", "tax": ""},
+        )
+        blank_amt_cid = (
+            await client.post("/intake/candidates", json=_payload(submission_id="acme-2"))
+        ).json()["candidate"]["candidate_id"]
+        blank_amount = await client.post(
+            "/intake/resolve",
+            json={"candidate_id": blank_amt_cid, "action": "confirm", "amount": ""},
+        )
+    assert blank_tax.status_code == 200  # "" tax → 0, filed
+    (row,) = _rows(intake.ledger_path)
+    assert row["tax"] == "0"
+    assert blank_amount.status_code == 422  # amount stays required — "" is a 422
 
 
 # --- the shared queue projection ---------------------------------------------

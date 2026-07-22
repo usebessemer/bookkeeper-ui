@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -337,6 +338,11 @@ async def test_resolve_already_decided_swaps_already_reviewed(intake_ui: IntakeU
     assert "Already reviewed" in again.text
     # No second decision row appended past the terminal state.
     assert len(_rows(intake_ui.decisions_path)) == 1
+    # The card still LEFT the visible queue, so the pending pulse is recomputed OOB
+    # (else the counter reads stale until a refresh) — pin 10. The one candidate is
+    # already rejected, so pending is 0.
+    assert 'id="intake-pending-count" hx-swap-oob="innerHTML">0</span>' in again.text
+    assert 'id="intake-pulse-count" hx-swap-oob="innerHTML">0</span>' in again.text
 
 
 async def test_resolve_unknown_candidate_swaps_gone(intake_ui: IntakeUiHarness):
@@ -355,6 +361,24 @@ async def test_resolve_unknown_candidate_swaps_gone(intake_ui: IntakeUiHarness):
         )
     assert resp.status_code == 200
     assert "No longer available" in resp.text
+    # The (stale) card still leaves the visible queue, so the pending pulse recomputes
+    # OOB — pin 10. No candidate is pending, so 0.
+    assert 'id="intake-pending-count" hx-swap-oob="innerHTML">0</span>' in resp.text
+
+
+async def test_resolve_gone_omits_oob_counter_when_intake_unwired(tmp_path, examples_dir):
+    """Pin 10 edge: with the intake port unwired there is no queue to recount, so the
+    gone swap carries NO OOB span (guarded on `pending` being defined) — never a blank
+    OOB write that would wipe a counter on some other page."""
+    harness = _make(tmp_path, examples_dir, wire_intake=False)
+    async with _client(harness.app) as client:
+        resp = await client.post(
+            "/ui/intake/resolve",
+            data={"candidate_id": "0" * 64, "action": "confirm", "period": "2026-Q2"},
+        )
+    assert resp.status_code == 200
+    assert "No longer available" in resp.text
+    assert "hx-swap-oob" not in resp.text  # no counter recompute when unwired
 
 
 # --- confirm/reject write roundtrips ----------------------------------------------
@@ -381,10 +405,13 @@ async def test_confirm_files_transaction_with_edits_artifact_and_decision_row(
         )
         assert resp.status_code == 200
         assert "Confirmed and filed" in resp.text
-        # Both OOB counters recompute off the projection (innerHTML strategy so the
-        # counter's aria-live region + focus target survive the swap).
+        # All THREE pulse counters recompute off the projection (innerHTML strategy so
+        # each counter's own element — the pending counter's aria-live region + focus
+        # target — survives the swap). The third span refreshes 'M filed today' live so a
+        # confirm bumps it without a full reload (pin 20).
         assert 'id="intake-pending-count" hx-swap-oob="innerHTML">0</span>' in resp.text
         assert 'id="intake-pulse-count" hx-swap-oob="innerHTML">0</span>' in resp.text
+        assert 'id="intake-filed-count" hx-swap-oob="innerHTML">1</span>' in resp.text
         # The confirmed transaction lands in the ledger for its period with the edits.
         ledger = (await client.get("/ledger", params={"period": "2026-Q2"})).json()
         entry = next(
@@ -542,6 +569,198 @@ async def test_intake_queue_reads_examples_config_labels(tmp_path, examples_dir)
 
 
 # ===========================================================================
+# Slice 5 · hardening pins (issue #71): the second-order should-fixes
+# ===========================================================================
+
+
+async def _closed(tmp_path: Path, period: str) -> FileCloseStore:
+    close_store = FileCloseStore(tmp_path / "closes.jsonl")
+    await close_store.record(
+        CloseRecord(
+            period=period,
+            signed_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
+            signed_by="owner",
+            checklist=(),
+            transactions=(),
+            tax={},
+            reconciliation={},
+            anomalies=(),
+            effective_prior_period_state=None,
+            config_prior_period_state=None,
+        )
+    )
+    return close_store
+
+
+async def test_confirm_edited_INTO_closed_period_is_refused_html_twin(tmp_path, examples_dir):
+    """Pin 9: the HTML twin's C1 guard reads the EDITED date in the CLOSED direction too.
+    A candidate whose STORED date is OPEN, edited so the confirmed date lands in a CLOSED
+    period, is refused into the card — a guard that only checked the stored date (which
+    here is open) would wrongly file it. Done once across both twins (JSON = pin 2)."""
+    close_store = await _closed(tmp_path, "2026-Q3")  # NOT the candidate's own period
+    harness = _make(tmp_path, examples_dir, labels=_LABELS, close_store=close_store)
+    async with _client(harness.app) as client:
+        cid = await _seed(client)  # stored date 2026-06-14 → 2026-Q2 (OPEN)
+        resp = await client.post(
+            "/ui/intake/resolve",
+            data={
+                "candidate_id": cid,
+                "action": "confirm",
+                "vendor": "Home Depot",
+                "amount": "82.50",
+                "tax": "10.73",
+                "date": "2026-08-01",  # EDITED into 2026-Q3 (closed)
+                "attribution_target_id": "target-001",
+                "period": "2026-Q2",
+            },
+        )
+    assert resp.status_code == 200
+    assert "Period 2026-Q3 is closed" in resp.text  # refused on the EDITED date's period
+    assert _rows(harness.ledger_path) == []
+    assert _rows(harness.decisions_path) == []
+
+
+async def test_resolve_already_confirmed_swaps_confirm_subcopy(intake_ui: IntakeUiHarness):
+    """Pin 16: the already-decided swap shows the CONFIRM sub-copy after a confirm (the
+    existing terminal test only covers the reject sub-copy). A second decision is still
+    refused (no new row) — AC-22's core — but the recorded outcome shown is 'confirmed'."""
+    async with _client(intake_ui.app) as client:
+        cid = await _seed(client)
+        confirm = {
+            "candidate_id": cid,
+            "action": "confirm",
+            "vendor": "Home Depot",
+            "amount": "82.50",
+            "tax": "10.73",
+            "date": "2026-06-14",
+            "attribution_target_id": "target-001",
+            "period": "2026-Q2",
+        }
+        await client.post("/ui/intake/resolve", data=confirm)
+        again = await client.post("/ui/intake/resolve", data=confirm)
+    assert again.status_code == 200
+    assert "Already reviewed" in again.text
+    assert "was confirmed" in again.text  # the confirm sub-copy, not the reject one
+    assert "was rejected" not in again.text
+    assert len(_rows(intake_ui.decisions_path)) == 1  # no second decision row
+
+
+async def test_queue_focus_move_is_conditional_on_card_leaving(intake_ui: IntakeUiHarness):
+    """Pin 11 (a11y): the queue's after-swap focus-move to the pending counter is guarded
+    so it fires ONLY when the card left. A re-validation failure re-renders the card in
+    place — its response still carries the `intake-confirm` form — and the guard keys off
+    exactly that, leaving the human on the field to correct instead of yanking focus."""
+    async with _client(intake_ui.app) as client:
+        cid = await _seed(client)
+        home = (await client.get("/")).text
+        # The guard is wired on the queue container, keyed on the confirm form marker.
+        assert "responseText.indexOf('intake-confirm')" in home
+        # A kept-card (error) response carries that marker, so the guard suppresses the move.
+        err = await client.post(
+            "/ui/intake/resolve",
+            data={
+                "candidate_id": cid,
+                "action": "confirm",
+                "vendor": "HD",
+                "amount": "not-a-number",
+                "date": "2026-06-14",
+                "attribution_target_id": "target-001",
+                "period": "2026-Q2",
+            },
+        )
+    assert "intake-confirm" in err.text  # the marker the guard trips on is present
+
+
+async def test_confirm_scientific_notation_amount_renders_error_html_twin(
+    intake_ui: IntakeUiHarness,
+):
+    """Pin 1 (HTML twin): an edited exponent-notation amount is refused into the card
+    (not filed), matching the JSON/submit gate — money is a plain decimal string."""
+    async with _client(intake_ui.app) as client:
+        cid = await _seed(client)
+        resp = await client.post(
+            "/ui/intake/resolve",
+            data={
+                "candidate_id": cid,
+                "action": "confirm",
+                "vendor": "Home Depot",
+                "amount": "1E+2",
+                "date": "2026-06-14",
+                "attribution_target_id": "target-001",
+                "period": "2026-Q2",
+            },
+        )
+    assert resp.status_code == 200
+    assert "exponent notation" in resp.text
+    assert f'id="card-{cid}"' in resp.text  # card kept
+    assert _rows(intake_ui.ledger_path) == []
+    assert _rows(intake_ui.decisions_path) == []
+
+
+async def test_confirm_missing_artifact_renders_error_html_twin(intake_ui: IntakeUiHarness):
+    """Pin 3 (HTML twin): a confirm whose source artifact went missing renders the failure
+    INTO the card — never files a ledger row with empty artifact bytes."""
+    async with _client(intake_ui.app) as client:
+        cid = await _seed(client)
+        (intake_ui.artifacts_dir / cid).unlink()  # blob lost between submit and confirm
+        resp = await client.post(
+            "/ui/intake/resolve",
+            data={
+                "candidate_id": cid,
+                "action": "confirm",
+                "vendor": "Home Depot",
+                "amount": "82.50",
+                "date": "2026-06-14",
+                "attribution_target_id": "target-001",
+                "period": "2026-Q2",
+            },
+        )
+    assert resp.status_code == 200
+    assert "artifact" in resp.text and "missing" in resp.text
+    assert f'id="card-{cid}"' in resp.text  # card kept, edits available
+    assert _rows(intake_ui.ledger_path) == []  # no row filed with empty bytes
+    assert _rows(intake_ui.decisions_path) == []
+
+
+async def test_confirm_blank_amount_renders_error_html_twin(intake_ui: IntakeUiHarness):
+    """Pin 17: the posted-blank amount SERVER path. The `required` attr blocks a blank
+    amount client-side, but a direct POST re-validates on the server — a blank amount is
+    refused into the card (blank tax, by contrast, coalesces to 0), nothing written."""
+    async with _client(intake_ui.app) as client:
+        cid = await _seed(client)
+        resp = await client.post(
+            "/ui/intake/resolve",
+            data={
+                "candidate_id": cid,
+                "action": "confirm",
+                "vendor": "Home Depot",
+                "amount": "",  # blank — the server still refuses it
+                "tax": "",  # blank tax coalesces to 0 (no error from this field)
+                "date": "2026-06-14",
+                "attribution_target_id": "target-001",
+                "period": "2026-Q2",
+            },
+        )
+    assert resp.status_code == 200
+    assert f'id="card-{cid}"' in resp.text  # card kept
+    assert _rows(intake_ui.ledger_path) == []
+    assert _rows(intake_ui.decisions_path) == []
+
+
+async def test_queue_renders_cards_in_submission_order(intake_ui: IntakeUiHarness):
+    """Pin 14: the queue renders cards in submission (server-assigned submitted_at,
+    append-only insertion) order — the same order both surfaces share."""
+    async with _client(intake_ui.app) as client:
+        first = await _seed(client, submission_id="s-1", vendor="First")
+        second = await _seed(client, submission_id="s-2", vendor="Second")
+        third = await _seed(client, submission_id="s-3", vendor="Third")
+        html = (await client.get("/ui/intake")).text
+    assert html.index(f"card-{first}") < html.index(f"card-{second}") < html.index(
+        f"card-{third}"
+    )
+
+
+# ===========================================================================
 # Slice 5 · B+: the capture-home landing (GET / re-homed to the intake queue)
 # ===========================================================================
 
@@ -619,9 +838,33 @@ async def test_capture_home_pulse_counts_stored_confirms_only(
         await client.post("/ui/intake/resolve", data={"candidate_id": cid1, **common})
         await client.post("/ui/intake/resolve", data={"candidate_id": cid2, **common})
         home = (await client.get("/")).text
-    # One row actually filed; the dedupe no-op is NOT counted (1, never 2).
-    assert '<span class="pulse-filed">1</span>' in home
-    assert '<span class="pulse-filed">2</span>' not in home
+    # One row actually filed; the dedupe no-op is NOT counted (1, never 2). The span
+    # carries an id (intake-filed-count) so a live confirm can OOB-refresh it (pin 20).
+    assert 'class="pulse-filed">1</span>' in home
+    assert 'class="pulse-filed">2</span>' not in home
+
+
+async def test_capture_home_shows_no_all_periods_rollup(intake_ui: IntakeUiHarness):
+    """Pin 18 (H2, positive): the landing pulse shows ONLY the two honest counts —
+    'N to review' + 'M filed today' — never a per-period breakdown or an all-periods
+    completeness roll-up. The earlier pins only rode on incidental phrase-guards
+    ('% complete'/'confiden' absent), which a roll-up worded to dodge them (e.g.
+    '12 of 40 filed across all periods', '34% categorized') slipped past (mutation g).
+    This asserts positively: no %, no 'N of M' total, no 'period' framing in the pulse,
+    and no 'across all periods' anywhere on the landing."""
+    async with _client(intake_ui.app) as client:
+        await _seed(client, submission_id="a")
+        await _seed(client, submission_id="b")
+        home = (await client.get("/")).text
+    # The pulse region is the showpiece honesty triad — isolate it (the whole page
+    # legitimately carries 'period' in its nav ?period= links, so scope the roll-up
+    # checks to the pulse itself).
+    start = home.index('class="capture-pulse"')
+    pulse = home[start : home.index("</p>", start)]
+    assert "%" not in pulse  # no '34% categorized' completeness roll-up
+    assert " of " not in pulse  # no '12 of 40' all-periods total
+    assert "period" not in pulse.lower()  # no per-period / across-period framing
+    assert "across all periods" not in home.lower()  # nor anywhere on the landing
 
 
 async def test_capture_home_no_period_on_receipts_link(intake_ui: IntakeUiHarness):
@@ -675,12 +918,29 @@ def test_count_filed_today_excludes_other_days():
     assert count_filed_today([_stored_confirm(yesterday)], today=today) == 0
 
 
-def test_count_filed_today_buckets_by_server_local_day_not_utc():
-    """The day boundary is the deployment-LOCAL day: a stored confirm at 7pm local
-    counts as today even though its stored UTC instant may fall on a different date.
-    Round-trips a 7pm-local wall time through UTC (how the app stores decided_at)."""
-    local_now = datetime.now().astimezone()  # server-local, tz-aware
-    today = local_now.date()
-    seven_pm_local = local_now.replace(hour=19, minute=0, second=0, microsecond=0)
-    decided_as_stored = seven_pm_local.astimezone(timezone.utc)  # the app stores UTC
-    assert count_filed_today([_stored_confirm(decided_as_stored)], today=today) == 1
+def test_count_filed_today_buckets_by_server_local_day_not_utc(monkeypatch):
+    """The day boundary is the deployment-LOCAL day, not UTC (pin 19 — deterministic).
+
+    The old form built a 7pm-local instant off the machine's own offset; at this
+    machine's UTC-04:00 (and every zero/positive offset) 7pm local is still the same UTC
+    calendar day, so a buggy raw-UTC `.date()` PASSED the test named to pin it. Pin the
+    deployment tz (America/New_York = UTC-05:00 in January) so the local-vs-UTC straddle
+    is guaranteed on every machine, including a UTC CI runner: 11pm on Jan 15 local is
+    04:00 on Jan 16 in UTC — same local day, NEXT UTC day. The correct helper
+    (`decided_at.astimezone().date()`) buckets it on the 15th; the mutation (raw
+    `.date()`) buckets it on the 16th and misses `today`.
+    """
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        est = timezone(timedelta(hours=-5))  # January is not DST — a clean UTC-05:00
+        decided_local = datetime(2026, 1, 15, 23, 0, tzinfo=est)  # 11pm local
+        decided_as_stored = decided_local.astimezone(timezone.utc)  # 2026-01-16 04:00 UTC
+        assert decided_as_stored.date() == date(2026, 1, 16)  # a DIFFERENT UTC day
+        assert (
+            count_filed_today([_stored_confirm(decided_as_stored)], today=date(2026, 1, 15))
+            == 1
+        )
+    finally:
+        monkeypatch.delenv("TZ", raising=False)
+        time.tzset()

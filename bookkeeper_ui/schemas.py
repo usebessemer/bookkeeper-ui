@@ -48,7 +48,7 @@ from bookkeeper.skills.reconcile import (
 from bookkeeper.skills.track_tax import TaxFlag, TaxSummary
 
 from bookkeeper_ui.anomaly_reviews import AnomalyReview
-from bookkeeper_ui.candidates import CandidateDecision, CandidateSubmission
+from bookkeeper_ui.candidates import ACTION_CONFIRM, CandidateDecision, CandidateSubmission
 from bookkeeper_ui.confirmations import Confirmation
 from bookkeeper_ui.ledger_store import transaction_key
 from bookkeeper_ui.reconciliations import Reconciliation
@@ -1206,6 +1206,17 @@ def _export_record_fields(record: "ExportRecord") -> dict[str, object]:
 IntakeStanding = Literal["pending", "confirmed", "rejected"]
 
 
+def standing_for_action(action: str) -> IntakeStanding:
+    """The candidate standing a decided action resolves to — the one action→standing map.
+
+    A `confirm` stands `confirmed`, any other decided action (`reject`) stands
+    `rejected`. The queue projection (`CandidateEntryOut.build`) and the `/intake/resolve`
+    response both derive the echoed standing from **this**, so the two can never drift to
+    disagree on what a decision means.
+    """
+    return "confirmed" if action == ACTION_CONFIRM else "rejected"
+
+
 class CandidateOut(BaseModel):
     """A submitted candidate on the wire — money as exact strings, dates ISO 8601.
 
@@ -1362,7 +1373,7 @@ class CandidateEntryOut(BaseModel):
         """Project a submission + its latest decision (or none) into a queue entry."""
         if decision is None:
             return cls(candidate=CandidateOut.from_submission(submission), standing="pending")
-        standing: IntakeStanding = "confirmed" if decision.action == "confirm" else "rejected"
+        standing = standing_for_action(decision.action)
         return cls(
             candidate=CandidateOut.from_submission(submission),
             standing=standing,

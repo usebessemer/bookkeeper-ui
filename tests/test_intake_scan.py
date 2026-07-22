@@ -25,6 +25,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+import bookkeeper_ui.api as api
 import bookkeeper_ui.intake_scan as intake_scan
 from bookkeeper_ui.api import create_app
 from bookkeeper_ui.candidates import (
@@ -382,3 +383,115 @@ async def test_ui_scan_twin_errors_when_unwired(tmp_path, examples_dir):
     # The UI convention: a config error is a 200 error partial, not a 500.
     assert resp.status_code == 200
     assert "not configured" in resp.text.lower()
+
+
+# --- A NaN/Infinity STRING on the scan money path (pin 24) --------------------
+
+
+async def test_scan_nan_infinity_string_amount_is_rejected(scan: ScanHarness):
+    """`_parse_money` has two guards: `_require_str` refuses a JSON *number* before
+    `Decimal()`, and `is_finite()` refuses a NaN/Infinity *string* after it. The only
+    other scan-money test uses a JSON number (branch 1); this exercises branch 2 — a
+    "NaN"/"Infinity" string is rejected, its file skipped, nothing ingested."""
+    _write_artifact(scan.drop_dir, "nan.jpg")
+    _write_artifact(scan.drop_dir, "inf.jpg")
+    _write_doc(
+        scan.drop_dir, "nan.json", _doc(submission_id="nan", artifact_file="nan.jpg", amount="NaN")
+    )
+    _write_doc(
+        scan.drop_dir,
+        "inf.json",
+        _doc(submission_id="inf", artifact_file="inf.jpg", amount="Infinity"),
+    )
+    async with _client(scan.app) as client:
+        summary = (await client.post("/intake/scan")).json()
+    assert summary["ingested"] == 0
+    by_file = {e["file"]: e["error"] for e in summary["errors"]}
+    assert "finite" in by_file["nan.json"] and "finite" in by_file["inf.json"]
+    assert _rows(scan.candidates_path) == []
+
+
+# --- A1 == A3: the two front doors enforce the IDENTICAL gate (pin 23) --------
+
+
+def test_a1_a3_share_identical_media_allowlist_and_cap():
+    """The highest-value missing pin. A3 (`intake_scan`) hand-restates A1's (`api`) gate
+    because an `intake_scan → api → web → intake_scan` import cycle forbids importing A1's
+    rules — a STRUCTURALLY FORCED duplication that cannot be deduped, so it must be pinned.
+    Mutation (f) added `image/tiff` to the scan allowlist (a type A1 rejects) and all 425
+    tests stayed green; asserting the two rule SETS are identical kills it."""
+    assert intake_scan.ALLOWED_ARTIFACT_MEDIA_TYPES == api.ALLOWED_ARTIFACT_MEDIA_TYPES
+    assert intake_scan.DEFAULT_MAX_ARTIFACT_BYTES == api.DEFAULT_MAX_ARTIFACT_BYTES
+
+
+def _a1_payload(**overrides) -> dict:
+    """The A1 (`POST /intake/candidates`) shape of the shared baseline — inline base64
+    `artifact` instead of A3's `artifact_file`, every other field identical to `_doc`."""
+    payload = _doc()
+    del payload["artifact_file"]
+    payload["artifact"] = base64.b64encode(_ARTIFACT_BYTES).decode("ascii")
+    payload.update(overrides)
+    return payload
+
+
+# One shared accept/reject table, driven through BOTH front doors. Each case's verdict
+# must match on A1 and A3 — the whole point of the equivalence. Covers the field rules
+# both gates restate: money (exponent / non-finite string), the non-blank rule, and the
+# media allowlist (incl. the off-allowlist type mutation (f) slipped onto A3).
+_EQUIVALENCE_CASES = [
+    ("valid_baseline", {}, True),
+    ("amount_exponent_notation", {"amount": "1E+2"}, False),
+    ("amount_nan_string", {"amount": "NaN"}, False),
+    ("amount_infinity_string", {"amount": "Infinity"}, False),
+    ("tax_exponent_notation", {"tax": "1e2"}, False),
+    ("blank_vendor", {"vendor": "   "}, False),
+    ("off_allowlist_media_type", {"artifact_media_type": "image/tiff"}, False),
+]
+
+
+@pytest.mark.parametrize(
+    "overrides,accept", [(o, a) for _n, o, a in _EQUIVALENCE_CASES],
+    ids=[n for n, _o, _a in _EQUIVALENCE_CASES],
+)
+async def test_a1_a3_validation_equivalence(tmp_path, examples_dir, overrides, accept):
+    """The SAME field rules decide identically on the A1 (`POST /intake/candidates`) and
+    A3 (`POST /intake/scan`) front doors — driven through both from one table. A rule that
+    drifted on one gate (e.g. an off-allowlist media type accepted only by A3) breaks the
+    matching verdict here."""
+    # A1: the JSON port (inline base64 artifact) → 201 accept / 422 reject.
+    a1 = _make(tmp_path / "a1", examples_dir)
+    async with _client(a1.app) as client:
+        resp = await client.post("/intake/candidates", json=_a1_payload(**overrides))
+    a1_accepted = resp.status_code == 201
+
+    # A3: the drop scan (artifact_file) → ingested==1 accept / a per-file error reject.
+    a3 = _make(tmp_path / "a3", examples_dir)
+    _write_artifact(a3.drop_dir, "eq.jpg")
+    _write_doc(a3.drop_dir, "eq.json", _doc(artifact_file="eq.jpg", **overrides))
+    async with _client(a3.app) as client:
+        summary = (await client.post("/intake/scan")).json()
+    a3_accepted = summary["ingested"] == 1
+
+    assert a1_accepted == accept  # A1 verdict matches the table
+    assert a3_accepted == accept  # A3 verdict matches the table
+    assert a1_accepted == a3_accepted  # ...and the two front doors agree
+
+
+async def test_a1_a3_over_cap_artifact_rejected_identically(tmp_path, examples_dir):
+    """The size cap decides identically on both front doors too (the minor note under pin
+    23): an over-cap artifact is a 422 on A1 and a per-file error on A3 — never ingested."""
+    big = b"x" * 100
+    a1 = _make(tmp_path / "a1", examples_dir, max_artifact_bytes=10)
+    async with _client(a1.app) as client:
+        resp = await client.post(
+            "/intake/candidates",
+            json=_a1_payload(artifact=base64.b64encode(big).decode("ascii")),
+        )
+    assert resp.status_code == 422
+
+    a3 = _make(tmp_path / "a3", examples_dir, max_artifact_bytes=10)
+    _write_artifact(a3.drop_dir, "big.jpg", big)
+    _write_doc(a3.drop_dir, "big.json", _doc(artifact_file="big.jpg"))
+    async with _client(a3.app) as client:
+        summary = (await client.post("/intake/scan")).json()
+    assert summary["ingested"] == 0 and len(summary["errors"]) == 1

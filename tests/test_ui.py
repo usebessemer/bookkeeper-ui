@@ -121,6 +121,30 @@ async def test_import_renders_result_with_queue_link(ui: UiHarness):
     assert ui.ledger_path.exists()
 
 
+async def test_import_post_through_rehomed_context_lands_transactions(ui: UiHarness):
+    """Pin 21: a real POST driven through the re-homed importer lands transactions
+    exactly as Slice 1 — asserted at the LEDGER, not just that the file exists. The
+    re-home (B+) moved the form to `GET /ui/import-files` but its POST target
+    (`/ui/import`) and store path are untouched, so the rows land with exact money."""
+    import json
+
+    async with _client(ui.app) as client:
+        # The re-homed page still targets the unchanged POST route.
+        form = (await client.get("/ui/import-files")).text
+        assert 'hx-post="/ui/import"' in form
+        resp = await _import_csv(client, ui.examples_dir / "transactions.csv")
+        assert resp.status_code == 200
+        assert "Imported 6" in resp.text
+    # The rows actually landed in the ledger (money exact as strings, never a float).
+    rows = [
+        json.loads(line)
+        for line in ui.ledger_path.read_text().splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == 6
+    assert all(isinstance(r["amount"], str) for r in rows)
+
+
 async def test_import_bad_file_renders_error_not_500(ui: UiHarness):
     """AC-adjacent: a bad upload renders the error into the page (200), not a 500;
     nothing is persisted."""

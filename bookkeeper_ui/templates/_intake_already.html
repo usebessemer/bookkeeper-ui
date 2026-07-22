@@ -1,7 +1,13 @@
 {# Terminal-decision swap: this candidate was already reviewed (a second decision
    is refused — re-opening a decided candidate is out of scope). Its recorded
-   outcome is shown in place of the card; nothing changed and the counter is left
-   untouched. The JSON twin (POST /intake/resolve) returns a machine 409. #}
+   outcome is shown in place of the card. The card still LEAVES the visible queue,
+   so the pending pulse is recomputed OOB (else the counter reads stale until a
+   refresh) — the same two spans the resolve partial targets. The JSON twin
+   (POST /intake/resolve) returns a machine 409. #}
+{% if pending is defined %}
+<span id="intake-pending-count" hx-swap-oob="innerHTML">{{ pending }}</span>
+<span id="intake-pulse-count" hx-swap-oob="innerHTML">{{ pending }}</span>
+{% endif %}
 <div class="result">
   <p><strong>Already reviewed.</strong>
   {% if action == "confirm" %}

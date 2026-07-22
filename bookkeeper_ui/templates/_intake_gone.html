@@ -1,6 +1,13 @@
 {# Terminal-decision swap: the candidate is unknown — never submitted, or gone from
-   this now-stale queue. Refuse into the card and tell the human to refresh; nothing
-   changed. The JSON twin (POST /intake/resolve) returns a machine 404. #}
+   this now-stale queue. Refuse into the card and tell the human to refresh. The card
+   still LEAVES the visible queue, so the pending pulse is recomputed OOB (else the
+   counter reads stale until a refresh) — the same two spans the resolve partial
+   targets. When the intake port is unwired there is no queue to recount, so `pending`
+   is undefined and the spans are omitted. The JSON twin returns a machine 404. #}
+{% if pending is defined %}
+<span id="intake-pending-count" hx-swap-oob="innerHTML">{{ pending }}</span>
+<span id="intake-pulse-count" hx-swap-oob="innerHTML">{{ pending }}</span>
+{% endif %}
 <div class="result error">
   <p><strong>No longer available.</strong> This candidate is not in the intake queue
      &mdash; refresh to see the current receipts.</p>

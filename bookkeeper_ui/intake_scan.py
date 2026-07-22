@@ -150,6 +150,13 @@ def _parse_money(value: object, field_name: str) -> Decimal:
         raise DropDocumentError(
             f"{field_name} must be a finite amount — {raw!r} (NaN/Infinity) is rejected."
         )
+    # Exponent notation (`1E+2`) parses finite but round-trips as E-notation, yielding a
+    # different `transaction_key` than the equal `100` — refuse it (A1's rule, verbatim).
+    if "e" in raw.lower():
+        raise DropDocumentError(
+            f"{field_name} {raw!r} uses exponent notation — money is a plain decimal "
+            f'string (e.g. "100", not "1E+2").'
+        )
     return parsed
 
 
