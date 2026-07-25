@@ -1,11 +1,14 @@
-"""Slice 6 · A+B (Issues #82, #83) — the backup engine: init + commit + push transport.
+"""Slice 6 · A+B+C (Issues #82, #83, #84) — the backup engine: init + commit + push + status.
 
 `BackupService` turns the data dir into a **git repository the app manages for the
 user** — a durable, versioned, off-machine-ready copy of the books. Issue #82 built
 the *local* half: lazily initialise the repo, and append a linear commit at each
 banked write. Issue #83 adds the **network push** — `bank()` commits locally (awaited,
 the durability floor) then schedules a best-effort `git push` off the request path, so
-no handler response ever waits on the network. All wiring/UI is later issues. It stays
+no handler response ever waits on the network. Issue #84 adds a read-only `status()`: a
+truthful `BackupStatus` computed live from git and the verified-push sidecar on every
+call — **never a cached boolean** — that the UI (Issue #87) renders. All wiring/UI is
+later issues. It stays
 a leaf: stdlib + `asyncio`/`subprocess` only, importing nothing from `api`/`web`
 (mirroring `intake_confirm.py`), so the app can construct it — or not — with no import
 cycle and no behavioural coupling.
@@ -58,7 +61,7 @@ import logging
 import os
 import shutil
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -200,6 +203,89 @@ async def _reap(proc: asyncio.subprocess.Process) -> None:
         pass
 
 
+# ------------------------------------------------------------------------- status
+
+# The four-state backup ladder. `status()` collapses live git + the verified-push sidecar
+# to EXACTLY one of these on every call — never a cached boolean. Ordered worst→best.
+STATE_UNCONFIGURED = "unconfigured"   # no `origin` remote, or the repo isn't inited yet
+STATE_NEVER_BACKED = "never_backed"   # a remote exists but no verified push has ever landed
+STATE_PENDING = "pending"             # HEAD is ahead of the last verified-pushed sha
+STATE_BACKED_UP = "backed_up"         # HEAD == the last verified-pushed sha (the ONLY green)
+
+# Freshness escalation: how long a `pending` state may sit as quiet amber before it becomes
+# the LOUD nag class. DECISION (Stu, 2026-07-23): 3 days, not the proposed 24h — a contractor
+# may be off-grid on a job site for a few days and 24h would false-alarm. Env-configurable
+# (whole or fractional days); a missing / non-numeric / non-positive value falls back to 3d,
+# so a mis-set env var can never zero the threshold (which would nag on every pending state).
+_DEFAULT_FRESHNESS_THRESHOLD = timedelta(days=3)
+_FRESHNESS_THRESHOLD_ENV_VAR = "BOOKKEEPER_BACKUP_FRESHNESS_DAYS"
+
+# Error classes that make a `pending` state escalate to LOUD *immediately*, without waiting
+# for the freshness clock: both are non-retryable (see `_classify_push_error`) and will NOT
+# self-heal — an expired/revoked token (`auth-failed`) or a diverged remote (`rejected`) must
+# surface loudly now, not climb quietly as amber. `offline` is deliberately excluded: it is
+# transient (the off-grid contractor), and the freshness threshold already covers it in time.
+_ESCALATING_ERROR_CLASSES = frozenset({"auth-failed", "rejected"})
+
+
+def _read_freshness_threshold_from_env() -> timedelta:
+    """The freshness threshold from the env var, defaulting to 3 days.
+
+    A missing, non-numeric, or non-positive value is a clean fall-back to the default — a
+    mis-set env var can never make the threshold zero or negative (which would escalate every
+    pending state at once).
+    """
+    raw = os.environ.get(_FRESHNESS_THRESHOLD_ENV_VAR)
+    if raw is None:
+        return _DEFAULT_FRESHNESS_THRESHOLD
+    try:
+        days = float(raw)
+    except ValueError:
+        return _DEFAULT_FRESHNESS_THRESHOLD
+    return timedelta(days=days) if days > 0 else _DEFAULT_FRESHNESS_THRESHOLD
+
+
+def _ladder_state(remote_configured: bool, has_verified_sidecar: bool, unpushed_count: int) -> str:
+    """Collapse the raw facts to exactly one ladder rung (worst→best precedence).
+
+    No remote (or not inited) is `unconfigured` regardless of everything else. With a remote
+    but no verified sidecar it is `never_backed` — the born-safe never-pushed default that can
+    never read green. With a verified sidecar, HEAD level with the pushed sha
+    (`unpushed_count == 0`) is `backed_up`, and any commits ahead is `pending`.
+    """
+    if not remote_configured:
+        return STATE_UNCONFIGURED
+    if not has_verified_sidecar:
+        return STATE_NEVER_BACKED
+    if unpushed_count == 0:
+        return STATE_BACKED_UP
+    return STATE_PENDING
+
+
+@dataclass(frozen=True)
+class BackupStatus:
+    """A per-call snapshot of the backup's truthful state — computed live from git and the
+    verified-push sidecar on every `status()` call, NEVER a cached boolean.
+
+    `state` collapses to exactly one rung of the four-state ladder. `escalated` is the layered
+    LOUD-nag signal: a `pending` state that has either gone stale (older than the freshness
+    threshold) or is stuck on a non-retryable push error. The rest are the raw facts the UI
+    (Issue #87) renders — the verified push-completion time, the honest unpushed count, and the
+    last collapsed error class.
+
+    Invariant: `backed_up` — the only green rung — requires `remote_configured` AND
+    `unpushed_count == 0` AND a real `last_push_time`, so a committed-but-unpushed repo, or one
+    with a corrupt/absent sidecar, can never read green.
+    """
+
+    state: str
+    remote_configured: bool
+    unpushed_count: int
+    last_push_time: datetime | None
+    last_error_class: str | None
+    escalated: bool = False
+
+
 class BackupService:
     """Local git backup for a data dir: lazy init + serialized commit + best-effort push.
 
@@ -219,12 +305,21 @@ class BackupService:
         data_dir: str | Path,
         remote_config: object | None = None,
         config_path: str | Path | None = None,
+        freshness_threshold: timedelta | None = None,
     ) -> None:
         # Resolve to an ABSOLUTE path now, so every git call runs against an
         # unambiguous location regardless of the process's cwd at call time.
         self._data_dir = Path(data_dir).resolve()
         self._remote_config = remote_config
         self._config_path = Path(config_path) if config_path is not None else None
+        # How long a `pending` state stays quiet amber before escalating to LOUD. Resolved
+        # once at construction — env-configurable, default 3 days — but an explicit argument
+        # wins, so a test can pin a tiny threshold deterministically.
+        self._freshness_threshold = (
+            freshness_threshold
+            if freshness_threshold is not None
+            else _read_freshness_threshold_from_env()
+        )
         # One lock guards this data dir's git index/refs for the object's lifetime; the
         # push acquires the same lock. asyncio.Lock binds to the running loop lazily.
         self._lock = asyncio.Lock()
@@ -355,6 +450,110 @@ class BackupService:
             sidecar.write_text(payload, encoding="utf-8")
         except OSError as exc:
             logger.warning("backup could not write push sidecar in %s: %s", self._data_dir, exc)
+
+    # ----------------------------------------------------------------------- status
+
+    async def status(self) -> BackupStatus:
+        """Compute the current backup status live from git + the verified-push sidecar.
+
+        Read-only and lock-free by design: it runs only non-mutating git queries
+        (`remote get-url`, `rev-list --count`), so it never collides with an in-flight
+        commit/push and a slow (up to 30s) push never delays a status read. Born-safe like
+        every other path — every git call goes through `_run`, which never raises — so a
+        not-yet-inited repo, a remote with no upstream, or an empty/detached HEAD each return
+        a clean value object rather than throwing. Crucially it counts unpushed commits against
+        the SIDECAR sha, NEVER `@{u}` (which fatals with no upstream), so it is fully
+        upstream-independent.
+        """
+        url = await self._run("remote", "get-url", "origin")
+        remote_configured = url.ok and bool(url.stdout.strip())
+
+        sidecar = self._read_verified_sidecar()
+        pushed_sha = sidecar[0] if sidecar is not None else None
+        last_push_time = sidecar[1] if sidecar is not None else None
+        unpushed_count = await self._count_unpushed(pushed_sha)
+
+        state = _ladder_state(remote_configured, sidecar is not None, unpushed_count)
+        return BackupStatus(
+            state=state,
+            remote_configured=remote_configured,
+            unpushed_count=unpushed_count,
+            last_push_time=last_push_time,
+            last_error_class=self._last_push_error_class,
+            escalated=self._is_escalated(state, last_push_time),
+        )
+
+    def _is_escalated(self, state: str, last_push_time: datetime | None) -> bool:
+        """Whether a `pending` state has crossed into the LOUD nag class.
+
+        Only `pending` escalates — the other rungs carry their own UI treatment. It goes loud
+        when EITHER the last push error is non-retryable (`auth-failed`/`rejected` — a stuck
+        token or diverged remote that will not self-heal) OR the last verified push is older
+        than the freshness threshold (the quiet-amber clock has run out). A transient `offline`
+        error alone does NOT escalate — only elapsed time does — so an off-grid contractor is
+        given the full freshness window before being nagged.
+        """
+        if state != STATE_PENDING:
+            return False
+        if self._last_push_error_class in _ESCALATING_ERROR_CLASSES:
+            return True
+        if last_push_time is None:
+            return False
+        return datetime.now(timezone.utc) - last_push_time > self._freshness_threshold
+
+    def _read_verified_sidecar(self) -> tuple[str, datetime] | None:
+        """Read the verified-push sidecar, returning `(pushed_sha, pushed_at)` or None.
+
+        Returns None on anything short of a fully trustworthy record — a missing/unreadable
+        file, malformed JSON, a missing key, an empty sha, or an unparseable timestamp — so a
+        corrupt sidecar is treated as "no verified push" (→ `never_backed`) and can never read
+        as green. A timestamp without a timezone is coerced to UTC so the freshness comparison
+        stays aware-vs-aware; every sidecar this service writes is already UTC-aware.
+        """
+        path = self._data_dir / ".git" / _PUSH_SIDECAR_NAME
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        try:
+            data = json.loads(raw)
+            sha = str(data["pushed_sha"]).strip()
+            pushed_at = datetime.fromisoformat(str(data["pushed_at"]))
+        except (ValueError, TypeError, KeyError):
+            return None
+        if not sha:
+            return None
+        if pushed_at.tzinfo is None:
+            pushed_at = pushed_at.replace(tzinfo=timezone.utc)
+        return sha, pushed_at
+
+    async def _count_unpushed(self, pushed_sha: str | None) -> int:
+        """Count commits on HEAD not yet covered by the verified-pushed sha — upstream-free.
+
+        Uses `git rev-list --count <pushed_sha>..HEAD` against the SIDECAR sha, NEVER
+        `@{u}..HEAD` (which fatals exit 128 with no upstream). With no sidecar every commit is
+        unpushed, so it counts all of HEAD. If the sidecar sha is not in local history (a
+        rewritten or foreign sha) the range query fatals — that is caught and folded back to
+        the total-commit count. A not-yet-inited/empty repo yields 0. Never raises, never fatals.
+        """
+        if pushed_sha:
+            ahead = await self._count_commits(f"{pushed_sha}..HEAD")
+            if ahead is not None:
+                return ahead
+            # Sidecar sha unknown to this repo → fall back to counting everything.
+        total = await self._count_commits("HEAD")
+        return total if total is not None else 0
+
+    async def _count_commits(self, revspec: str) -> int | None:
+        """`git rev-list --count <revspec>`; None if the query fails (unresolvable revspec,
+        not a repo) so the caller can fall back — this never fatals into the caller."""
+        result = await self._run("rev-list", "--count", revspec)
+        if not result.ok:
+            return None
+        try:
+            return int(result.stdout.strip())
+        except ValueError:
+            return None
 
     async def commit(self, message: str) -> None:
         """Snapshot config, stage everything, and commit — serialized and never raising.
