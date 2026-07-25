@@ -9,12 +9,12 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
 import bookkeeper_ui.backup as backup_mod
-from bookkeeper_ui.backup import BACKUP_GITIGNORE, BackupService
+from bookkeeper_ui.backup import BACKUP_GITIGNORE, BackupService, BackupStatus
 
 
 def run_git(data_dir: Path, *args: str) -> subprocess.CompletedProcess:
@@ -649,3 +649,382 @@ async def test_push_cycle_never_lets_an_exception_escape(tmp_path, monkeypatch):
 
     monkeypatch.setattr(svc, "_push_once", boom)
     await svc._push_cycle()  # must not raise
+
+
+# ===========================================================================
+# Slice 6 · C (#84) — BackupStatus: truthful state computed live from git on the
+# sidecar-sha basis (four-state ladder + freshness escalation). Every ladder rung is
+# built from constructed git states; born-safe/never-pushed never reads green; the
+# `@{u}` fatal is avoided; freshness escalation fires on stale-success-while-unbacked.
+# ===========================================================================
+
+
+def iso_days_ago(days: float) -> str:
+    """An ISO, timezone-aware completion timestamp `days` in the past — for a stale sidecar."""
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+def write_sidecar(data_dir: Path, pushed_sha: str, pushed_at: str) -> None:
+    """Write a verified-push sidecar directly, so a ladder/freshness state can be constructed
+    deterministically without depending on a real network push or on wall-clock timing."""
+    payload = json.dumps({"pushed_sha": pushed_sha, "pushed_at": pushed_at})
+    (data_dir / SIDECAR).write_text(payload, encoding="utf-8")
+
+
+def head_sha(data_dir: Path) -> str:
+    return run_git(data_dir, "rev-parse", "HEAD").stdout.strip()
+
+
+# --------------------------------------------------------------------- ladder rungs
+
+async def test_status_unconfigured_when_not_inited(tmp_path):
+    """A not-yet-inited data dir reads `unconfigured` and raises nothing — the born-safe
+    default, never an exception."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()  # exists but no `git init`
+
+    status = await BackupService(data_dir).status()
+
+    assert isinstance(status, BackupStatus)
+    assert status.state == backup_mod.STATE_UNCONFIGURED
+    assert status.remote_configured is False
+    assert status.unpushed_count == 0
+    assert status.last_push_time is None
+    assert status.escalated is False
+
+
+async def test_status_unconfigured_when_inited_but_no_remote(tmp_path):
+    """A repo with commits but NO `origin` remote reads `unconfigured` — no remote outweighs
+    having local history."""
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+
+    status = await svc.status()
+    assert status.state == backup_mod.STATE_UNCONFIGURED
+    assert status.remote_configured is False
+
+
+async def test_status_never_backed_when_remote_but_no_sidecar(tmp_path):
+    """A remote is configured but no verified push has ever landed → `never_backed`; the
+    commits are all counted unpushed, and it can NEVER read green."""
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    run_git(data_dir, "remote", "add", "origin", "https://example.invalid/x/y.git")
+
+    status = await svc.status()
+    assert status.state == backup_mod.STATE_NEVER_BACKED
+    assert status.state != backup_mod.STATE_BACKED_UP  # born-safe: never green without a push
+    assert status.remote_configured is True
+    assert status.unpushed_count == 1  # the baseline commit is unpushed
+    assert status.last_push_time is None
+
+
+async def test_status_backed_up_after_verified_push(tmp_path):
+    """After a real, verified push (HEAD == pushed_sha) the status is `backed_up`: green,
+    zero unpushed, a real aware completion timestamp, no error."""
+    bare = init_bare_remote(tmp_path / "remote.git")
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    (data_dir / "ledger.jsonl").write_text("{}\n")
+    run_git(data_dir, "remote", "add", "origin", file_url(bare))
+
+    await svc.bank("banked change")
+    await svc._push_task
+
+    status = await svc.status()
+    assert status.state == backup_mod.STATE_BACKED_UP
+    assert status.remote_configured is True
+    assert status.unpushed_count == 0
+    assert status.last_push_time is not None and status.last_push_time.tzinfo is not None
+    assert status.last_error_class is None
+    assert status.escalated is False
+
+
+async def test_status_pending_when_head_ahead_of_pushed_sha(tmp_path):
+    """A commit made after the last verified push leaves HEAD ahead of the pushed sha →
+    `pending` with an honest unpushed count, and (recent push) not escalated."""
+    bare = init_bare_remote(tmp_path / "remote.git")
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    (data_dir / "ledger.jsonl").write_text("{}\n")
+    run_git(data_dir, "remote", "add", "origin", file_url(bare))
+    await svc.bank("first")
+    await svc._push_task
+
+    # Two more local commits, not pushed → HEAD is two ahead of the verified sha.
+    (data_dir / "a.jsonl").write_text("a\n")
+    await svc.commit("second, local only")
+    (data_dir / "b.jsonl").write_text("b\n")
+    await svc.commit("third, local only")
+
+    status = await svc.status()
+    assert status.state == backup_mod.STATE_PENDING
+    assert status.unpushed_count == 2
+    assert status.state != backup_mod.STATE_BACKED_UP  # committed-but-unpushed is never green
+    assert status.escalated is False  # the last push is recent
+
+
+async def test_committed_but_unpushed_can_never_read_backed_up(tmp_path):
+    """The green invariant: even with a remote and a sidecar present, a HEAD ahead of the
+    pushed sha reads `pending`, never `backed_up`."""
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    base = head_sha(data_dir)
+    run_git(data_dir, "remote", "add", "origin", "https://example.invalid/x/y.git")
+    write_sidecar(data_dir, base, iso_days_ago(0))  # a fresh verified push of the baseline
+
+    (data_dir / "later.jsonl").write_text("x\n")
+    await svc.commit("a banked change after the push")
+
+    status = await svc.status()
+    assert status.state == backup_mod.STATE_PENDING
+    assert status.state != backup_mod.STATE_BACKED_UP
+
+
+# ------------------------------------------------------- upstream-independent counting
+
+async def test_unpushed_count_is_upstream_independent_never_uses_at_u(tmp_path, monkeypatch):
+    """The unpushed count is computed against the SIDECAR sha, never `@{u}` (which fatals with
+    no upstream). No tracking branch is ever set here, so `@{u}` would exit 128 — status must
+    still return a correct count without any `@{u}`/`@{upstream}` revspec."""
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    base = head_sha(data_dir)
+    run_git(data_dir, "remote", "add", "origin", "https://example.invalid/x/y.git")
+    write_sidecar(data_dir, base, iso_days_ago(0))
+    (data_dir / "new.jsonl").write_text("x\n")
+    await svc.commit("second")
+
+    seen_args: list[tuple] = []
+    real_run = svc._run
+
+    async def recording_run(*args, **kwargs):
+        seen_args.append(args)
+        return await real_run(*args, **kwargs)
+
+    monkeypatch.setattr(svc, "_run", recording_run)
+
+    status = await svc.status()
+
+    assert status.state == backup_mod.STATE_PENDING
+    assert status.unpushed_count == 1
+    joined = " ".join(a for call in seen_args for a in call)
+    assert "@{u}" not in joined and "@{upstream}" not in joined
+    # the count really was taken against the sidecar sha
+    assert any("rev-list" in call and f"{base}..HEAD" in call for call in seen_args)
+
+
+async def test_unknown_sidecar_sha_falls_back_to_total_never_fatals(tmp_path):
+    """A sidecar sha not in local history (rewritten/foreign) makes `<sha>..HEAD` fatal; the
+    count folds back to the total-commit count instead of raising or fatalling."""
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    run_git(data_dir, "remote", "add", "origin", "https://example.invalid/x/y.git")
+    write_sidecar(data_dir, "0" * 40, iso_days_ago(0))  # a sha this repo has never seen
+
+    status = await svc.status()
+    assert status.unpushed_count == commit_count(data_dir)  # folded back to all commits
+
+
+# --------------------------------------------------------------- freshness escalation
+
+async def test_freshness_escalation_fires_when_pending_push_is_stale(tmp_path):
+    """A `pending` state whose verified push is older than the (default 3-day) threshold
+    escalates to the LOUD nag class — stale-success-while-unbacked surfaces loudly."""
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    base = head_sha(data_dir)
+    run_git(data_dir, "remote", "add", "origin", "https://example.invalid/x/y.git")
+    write_sidecar(data_dir, base, iso_days_ago(10))  # last verified push was 10 days ago
+    (data_dir / "new.jsonl").write_text("x\n")
+    await svc.commit("banked, unpushed for days")
+
+    status = await svc.status()
+    assert status.state == backup_mod.STATE_PENDING
+    assert status.escalated is True
+
+
+async def test_recent_pending_push_does_not_escalate(tmp_path):
+    """A `pending` state within the freshness window stays quiet amber — not escalated."""
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    base = head_sha(data_dir)
+    run_git(data_dir, "remote", "add", "origin", "https://example.invalid/x/y.git")
+    write_sidecar(data_dir, base, iso_days_ago(1))  # well within the 3-day window
+    (data_dir / "new.jsonl").write_text("x\n")
+    await svc.commit("banked recently")
+
+    status = await svc.status()
+    assert status.state == backup_mod.STATE_PENDING
+    assert status.escalated is False
+
+
+async def test_terminal_push_error_escalates_pending_immediately(tmp_path):
+    """A non-retryable error (`auth-failed`/`rejected`) escalates a `pending` state at once,
+    without waiting for the freshness clock — an expired token surfaces loudly now."""
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    base = head_sha(data_dir)
+    run_git(data_dir, "remote", "add", "origin", "https://example.invalid/x/y.git")
+    write_sidecar(data_dir, base, iso_days_ago(0))  # last push was seconds ago (fresh)
+    (data_dir / "new.jsonl").write_text("x\n")
+    await svc.commit("banked, then the token was revoked")
+
+    for terminal in ("auth-failed", "rejected"):
+        svc._last_push_error_class = terminal
+        status = await svc.status()
+        assert status.state == backup_mod.STATE_PENDING
+        assert status.escalated is True, f"{terminal} must escalate immediately"
+        assert status.last_error_class == terminal
+
+
+async def test_offline_error_alone_does_not_escalate(tmp_path):
+    """A transient `offline` error does NOT escalate on its own — only elapsed time does, so an
+    off-grid contractor is given the full freshness window before being nagged."""
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    base = head_sha(data_dir)
+    run_git(data_dir, "remote", "add", "origin", "https://example.invalid/x/y.git")
+    write_sidecar(data_dir, base, iso_days_ago(1))  # recent push, just briefly offline since
+    (data_dir / "new.jsonl").write_text("x\n")
+    await svc.commit("banked while briefly offline")
+    svc._last_push_error_class = "offline"
+
+    status = await svc.status()
+    assert status.state == backup_mod.STATE_PENDING
+    assert status.escalated is False
+
+
+async def test_non_pending_states_never_escalate(tmp_path):
+    """Escalation is scoped to `pending`: a `never_backed` state, even with a terminal push
+    error recorded, does not set `escalated` — its own rung already carries the UI treatment."""
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    run_git(data_dir, "remote", "add", "origin", "https://example.invalid/x/y.git")
+    svc._last_push_error_class = "auth-failed"
+
+    status = await svc.status()
+    assert status.state == backup_mod.STATE_NEVER_BACKED
+    assert status.escalated is False
+
+
+# --------------------------------------------------------------- corrupt sidecar / fields
+
+async def test_corrupt_sidecar_is_treated_as_never_backed(tmp_path):
+    """A malformed sidecar is treated as "no verified push" → `never_backed`, never green — a
+    corrupt record can't be read as a successful backup."""
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    run_git(data_dir, "remote", "add", "origin", "https://example.invalid/x/y.git")
+    (data_dir / SIDECAR).write_text("not valid json{", encoding="utf-8")
+
+    status = await svc.status()
+    assert status.state == backup_mod.STATE_NEVER_BACKED
+    assert status.last_push_time is None
+    assert status.state != backup_mod.STATE_BACKED_UP
+
+
+async def test_sidecar_missing_timestamp_never_reads_green(tmp_path):
+    """`backed_up` requires a REAL timestamp: a sidecar carrying a valid sha but no parseable
+    `pushed_at` is rejected as unverified → `never_backed`, not green."""
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    base = head_sha(data_dir)
+    run_git(data_dir, "remote", "add", "origin", "https://example.invalid/x/y.git")
+    (data_dir / SIDECAR).write_text(json.dumps({"pushed_sha": base}), encoding="utf-8")
+
+    status = await svc.status()
+    assert status.state == backup_mod.STATE_NEVER_BACKED
+    assert status.state != backup_mod.STATE_BACKED_UP
+
+
+async def test_status_surfaces_last_error_class_and_completion_time(tmp_path):
+    """The raw fields are wired through: `last_error_class` mirrors the service's last collapsed
+    class, and `last_push_time` is the sidecar's push-completion timestamp."""
+    bare = init_bare_remote(tmp_path / "remote.git")
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    (data_dir / "ledger.jsonl").write_text("{}\n")
+    run_git(data_dir, "remote", "add", "origin", file_url(bare))
+    await svc.bank("first")
+    await svc._push_task
+
+    recorded = read_sidecar(data_dir)["pushed_at"]
+    status = await svc.status()
+    assert status.last_push_time == datetime.fromisoformat(recorded)
+    assert status.last_error_class is None  # success cleared it
+
+
+# --------------------------------------------------------------- env-configurable threshold
+
+def test_freshness_threshold_default_is_three_days():
+    """With no env override the threshold is the DECISION's 3 days (not the proposed 24h)."""
+    assert backup_mod._DEFAULT_FRESHNESS_THRESHOLD == timedelta(days=3)
+
+
+def test_freshness_threshold_is_env_configurable(monkeypatch):
+    """`BOOKKEEPER_BACKUP_FRESHNESS_DAYS` overrides the default (whole or fractional days);
+    a missing / non-numeric / non-positive value falls back cleanly to 3 days."""
+    monkeypatch.delenv("BOOKKEEPER_BACKUP_FRESHNESS_DAYS", raising=False)
+    assert backup_mod._read_freshness_threshold_from_env() == timedelta(days=3)
+
+    monkeypatch.setenv("BOOKKEEPER_BACKUP_FRESHNESS_DAYS", "0.5")
+    assert backup_mod._read_freshness_threshold_from_env() == timedelta(days=0.5)
+
+    for bad in ("not-a-number", "0", "-2"):
+        monkeypatch.setenv("BOOKKEEPER_BACKUP_FRESHNESS_DAYS", bad)
+        assert backup_mod._read_freshness_threshold_from_env() == timedelta(days=3)
+
+
+async def test_env_threshold_shortens_escalation_window(tmp_path, monkeypatch):
+    """A shortened env threshold escalates a pending state that a longer one would leave quiet —
+    the constructor reads the env var (no explicit arg), proving it's genuinely env-driven."""
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("BOOKKEEPER_BACKUP_FRESHNESS_DAYS", "0.5")
+    svc = BackupService(data_dir)  # threshold comes from the env, not an argument
+    data_dir.mkdir(parents=True, exist_ok=True)
+    await svc.commit("baseline")
+    base = head_sha(data_dir)
+    run_git(data_dir, "remote", "add", "origin", "https://example.invalid/x/y.git")
+    write_sidecar(data_dir, base, iso_days_ago(1))  # 1 day old: under 3d, but over 0.5d
+    (data_dir / "new.jsonl").write_text("x\n")
+    await svc.commit("banked")
+
+    status = await svc.status()
+    assert status.state == backup_mod.STATE_PENDING
+    assert status.escalated is True  # 1 day > the 0.5-day env threshold
+
+
+async def test_explicit_threshold_argument_overrides_env(tmp_path, monkeypatch):
+    """An explicit `freshness_threshold` argument wins over the env var — the test-friendly
+    deterministic override."""
+    monkeypatch.setenv("BOOKKEEPER_BACKUP_FRESHNESS_DAYS", "0.5")
+    svc = BackupService(tmp_path / "data", freshness_threshold=timedelta(days=30))
+    assert svc._freshness_threshold == timedelta(days=30)
+
+
+# ------------------------------------------------------------------- read-only guarantee
+
+async def test_status_is_read_only_and_never_mutates_history(tmp_path, monkeypatch):
+    """`status()` runs only non-mutating git queries — never add/commit/push/fetch/pull/merge/
+    rebase/init — so it can never change history or collide with a write."""
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    run_git(data_dir, "remote", "add", "origin", "https://example.invalid/x/y.git")
+    before = commit_count(data_dir)
+
+    verbs: list[str] = []
+    real_run = svc._run
+
+    async def recording_run(*args, **kwargs):
+        verbs.append(args[0] if args else "")
+        return await real_run(*args, **kwargs)
+
+    monkeypatch.setattr(svc, "_run", recording_run)
+
+    await svc.status()
+
+    assert commit_count(data_dir) == before
+    assert set(verbs) <= {"remote", "rev-list"}  # only read-only queries
+    for forbidden in ("add", "commit", "push", "fetch", "pull", "merge", "rebase", "init"):
+        assert forbidden not in verbs, f"status must never run git {forbidden}"
