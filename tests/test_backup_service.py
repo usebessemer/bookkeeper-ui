@@ -7,8 +7,11 @@ is fine in a test); the service under test always uses async exec.
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import bookkeeper_ui.backup as backup_mod
 from bookkeeper_ui.backup import BACKUP_GITIGNORE, BackupService
@@ -266,3 +269,383 @@ async def test_no_config_path_means_no_snapshot(tmp_path):
     """With no config path configured, no snapshot file appears — the feature is opt-in."""
     await BackupService(tmp_path).commit("no config configured")
     assert not (tmp_path / "config.snapshot.json").exists()
+
+
+# ===========================================================================
+# Slice 6 · B (#83) — the push transport: fire-and-forget force-with-lease,
+# retry/backoff, error-collapse, verified-success sidecar.
+# ===========================================================================
+
+SIDECAR = Path(".git") / "bookkeeper_last_push"
+
+
+def init_bare_remote(path: Path) -> Path:
+    """A temp BARE repo to push to (the offline-safe local stand-in for the client's remote)."""
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    return path
+
+
+def file_url(path: Path) -> str:
+    """A credential-free `file://` remote URL — allowed by the secrets guard (non-network,
+    no embedded token), exactly what the AC's bare-repo fixture needs to exercise a real push."""
+    return f"file://{path.resolve()}"
+
+
+async def _inited_repo(data_dir: Path) -> BackupService:
+    """A BackupService whose repo is inited with a baseline commit but no remote yet — the
+    caller wires `origin` next, mirroring the real order (repo exists, consultant adds remote)."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    svc = BackupService(data_dir)
+    await svc.commit("baseline")
+    return svc
+
+
+def read_sidecar(data_dir: Path) -> dict:
+    return json.loads((data_dir / SIDECAR).read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------- verified success
+
+async def test_bank_pushes_to_bare_remote_and_writes_verified_sidecar(tmp_path):
+    """A first `bank()` to an EMPTY bare remote succeeds: the remote's `main` lands at local
+    HEAD, and the sidecar records that exact sha with a real ISO completion timestamp."""
+    bare = init_bare_remote(tmp_path / "remote.git")
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    (data_dir / "ledger.jsonl").write_text("{}\n")
+    run_git(data_dir, "remote", "add", "origin", file_url(bare))
+
+    await svc.bank("banked: import 1 transaction")
+    await svc._push_task  # drive the scheduled, non-awaited push to completion
+
+    head = run_git(data_dir, "rev-parse", "HEAD").stdout.strip()
+    assert run_git(bare, "rev-parse", "main").stdout.strip() == head  # remote advanced to HEAD
+    sidecar = read_sidecar(data_dir)
+    assert sidecar["pushed_sha"] == head
+    stamp = datetime.fromisoformat(sidecar["pushed_at"])
+    assert stamp.tzinfo is not None  # a real, timezone-aware COMPLETION time
+    assert svc._last_push_error_class is None
+
+
+async def test_up_to_date_push_still_refreshes_sidecar(tmp_path):
+    """A second bank with nothing new (HEAD already on the remote) is `everything up-to-date`
+    — still verified against the remote, so the sidecar stays truthful, not stale."""
+    bare = init_bare_remote(tmp_path / "remote.git")
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    (data_dir / "ledger.jsonl").write_text("{}\n")
+    run_git(data_dir, "remote", "add", "origin", file_url(bare))
+
+    await svc.bank("first")
+    await svc._push_task
+    head = run_git(data_dir, "rev-parse", "HEAD").stdout.strip()
+
+    # No file change → the second bank's commit is a no-op; HEAD is already on the remote.
+    await svc.bank("nothing new")
+    await svc._push_task
+    assert read_sidecar(data_dir)["pushed_sha"] == head
+    assert svc._last_push_error_class is None
+
+
+# ------------------------------------------------------------- off the request path
+
+async def test_bank_awaits_commit_but_never_awaits_the_push(tmp_path, monkeypatch):
+    """`bank()` returns as soon as the local commit is durable; the network push is scheduled,
+    not awaited — so a slow/failing push never delays the handler response."""
+    svc = await _inited_repo(tmp_path / "data")
+    run_git(tmp_path / "data", "remote", "add", "origin", "https://example.invalid/x/y.git")
+
+    gate = asyncio.Event()
+    real_run = svc._run
+
+    async def gated_run(*args, **kwargs):
+        if args and args[0] == "push":
+            await gate.wait()  # hold the push open
+            return backup_mod._GitResult(128, "", "fatal: Authentication failed")
+        return await real_run(*args, **kwargs)
+
+    monkeypatch.setattr(svc, "_run", gated_run)
+
+    (tmp_path / "data" / "x.jsonl").write_text("x\n")
+    await svc.bank("banked change")  # must NOT block on the gated push
+
+    assert svc._push_task is not None and not svc._push_task.done()
+    # the local commit, by contrast, is already durable
+    assert run_git(tmp_path / "data", "rev-parse", "HEAD").returncode == 0
+    gate.set()
+    await svc._push_task  # clean up
+
+
+async def test_in_flight_push_is_coalesced_not_stacked(tmp_path, monkeypatch):
+    """A second bank while a push cycle is in flight does not start a competing cycle — the
+    running one already carries current HEAD."""
+    svc = await _inited_repo(tmp_path / "data")
+    run_git(tmp_path / "data", "remote", "add", "origin", "https://example.invalid/x/y.git")
+
+    gate = asyncio.Event()
+    real_run = svc._run
+
+    async def gated_run(*args, **kwargs):
+        if args and args[0] == "push":
+            await gate.wait()
+            return backup_mod._GitResult(128, "", "fatal: Authentication failed")
+        return await real_run(*args, **kwargs)
+
+    monkeypatch.setattr(svc, "_run", gated_run)
+
+    (tmp_path / "data" / "a.jsonl").write_text("a\n")
+    await svc.bank("first")
+    task1 = svc._push_task
+
+    (tmp_path / "data" / "b.jsonl").write_text("b\n")
+    await svc.bank("second")  # in-flight push not done → coalesce
+    assert svc._push_task is task1
+
+    gate.set()
+    await svc._push_task
+
+
+# -------------------------------------------------------------- offline / backoff
+
+async def test_offline_push_retries_on_backoff_then_pends(tmp_path, monkeypatch):
+    """A transient (offline) failure retries on the ~2s/8s/30s schedule, then gives up for the
+    cycle: no sidecar, state honestly pending, the commit still safely local, nothing raised."""
+    svc = await _inited_repo(tmp_path / "data")
+    run_git(tmp_path / "data", "remote", "add", "origin", "https://example.invalid/x/y.git")
+
+    push_calls = 0
+    real_run = svc._run
+
+    async def flaky_run(*args, **kwargs):
+        nonlocal push_calls
+        if args and args[0] == "push":
+            push_calls += 1
+            return backup_mod._GitResult(
+                128, "", "fatal: unable to access: Could not resolve host example.invalid"
+            )
+        return await real_run(*args, **kwargs)
+
+    monkeypatch.setattr(svc, "_run", flaky_run)
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(backup_mod.asyncio, "sleep", fake_sleep)
+
+    await svc._push_cycle()  # run the cycle inline for a deterministic schedule check
+
+    assert push_calls == 4  # initial attempt + 3 retries
+    assert sleeps == [2.0, 8.0, 30.0]
+    assert svc._last_push_error_class == "offline"
+    assert not (tmp_path / "data" / SIDECAR).exists()  # never reads backed-up
+    assert commit_count(tmp_path / "data") >= 1  # commit stayed safely local
+
+
+async def test_auth_failure_is_terminal_no_retry(tmp_path, monkeypatch):
+    """An auth failure will not self-heal within a cycle, so it gives up immediately (no backoff),
+    records the `auth-failed` class, and writes no sidecar."""
+    svc = await _inited_repo(tmp_path / "data")
+    run_git(tmp_path / "data", "remote", "add", "origin", "https://example.invalid/x/y.git")
+
+    push_calls = 0
+    real_run = svc._run
+
+    async def auth_run(*args, **kwargs):
+        nonlocal push_calls
+        if args and args[0] == "push":
+            push_calls += 1
+            return backup_mod._GitResult(128, "", "fatal: Authentication failed for 'https://...'")
+        return await real_run(*args, **kwargs)
+
+    monkeypatch.setattr(svc, "_run", auth_run)
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(backup_mod.asyncio, "sleep", fake_sleep)
+
+    await svc._push_cycle()
+
+    assert push_calls == 1  # no retry
+    assert sleeps == []
+    assert svc._last_push_error_class == "auth-failed"
+    assert not (tmp_path / "data" / SIDECAR).exists()
+
+
+async def test_timeout_kills_subprocess_and_pends(tmp_path, monkeypatch):
+    """A push that overruns the bounded timeout is killed and reaped (returncode None) and
+    treated as offline — no sidecar, nothing raised, no zombie left holding the lock."""
+    svc = await _inited_repo(tmp_path / "data")
+    run_git(tmp_path / "data", "remote", "add", "origin", "https://example.invalid/x/y.git")
+
+    real_run = svc._run
+
+    async def timing_out_run(*args, **kwargs):
+        if args and args[0] == "push":
+            return backup_mod._GitResult(None, "", "timed out")  # as _run returns on timeout
+        return await real_run(*args, **kwargs)
+
+    monkeypatch.setattr(svc, "_run", timing_out_run)
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(backup_mod.asyncio, "sleep", fake_sleep)
+
+    await svc._push_cycle()
+    assert sleeps == [2.0, 8.0, 30.0]  # a timeout is transient → retried then pends
+    assert svc._last_push_error_class == "offline"
+    assert not (tmp_path / "data" / SIDECAR).exists()
+
+
+# --------------------------------------------------------- diverged remote refused
+
+async def test_diverged_remote_is_refused_not_clobbered(tmp_path):
+    """A remote that moved out-of-band fails `--force-with-lease` (stale info): the remote is
+    NEVER clobbered, the sidecar does not advance, and the class is `rejected`."""
+    bare = init_bare_remote(tmp_path / "remote.git")
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    (data_dir / "a.jsonl").write_text("a\n")
+    run_git(data_dir, "remote", "add", "origin", file_url(bare))
+
+    await svc.bank("first push")
+    await svc._push_task
+    first_sha = run_git(data_dir, "rev-parse", "HEAD").stdout.strip()
+    assert run_git(bare, "rev-parse", "main").stdout.strip() == first_sha
+
+    # Diverge the bare remote out-of-band via a second clone → the remote moves to B.
+    work = tmp_path / "work"
+    subprocess.run(["git", "clone", file_url(bare), str(work)],
+                   capture_output=True, text=True, check=True)
+    run_git(work, "config", "user.email", "d@t")
+    run_git(work, "config", "user.name", "Diverge")
+    (work / "diverge.txt").write_text("x\n")
+    run_git(work, "add", "-A")
+    run_git(work, "commit", "-m", "divergent")
+    run_git(work, "push", "origin", "main")
+    diverged_sha = run_git(work, "rev-parse", "HEAD").stdout.strip()
+    assert run_git(bare, "rev-parse", "main").stdout.strip() == diverged_sha
+
+    # Local advances → C; the next bank pushes over the diverged remote and must be refused.
+    (data_dir / "b.jsonl").write_text("b\n")
+    await svc.bank("second push over a diverged remote")
+    await svc._push_task
+
+    assert run_git(bare, "rev-parse", "main").stdout.strip() == diverged_sha  # NOT clobbered
+    assert read_sidecar(data_dir)["pushed_sha"] == first_sha  # sidecar did not advance
+    assert svc._last_push_error_class == "rejected"
+
+
+# ----------------------------------------------------------- unconfigured / secrets
+
+async def test_no_remote_is_a_clean_unconfigured_noop(tmp_path):
+    """With no `origin`, a push is an honest no-op — no sidecar, no error class, no exception."""
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    (data_dir / "x.jsonl").write_text("x\n")
+
+    await svc.bank("change with no remote")
+    await svc._push_task
+
+    assert not (data_dir / SIDECAR).exists()
+    assert svc._last_push_error_class is None
+
+
+async def test_tokenized_remote_is_refused_and_never_pushed(tmp_path, monkeypatch):
+    """The secrets guard refuses a tokenized remote BEFORE any `git push` runs — so a token
+    can never reach a git command line — and records no success."""
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    run_git(data_dir, "remote", "add", "origin",
+            "https://x-access-token:ghp_secretsecret@github.com/client/books.git")
+
+    push_attempted = False
+    real_run = svc._run
+
+    async def spy_run(*args, **kwargs):
+        nonlocal push_attempted
+        if args and args[0] == "push":
+            push_attempted = True
+        return await real_run(*args, **kwargs)
+
+    monkeypatch.setattr(svc, "_run", spy_run)
+
+    (data_dir / "x.jsonl").write_text("x\n")
+    await svc.bank("change")
+    await svc._push_task
+
+    assert push_attempted is False  # refused before invoking git push
+    assert not (data_dir / SIDECAR).exists()
+    assert svc._last_push_error_class is None
+
+
+async def test_real_push_leaves_no_secret_in_git_config(tmp_path):
+    """After a real, successful push the repo's `.git/config` carries no credential — the
+    service never sets a remote or writes a token; the origin URL stays credential-free."""
+    bare = init_bare_remote(tmp_path / "remote.git")
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    (data_dir / "ledger.jsonl").write_text("{}\n")
+    run_git(data_dir, "remote", "add", "origin", file_url(bare))
+
+    await svc.bank("banked change")
+    await svc._push_task
+    assert (data_dir / SIDECAR).exists()  # the push really happened
+
+    config_text = (data_dir / ".git" / "config").read_text(encoding="utf-8")
+    for secret_marker in ("x-access-token", "ghp_", "password", "oauth", "token"):
+        assert secret_marker not in config_text.lower()
+    origin_url = run_git(data_dir, "config", "--local", "remote.origin.url").stdout.strip()
+    assert urlparse(origin_url).username is None  # no embedded credentials
+
+
+# ------------------------------------------------------- never mutates local history
+
+async def test_push_never_fetches_pulls_merges_or_rebases(tmp_path, monkeypatch):
+    """The transport is push-only: across a full bank+push it runs `push` (and read-only
+    `ls-remote`/`rev-parse`/`remote get-url`) but NEVER pull/merge/rebase/fetch."""
+    bare = init_bare_remote(tmp_path / "remote.git")
+    data_dir = tmp_path / "data"
+    svc = await _inited_repo(data_dir)
+    (data_dir / "a.jsonl").write_text("a\n")
+    run_git(data_dir, "remote", "add", "origin", file_url(bare))
+
+    verbs: list[str] = []
+    real_run = svc._run
+
+    async def recording_run(*args, **kwargs):
+        verbs.append(args[0] if args else "")
+        return await real_run(*args, **kwargs)
+
+    monkeypatch.setattr(svc, "_run", recording_run)
+
+    await svc.bank("change")
+    await svc._push_task
+
+    assert "push" in verbs
+    for forbidden in ("pull", "merge", "rebase", "fetch"):
+        assert forbidden not in verbs, f"backup must never run git {forbidden}"
+
+
+# ---------------------------------------------------------------- born-safe cycle
+
+async def test_push_cycle_never_lets_an_exception_escape(tmp_path, monkeypatch):
+    """Even an unexpected error inside an attempt is swallowed — the cycle runs as a bare task,
+    so an escape would surface as an unhandled-exception warning and (worse) a lost lock."""
+    svc = await _inited_repo(tmp_path / "data")
+
+    async def boom():
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(svc, "_push_once", boom)
+    await svc._push_cycle()  # must not raise
