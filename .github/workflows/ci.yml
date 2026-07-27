@@ -10,6 +10,11 @@ jobs:
   test:
     name: pytest (py3.12)
     runs-on: ubuntu-latest
+    # Hard backstop so a hung test can never sit "in_progress" for the runner's full 6h.
+    # The suite runs in well under a minute; 10m absorbs cold installs with wide margin.
+    # The per-test `timeout` (pyproject) is the fine-grained fail-fast that pinpoints which
+    # test wedged — this only bounds pathological cases the per-test signal can't catch.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
