@@ -56,7 +56,7 @@
 {% if drop_dir_enabled %}
 <form class="scan-drop-form" hx-post="/ui/intake/scan" hx-target="#intake-scan-result" hx-swap="innerHTML">
   <button type="submit" class="button scan-drop-button">Scan drop folder</button>
-  <small class="scan-hint">Ingest receipts a script dropped in the folder &mdash; nothing leaves this machine.</small>
+  <small class="scan-hint">Ingest receipts a script dropped in the folder on this machine.</small>
 </form>
 {% endif %}
 {% else %}
