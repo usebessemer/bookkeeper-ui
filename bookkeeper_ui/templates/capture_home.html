@@ -3,6 +3,19 @@
 {% block title %}Receipts — Bookkeeper{% endblock %}
 {% block content %}
 
+{# The page-level LOUD nag (Slice 6 · #87). Leads the front door — a non-technical
+   owner cannot miss that this machine is the only copy of their books. Rendered only
+   for the not-backed states (unconfigured / never-backed / a freshness- or error-
+   escalated pending); the amber `pending` and green `backed_up` states carry only the
+   quiet nav chip, no banner. Born-safe: home always injects `backup`, and a fresh
+   install collapses to `loud`, so the banner shows by default until a verified push. #}
+{% if backup is defined and backup and backup.loud %}
+<div class="backup-banner loud" role="alert">
+  <strong>{{ backup.banner_headline }}</strong>
+  <p>{{ backup.banner_body }}</p>
+</div>
+{% endif %}
+
 {% if closed_banners %}
 {# Every signed-closed period still surfaces on the front door (the closed-period
    import/confirm guards refuse a write touching one). Kept from the old import

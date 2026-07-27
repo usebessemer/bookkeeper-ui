@@ -48,6 +48,13 @@ from bookkeeper.skills.reconcile import (
 from bookkeeper.skills.track_tax import TaxFlag, TaxSummary
 
 from bookkeeper_ui.anomaly_reviews import AnomalyReview
+from bookkeeper_ui.backup import (
+    STATE_BACKED_UP,
+    STATE_NEVER_BACKED,
+    STATE_PENDING,
+    STATE_UNCONFIGURED,
+    BackupStatus,
+)
 from bookkeeper_ui.candidates import ACTION_CONFIRM, CandidateDecision, CandidateSubmission
 from bookkeeper_ui.confirmations import Confirmation
 from bookkeeper_ui.ledger_store import transaction_key
@@ -1423,3 +1430,118 @@ class ScanResultOut(BaseModel):
     ingested: int
     duplicates: int
     errors: list[ScanFileErrorOut]
+
+
+# --- Slice 6 · #87: the backup safe-signal projection ----------------------
+# The global nav chip + the capture-home loud banner render THIS, never a raw
+# `BackupStatus`. It collapses the four-state `BackupStatus` ladder (+ its
+# `escalated` nag flag) into the THREE visual states #87 renders, so the state→UI
+# mapping lives in one unit-tested place, not scattered across templates.
+
+
+def _loud_reason_and_body(status: BackupStatus) -> tuple[str, str]:
+    """The reason token + human banner body for a LOUD not-backed state.
+
+    `unconfigured`/`never_backed` are the born-safe pre-first-push rungs (this machine
+    is still the only copy); a freshness- or error-escalated `pending` is a backup that
+    was working and has stopped keeping up (stale clock, a stuck token, or a diverged
+    remote). The copy speaks to a non-technical owner — "off this machine", never git.
+    """
+    if status.state == STATE_UNCONFIGURED:
+        return "unconfigured", (
+            "No backup has been set up yet, so this machine is the only copy of your "
+            "books. Set up backup so every change is safely copied off this machine."
+        )
+    if status.state == STATE_NEVER_BACKED:
+        return "never_backed", (
+            "Backup is set up but nothing has been safely copied off this machine yet "
+            "— this machine is still the only copy of your books."
+        )
+    # An escalated `pending`: backup was working and has fallen behind. Name why.
+    n = status.unpushed_count
+    if status.last_error_class == "auth-failed":
+        return "auth", (
+            f"Backup can't sign in to your backup destination, so {n} recent "
+            "change(s) are still only on this machine. Check your backup sign-in."
+        )
+    if status.last_error_class == "rejected":
+        return "rejected", (
+            f"Your backup destination refused the latest backup, so {n} recent "
+            "change(s) are still only on this machine. This needs attention."
+        )
+    return "stale", (
+        f"Your books haven't been backed up in over 3 days — {n} recent change(s) "
+        "are still only on this machine."
+    )
+
+
+class BackupSignalOut(BaseModel):
+    """The backup safe-signal the global nav chip + capture-home banner render (#87).
+
+    Collapses `BackupStatus`'s four-rung ladder into three visual states: `backed_up`
+    (green, the ONLY ✓ — HEAD equals the verified-pushed sha, with the push-completion
+    time), `pending` (amber, the honest unpushed count), and `not_backed` (the LOUD
+    danger state — `unconfigured`, `never_backed`, or a freshness/error-escalated
+    `pending`, which also raises the page-level banner).
+
+    Born-safe: `from_status(None)` — no backup service wired, or no status available —
+    collapses to the LOUD `not_backed` state, never a blank or optimistic default. The
+    chip template applies the same rule for a render that omits `backup` entirely, so a
+    missed context can never read falsely green.
+    """
+
+    state: Literal["backed_up", "pending", "not_backed"]
+    css_class: str = Field(description="The .status-local modifier: backed-up/pending/not-backed.")
+    label: str = Field(description="The mono chip readout (CSS uppercases it).")
+    show_check: bool = Field(description="The ✓ — true ONLY for backed_up (HEAD == pushed sha).")
+    last_push_time: str | None = Field(
+        description="ISO push-completion time; set ONLY on backed_up, else null."
+    )
+    unpushed_count: int
+    loud: bool = Field(description="Raise the capture-home loud banner (not_backed only).")
+    reason: str = Field(default="", description="Sub-state token for banner nuance / tests.")
+    banner_headline: str | None = None
+    banner_body: str | None = None
+
+    @classmethod
+    def from_status(cls, status: BackupStatus | None) -> "BackupSignalOut":
+        # Born-safe: no service / no status → the LOUD not-backed alarm, never green.
+        if status is None:
+            return cls(
+                state="not_backed", css_class="not-backed", label="Not backed up",
+                show_check=False, last_push_time=None, unpushed_count=0, loud=True,
+                reason="unconfigured",
+                banner_headline="Your books are not backed up",
+                banner_body=(
+                    "No backup has been set up yet, so this machine is the only copy of "
+                    "your books. Set up backup so every change is safely copied off this "
+                    "machine."
+                ),
+            )
+        if status.state == STATE_BACKED_UP:
+            return cls(
+                state="backed_up", css_class="backed-up", label="Backed up",
+                show_check=True,
+                last_push_time=(
+                    status.last_push_time.isoformat()
+                    if status.last_push_time is not None
+                    else None
+                ),
+                unpushed_count=0, loud=False,
+            )
+        if status.state == STATE_PENDING and not status.escalated:
+            return cls(
+                state="pending", css_class="pending", label="Backing up",
+                show_check=False, last_push_time=None,
+                unpushed_count=status.unpushed_count, loud=False, reason="pending",
+            )
+        # Everything else — unconfigured, never_backed, or an escalated pending — is
+        # the LOUD not-backed alarm. The chip reads "Not backed up"; the banner body
+        # carries the nuance. `show_check` is never true here, so it can't read green.
+        reason, body = _loud_reason_and_body(status)
+        return cls(
+            state="not_backed", css_class="not-backed", label="Not backed up",
+            show_check=False, last_push_time=None,
+            unpushed_count=status.unpushed_count, loud=True, reason=reason,
+            banner_headline="Your books are not backed up", banner_body=body,
+        )
