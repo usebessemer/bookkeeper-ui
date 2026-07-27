@@ -48,11 +48,14 @@ default (see its docstring) for ``uvicorn bookkeeper_ui.api:build_app_from_env
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
 import json
+import logging
 import os
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -164,6 +167,14 @@ from bookkeeper_ui.views import (
 from bookkeeper_ui.waivers import FileWaiverStore, Waiver
 from bookkeeper_ui.web import register_ui
 
+logger = logging.getLogger(__name__)
+
+# How often the app's background sweep (Issue #86) reconciles the backup with no banked
+# action — committing a crash-orphan and flushing an idle-but-unbacked session or a recovered
+# network. A local single-user cadence: frequent enough to self-heal within minutes, quiet
+# enough to barely register (each tick is a cheap `git add`/`diff`, and its push coalesces).
+_BACKUP_SWEEP_INTERVAL_SECONDS = 300.0
+
 # The intake port's artifact allowlist (AC #3): the media types an extractor may
 # submit. A candidate declaring anything else is a 422 — nothing is written.
 ALLOWED_ARTIFACT_MEDIA_TYPES = frozenset(
@@ -181,6 +192,25 @@ ALLOWED_ARTIFACT_MEDIA_TYPES = frozenset(
 # overrides it at `build_app_from_env`; a test can pass `max_artifact_bytes` to
 # `create_app` directly. A candidate whose decoded bytes exceed it is a 422.
 DEFAULT_MAX_ARTIFACT_BYTES = 10 * 1024 * 1024  # 10 MiB
+
+
+async def _run_periodic_backup_sweep(backup: BackupService, interval: float) -> None:
+    """Loop `backup.sweep()` every `interval` seconds until cancelled (Issue #86).
+
+    The launch sweep runs once inline at startup; this drives the *periodic* re-sweep after it.
+    Fully best-effort: `sweep()` never raises, but a defensive guard logs anything unexpected and
+    keeps looping so one bad tick can never kill the schedule. `CancelledError` (lifespan
+    shutdown) is re-raised so the task tears down cleanly. Sleeping first means the first periodic
+    tick lands one interval *after* the startup sweep, not immediately on top of it.
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            await backup.sweep()
+        except asyncio.CancelledError:
+            raise  # shutdown — let the task cancel cleanly.
+        except Exception as exc:  # never let a single tick's failure kill the loop.
+            logger.warning("periodic backup sweep tick failed: %s", exc)
 
 
 def _require_nonblank(value: str | None, field: str) -> str:
@@ -320,6 +350,11 @@ def create_app(
     straight through to `register_ui` so the HTML twins bank through the *same* service.
     When `backup is None` every `_bank` is a no-op, so the app behaves exactly as
     pre-feature and every existing call site keeps working unchanged.
+
+    The wired `backup` also drives the app's one lifespan task (Slice-6 · #86): a **launch
+    sweep** on startup (crash-orphan recovery + unpushed re-verification + idle-flush) and a
+    best-effort **periodic sweep** thereafter, so a session that ended committed-but-unpushed,
+    or a recovered network, self-heals with no banked action. Born-inert with `backup is None`.
     """
     # The append-only export log lives beside the per-export folders, under the
     # injected export dir. Unwired → no export surface (the routes 503).
@@ -332,12 +367,46 @@ def create_app(
     artifact_cap = (
         max_artifact_bytes if max_artifact_bytes is not None else DEFAULT_MAX_ARTIFACT_BYTES
     )
+
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        """Drive the backup sweep (Issue #86) — the app's one startup/shutdown task.
+
+        On startup, run one **launch sweep** inline (awaited): commit any crash-orphaned
+        change, re-verify unpushed against the verified sidecar, and flush an idle-but-unbacked
+        session — all before the first request is served. Then spawn a best-effort **periodic**
+        sweep so an idle session still flushes and a recovered network self-heals with no banked
+        action. On shutdown, cancel the periodic task and await its clean teardown.
+
+        Born-inert: with `backup is None` (the default) nothing runs — no sweep, no task, no
+        `.git` — so the app is exactly pre-feature. The launch sweep is wrapped so even a
+        pathological backup fault can never stop the app from starting (backup is never
+        load-bearing).
+        """
+        sweep_task: asyncio.Task[None] | None = None
+        if backup is not None:
+            try:
+                await backup.sweep()  # launch sweep: crash-orphan recovery + re-verify + flush.
+            except Exception as exc:  # best-effort — backup must never block app startup.
+                logger.warning("startup backup sweep failed: %s", exc)
+            sweep_task = asyncio.create_task(
+                _run_periodic_backup_sweep(backup, _BACKUP_SWEEP_INTERVAL_SECONDS)
+            )
+        try:
+            yield
+        finally:
+            if sweep_task is not None:
+                sweep_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await sweep_task
+
     app = FastAPI(
         title="bookkeeper-ui API",
         description=(
             "Local, single-user read/write API for the Bessemer Bookkeeper: "
             "import → categorize → confirm/correct → read the categorized ledger."
         ),
+        lifespan=_lifespan,
     )
 
     async def _bank(message: str) -> None:

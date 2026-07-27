@@ -74,6 +74,11 @@ _IDENTITY_EMAIL = "backup@bookkeeper.local"
 
 _INITIAL_COMMIT_MESSAGE = "Initialize Bookkeeper backup repository"
 
+# The sweep-recovery commit subject (Issue #86). A sweep-committed change is NOT a banked
+# business event, so it is deliberately NOT a `banked: …` subject — it is the recovery of an
+# uncommitted change a crash-mid-write left orphaned, made auditable as exactly that.
+_SWEEP_COMMIT_MESSAGE = "Bookkeeper backup sweep — recovered uncommitted changes"
+
 # The snapshot of the out-of-tree `config.json`, written into the backup tree so a
 # clone is self-contained. Not matched by any `.gitignore` pattern → always tracked.
 _CONFIG_SNAPSHOT_NAME = "config.snapshot.json"
@@ -341,6 +346,36 @@ class BackupService:
         """
         await self.commit(message)
         self._schedule_push()
+
+    async def sweep(self) -> None:
+        """Reconcile the repo with no banked action — the startup/idle self-heal (Issue #86).
+
+        Best-effort and never raising (it runs as a bare lifespan task). Three jobs, in order:
+
+        1. **Crash-orphan recovery.** `commit()` stages and commits any uncommitted change a
+           crash-mid-write left in the tree — a no-op on a clean tree. This is also what makes
+           launch re-verification honest: a HEAD level with the sidecar but a *dirty* tree reads
+           `backed_up` (status counts commits, not the worktree), a stale green; committing the
+           orphan advances HEAD past the sidecar so the very next `status()` reverts to `pending`.
+        2. **Re-verify unpushed.** Recompute HEAD-vs-the-verified-sidecar (never `@{u}`), so a
+           session that ended committed-but-unpushed — or that just recovered an orphan — is seen.
+        3. **Flush.** If anything is unpushed, schedule a push. `_schedule_push` already coalesces
+           (it never stacks on an in-flight cycle), so a sweep firing next to a banked write's push
+           spawns no redundant second cycle. With `origin` unreachable the cycle is an honest,
+           non-blocking failure that leaves state pending for the next sweep; with a recovered
+           network it self-heals — all with no banked action required.
+
+        No-op when the repo isn't inited yet: nothing has been banked, so there is nothing to
+        sweep, and the sweep must never create the repo the first `bank()` creates lazily (that
+        would turn an unconfigured app into one carrying a `.git`).
+        """
+        if not (self._data_dir / ".git").exists():
+            return  # never-banked / unconfigured: nothing to sweep, and never init here.
+        await self.commit(_SWEEP_COMMIT_MESSAGE)  # crash-orphan recovery; no-op on a clean tree.
+        sidecar = self._read_verified_sidecar()
+        pushed_sha = sidecar[0] if sidecar is not None else None
+        if await self._count_unpushed(pushed_sha) > 0:
+            self._schedule_push()
 
     def _schedule_push(self) -> None:
         """Start a push cycle unless one is already in flight (coalesced).
