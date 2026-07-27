@@ -16,8 +16,9 @@
   <span class="readout">{{ sig.label if sig else "Not backed up" }}</span>
   {% if sig and sig.show_check %}<span class="check" aria-hidden="true">&check;</span>{% endif %}
   {# backed_up carries the verified push-COMPLETION time (the sidecar's `pushed_at`,
-     never the attempt time); it is set only on backed_up, so it prints only there. #}
+     never the attempt time); it is set only on backed_up, so it prints only there.
+     The pending count is NOT a separate span — it rides inside the readout label
+     ("N changes not yet backed up"), so the chip states no double count. #}
   {% if sig and sig.last_push_time %}<time class="ts" datetime="{{ sig.last_push_time }}">{{ sig.last_push_time[:16] | replace("T", " ") }}</time>{% endif %}
-  {% if sig and sig.state == "pending" and sig.unpushed_count %}<span class="count">{{ sig.unpushed_count }} unsaved</span>{% endif %}
 </span>
 {% endmacro %}

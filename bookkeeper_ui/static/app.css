@@ -146,7 +146,6 @@ body {
   border: 1px solid var(--line-2); border-radius: var(--r-md); padding: 0.32rem 0.6rem;
 }
 .status-local .led { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
-.status-local .count { font-weight: 500; letter-spacing: 0.06em; opacity: 0.85; }
 .status-local .check { font-weight: 700; }
 .status-local .ts { font-weight: 500; letter-spacing: 0.04em; opacity: 0.85; }
 

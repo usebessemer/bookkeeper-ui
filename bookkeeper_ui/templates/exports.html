@@ -5,13 +5,14 @@
    A pure read of the SAME `exports.jsonl` the JSON `GET /exports` serializes (no second
    reader, no writes). Each row carries its id/period/status/time/divergence plus one
    guarded-download link per Core file (each → the `GET /ui/exports/{id}/{name}` route,
-   which serves the local file to the local browser — nothing is transmitted). #}
+   which serves the local file to the local browser — the app never sends an export
+   onward for the user). #}
 <h1>Exports</h1>
 
 <p class="lead">
   Every accountant package you have exported, newest first. Each file downloads to
-  this machine only &mdash; nothing is transmitted. You send it to your accountant
-  by hand.
+  this machine, and the app never sends it to your accountant for you &mdash; you do
+  that by hand.
 </p>
 
 {% if exports %}

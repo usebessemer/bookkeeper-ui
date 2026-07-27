@@ -1530,10 +1530,17 @@ class BackupSignalOut(BaseModel):
                 unpushed_count=0, loud=False,
             )
         if status.state == STATE_PENDING and not status.escalated:
+            # The spec's honest status readout (§6/§9): "N changes not yet backed up",
+            # NOT "Backing up" — an offline-stalled-but-unescalated pending is not an
+            # active upload, and the ownership/status framing must not overstate it. The
+            # count lives in the label (so the redundant "N unsaved" chip span retires);
+            # `unpushed_count` stays on the model as the machine-readable datum.
+            n = status.unpushed_count
             return cls(
-                state="pending", css_class="pending", label="Backing up",
+                state="pending", css_class="pending",
+                label=f"{n} change{'' if n == 1 else 's'} not yet backed up",
                 show_check=False, last_push_time=None,
-                unpushed_count=status.unpushed_count, loud=False, reason="pending",
+                unpushed_count=n, loud=False, reason="pending",
             )
         # Everything else — unconfigured, never_backed, or an escalated pending — is
         # the LOUD not-backed alarm. The chip reads "Not backed up"; the banner body

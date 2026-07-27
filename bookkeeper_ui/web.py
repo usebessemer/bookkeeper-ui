@@ -1220,8 +1220,9 @@ def register_ui(
     # The read/serve surface over what B wrote — the SAME append-only `exports.jsonl`
     # log the JSON `GET /exports` reads (`export_store`), never a second reader. The
     # listing lets a human *see the log*; the download lets him *pull the local files*
-    # (`FileResponse` from the local exports dir to the local browser — the entire
-    # transport story; nothing leaves the machine). The export action (`POST /ui/export`)
+    # (`FileResponse` from the local exports dir to the local browser — the app never
+    # sends an export onward for the user; he hands the package to his accountant
+    # himself). The export action (`POST /ui/export`)
     # is the human twin of B's JSON `POST /export`: it re-obtains the package from the
     # app's own stores and reuses B's `export_package` (no second write path).
 

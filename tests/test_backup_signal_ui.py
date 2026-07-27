@@ -100,6 +100,17 @@ def test_pending_is_amber_with_the_honest_count_and_no_timestamp():
     assert sig.show_check is False
     assert sig.loud is False
     assert sig.last_push_time is None  # pending shows the count, not a (stale) green time
+    # The spec's honest status readout — the count rides IN the label; never "Backing up",
+    # which would overstate an offline-stalled-but-unescalated pending as active upload.
+    assert sig.label == "3 changes not yet backed up"
+
+
+def test_pending_label_is_singular_for_one_change():
+    """The pending readout agrees in number — one unpushed commit reads "1 change"."""
+    sig = BackupSignalOut.from_status(
+        _status(STATE_PENDING, unpushed=1, last_push_time=PUSH_AT, escalated=False)
+    )
+    assert sig.label == "1 change not yet backed up"
 
 
 def test_escalated_pending_becomes_loud_not_backed():
@@ -174,7 +185,8 @@ def test_chip_renders_the_three_state_tokens():
     assert 'class="status-local backed-up"' in backed
     assert "&check;" in backed  # the ✓ shows only here
     assert 'class="status-local pending"' in pending
-    assert "4 unsaved" in pending  # the honest unpushed count
+    assert "4 changes not yet backed up" in pending  # the spec's honest status readout
+    assert "Backing up" not in pending  # never overstates an offline-stalled pending
     assert "&check;" not in pending
     assert 'class="status-local not-backed"' in loud
     assert "&check;" not in loud
@@ -262,7 +274,7 @@ async def test_pending_home_is_amber_with_no_banner(tmp_path, examples_dir):
     async with _client(_app(tmp_path, examples_dir, backup)) as client:
         html = (await client.get("/")).text
     assert 'class="status-local pending"' in html
-    assert "2 unsaved" in html
+    assert "2 changes not yet backed up" in html
     assert "backup-banner loud" not in html
 
 
