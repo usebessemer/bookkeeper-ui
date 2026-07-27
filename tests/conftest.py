@@ -7,11 +7,13 @@ repo). The `examples_dir` fixture points at the committed runnable dataset.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 
 from bookkeeper.model import StatementLine, Transaction
 
@@ -59,3 +61,29 @@ def make_stmt_line(
 @pytest.fixture
 def examples_dir() -> Path:
     return EXAMPLES_DIR
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _settle_background_tasks():
+    """Drain any still-pending task on the test's event loop once the body returns.
+
+    A banked write schedules its push **off the request path** (`BackupService.bank` →
+    `_schedule_push` → a background task that spawns a `git` subprocess). Tests that hold
+    the service drain it explicitly (the local `_settle` helpers); ones driven only through
+    `create_app` / `build_app_from_env` — e.g. the `build_app_from_env` export tests — can't
+    reach the service buried in the handler closure, so a banked export/sign leaves that push
+    task pending. With pytest-asyncio's per-test event loops, a task still holding a subprocess
+    transport when its loop is torn down **hangs on Linux** (the CI stall) even though macOS
+    reaps it cleanly. Awaiting the stragglers here — never *cancelling*, which would orphan the
+    live subprocess — makes every test self-contained regardless of whether it remembered to
+    settle. Bounded, so a genuinely stuck task fails fast under the per-test `timeout` instead
+    of blocking teardown; best-effort, so this never fails a test on its own.
+    """
+    yield
+    try:
+        current = asyncio.current_task()
+        pending = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+        if pending:
+            await asyncio.wait(pending, timeout=10)
+    except Exception:  # teardown hygiene must never turn a green test red.
+        pass

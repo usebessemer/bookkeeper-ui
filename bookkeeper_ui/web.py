@@ -63,6 +63,7 @@ from bookkeeper_ui.anomaly_reviews import (
     FileAnomalyReviewStore,
     derive_flag_id,
 )
+from bookkeeper_ui.backup import BackupService
 from bookkeeper_ui.candidates import (
     ACTION_CONFIRM,
     ACTION_REJECT,
@@ -220,6 +221,7 @@ def register_ui(
     intake_drop_dir: str | Path | None = None,
     max_artifact_bytes: int | None = None,
     attribution_target_labels: dict[str, str] | None = None,
+    backup: BackupService | None = None,
 ) -> None:
     """Mount the HTML UI on `app`, reading through the same injected stores as #2.
 
@@ -267,6 +269,15 @@ def register_ui(
     config JSON in `build_app_from_env` — and is defaulted to `{}` in the template
     context. The confirmed value on the wire is always the opaque id string; the label
     map is presentation-only and never enters validation.
+
+    `backup` (Slice-6 · #85) is the **optional** `BackupService` (default `None` →
+    born-inert), threaded from `create_app` so these HTML twins bank through the *same*
+    service the JSON surface does — one commit per banked business event on Javed's
+    surface (a confirm, a reconcile resolution, an anomaly ack, a waiver, a sign, an
+    export, a receipt filed, an import batch). Each fires `await _bank(<semantic msg>)`:
+    the local commit is awaited (the durability floor) and the push is scheduled off the
+    request path, so a slow/failing push never delays an htmx response. With `backup is
+    None` every `_bank` is a no-op, so the UI behaves exactly as pre-feature.
     """
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -275,6 +286,17 @@ def register_ui(
     artifact_cap = (
         max_artifact_bytes if max_artifact_bytes is not None else DEFAULT_MAX_ARTIFACT_BYTES
     )
+
+    async def _bank(message: str) -> None:
+        """Fire one best-effort backup commit for a banked business event (born-inert).
+
+        With no backup service wired (`backup is None`) this is a no-op, so the HTML
+        surface behaves exactly as pre-feature. When wired, `bank()` awaits the local
+        commit (the durability floor) then schedules the push off the request path — and
+        never raises, so a broken backup can never break an htmx write.
+        """
+        if backup is not None:
+            await backup.bank(message)
 
     @app.get("/", response_class=HTMLResponse, summary="Capture home (the receipts landing)")
     async def home(request: Request) -> HTMLResponse:
@@ -404,6 +426,9 @@ def register_ui(
 
         for transaction in transactions:
             await ledger_store.store(transaction)
+
+        # Bank the whole batch as ONE commit (not per row) — the import is one event.
+        await _bank(f"banked: import {len(transactions)} transactions")
 
         # Which periods the file actually landed in (by each row's own date) — the
         # convenience links, so a multi-period file is navigable and a typo'd
@@ -583,6 +608,7 @@ def register_ui(
                 decided_at=datetime.now(timezone.utc),
             )
         )
+        await _bank(f"banked: confirm {transaction_id} as {account}")
 
         # Recompute how many still need a human, so the live counter and the
         # "all caught up" empty-state stay honest as the queue shrinks.
@@ -759,6 +785,7 @@ def register_ui(
                 decided_at=datetime.now(timezone.utc),
             )
         )
+        await _bank(f"banked: reconcile {decision} {txn_id or stmt_id}")
 
         # Recompute the open-items count off the same projection, so the live
         # counter and the "all reconciled" empty state stay honest as cards leave.
@@ -933,6 +960,7 @@ def register_ui(
             source=SOURCE_HUMAN,
         )
         await anomaly_review_store.record(review)
+        await _bank(f"banked: acknowledge anomaly {flag_id} ({period})")
 
         acknowledged = AnomalyOut(
             id=flag_id,
@@ -994,6 +1022,7 @@ def register_ui(
             note=note.strip() or None,
         )
         await waiver_store.record(waiver)
+        await _bank(f"banked: waive reconciliation {period}")
         return templates.TemplateResponse(
             request,
             "_reconciliation_gate.html",
@@ -1098,6 +1127,7 @@ def register_ui(
             signed_at=datetime.now(timezone.utc),
         )
         await close_store.record(record)
+        await _bank(f"banked: signed close {period}")
         return templates.TemplateResponse(
             request,
             "_close_signed.html",
@@ -1322,6 +1352,7 @@ def register_ui(
             app_version=__version__,
         )
         await export_store.record(record)
+        await _bank(f"banked: export {period}")
         return templates.TemplateResponse(
             request,
             "_export_result.html",
@@ -1471,6 +1502,7 @@ def register_ui(
                     reject_reason=reject_reason.strip() or None,
                 )
             )
+            await _bank(f"banked: reject candidate {candidate_id}")
             pending = await _intake_pending_count(
                 candidate_store, candidate_decision_store
             )
@@ -1586,6 +1618,10 @@ def register_ui(
                     "attribution_target_labels": intake_labels,
                 },
             )
+
+        # Bank AFTER `apply_confirm` returns — the write core stays a pure leaf; the
+        # caller owns the backup commit for the receipt it just filed.
+        await _bank(f"banked: file receipt {v_vendor} {v_amount}")
 
         pending = await _intake_pending_count(candidate_store, candidate_decision_store)
         # "M filed today" is the pulse's second number — a confirm that filed a fresh row
