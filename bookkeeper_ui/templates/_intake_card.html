@@ -10,8 +10,15 @@
 
    Deliberately NO confidence and NO category/account element anywhere (AC 5): the
    extractor emits no confidence, and the account is proposed downstream by the
-   existing confirm queue — rendering either here would fabricate trust. #}
-<div class="card intake" id="card-{{ c.candidate_id }}">
+   existing confirm queue — rendering either here would fabricate trust.
+
+   Direction B (DS-2): the receipt-hero card — an instrument .card-strip header
+   (id · vendor · state pill · amount) over the two-pane receipt|fields body, a
+   tinted .suggest-block holding the attribution select (reason line ABOVE Confirm),
+   and the mono trust trail. The proposed/flagged STATE is `attribution_target_id is
+   none` (no suggestion → "Needs a job", the honest-absence branch). #}
+{% set intake_state = "flagged" if c.attribution_target_id is none else "proposed" %}
+<div class="card intake {{ intake_state }}" id="card-{{ c.candidate_id }}">
   {% if error %}
   {# Re-validation failure — the human keeps their edits and sees which field failed;
      the card is not removed and the pending counter is left untouched. #}
@@ -20,6 +27,16 @@
     <p>Fix the field and confirm again &mdash; your edits are kept.</p>
   </div>
   {% endif %}
+
+  {# Instrument header strip — the fast-scan triage row: id · vendor · state · amount.
+     The vendor + amount are read-only echoes of the editable fields below (the human
+     still edits the verbatim values in the form). #}
+  <div class="card-strip">
+    <span class="card-id">{{ c.candidate_id }}</span>
+    <span class="vendor-label">{{ c.vendor }}</span>
+    <span class="state-pill">{{ "Needs a job" if c.attribution_target_id is none else "Proposed" }}</span>
+    <span class="amount-label">${{ c.amount }}</span>
+  </div>
 
   <div class="intake-grid">
     <div class="artifact">
@@ -45,52 +62,72 @@
         <input type="hidden" name="action" value="confirm">
         <input type="hidden" name="period" value="{{ period }}">
 
+        {# The mono numeric row — amount · tax · date side by side. #}
+        <div class="grid3">
+          <label>Amount
+            <input type="text" name="amount" value="{{ c.amount }}" inputmode="decimal" required>
+          </label>
+          <label>Tax
+            <input type="text" name="tax" value="{{ c.tax }}" inputmode="decimal">
+          </label>
+          <label>Date
+            <input type="text" name="date" value="{{ c.date }}" required>
+          </label>
+        </div>
         <label>Vendor
           <input type="text" name="vendor" value="{{ c.vendor }}" required>
-        </label>
-        <label>Amount
-          <input type="text" name="amount" value="{{ c.amount }}" inputmode="decimal" required>
-        </label>
-        <label>Tax
-          <input type="text" name="tax" value="{{ c.tax }}" inputmode="decimal">
-        </label>
-        <label>Date
-          <input type="text" name="date" value="{{ c.date }}" required>
         </label>
         <label>Description
           <input type="text" name="description" value="{{ c.description }}">
         </label>
-        <label>Attribution target
-          {# The id strings render with their human label when the sidecar map has
-             one, else the raw id; the <option value> and the pre-select both use the
-             id string (AC 16), never a warm name. A null-attribution candidate opens
-             on a disabled "choose…" placeholder — Confirm is blocked (required + the
-             server's defensive 422) until the human picks a target. #}
-          <select name="attribution_target_id" required>
-            {% if c.attribution_target_id is none %}
-            <option value="" selected disabled>choose&hellip;</option>
-            {% endif %}
-            {% for t in attribution_targets %}
-            <option value="{{ t }}"{% if t == c.attribution_target_id %} selected{% endif %}>{{ attribution_target_labels.get(t, t) }}</option>
-            {% endfor %}
-          </select>
-        </label>
 
-        {# The reason line (M3) — ONLY when a target was suggested (non-null), so a
-           failure reason folded into a null-attribution candidate's source_hint is
-           never mis-rendered as attribution provenance. Sits ABOVE the Confirm
-           button (H4) so a rapid one-tap confirm still passes the human's eye over
-           the suggested job. Never a manufactured confidence — the source_hint is
-           the trust signal, and it is true. #}
-        {% if c.attribution_target_id is not none %}
-        <p class="reason suggested">
-          {% if c.source == "receipt-intake" %}
-          from the email subject: '{{ c.source_hint }}'
-          {% else %}
-          suggested &mdash; {{ c.source_hint }}
+        {# The tinted suggested-job block: the attribution <select>, the reason line
+           (ABOVE Confirm), and the warmer plain-language state line. On honest
+           absence (`attribution_target_id is none`) it flips to the flagged tone,
+           renders NO reason line, and the language reads "No suggestion". #}
+        <div class="suggest-block{% if c.attribution_target_id is none %} flagged{% endif %}">
+          {# Honest absence: the heading is a directive, never a "suggested" claim
+             (AC17 forbids the word "suggested" on a null-attribution card). #}
+          <span class="cap-suggest">{% if c.attribution_target_id is none %}Choose a job{% else %}Suggested job{% endif %}</span>
+          <label>Attribution target
+            {# The id strings render with their human label when the sidecar map has
+               one, else the raw id; the <option value> and the pre-select both use the
+               id string (AC 16), never a warm name. A null-attribution candidate opens
+               on a disabled "choose…" placeholder — Confirm is blocked (required + the
+               server's defensive 422) until the human picks a target. #}
+            <select name="attribution_target_id" required>
+              {% if c.attribution_target_id is none %}
+              <option value="" selected disabled>choose&hellip;</option>
+              {% endif %}
+              {% for t in attribution_targets %}
+              <option value="{{ t }}"{% if t == c.attribution_target_id %} selected{% endif %}>{{ attribution_target_labels.get(t, t) }}</option>
+              {% endfor %}
+            </select>
+          </label>
+
+          {# The reason line (M3) — ONLY when a target was suggested (non-null), so a
+             failure reason folded into a null-attribution candidate's source_hint is
+             never mis-rendered as attribution provenance. Sits ABOVE the Confirm
+             button (H4) so a rapid one-tap confirm still passes the human's eye over
+             the suggested job. Never a manufactured confidence — the source_hint is
+             the trust signal, and it is true. #}
+          {% if c.attribution_target_id is not none %}
+          <p class="reason suggested">
+            {% if c.source == "receipt-intake" %}
+            from the email subject: '{{ c.source_hint }}'
+            {% else %}
+            suggested &mdash; {{ c.source_hint }}
+            {% endif %}
+          </p>
           {% endif %}
-        </p>
-        {% endif %}
+
+          {# Graft 1 — C's warmer plain-language state line (the header pill stays the
+             fast-scan element). Honest absence keeps its own copy; still no reason. #}
+          <p class="state-language">
+            <span class="dot" aria-hidden="true"></span>
+            {% if c.attribution_target_id is none %}No suggestion &middot; you choose the job{% else %}Suggested &middot; waiting for you to confirm{% endif %}
+          </p>
+        </div>
 
         <button type="submit" class="confirm">Confirm</button>
       </form>
@@ -112,7 +149,7 @@
     </div>
   </div>
 
-  {# Read-only trust trail — muted chips. No confidence chip, no category element. #}
+  {# Read-only trust trail — muted mono chips. No confidence chip, no category element. #}
   <div class="trail intake-trail">
     <span class="tag">source: {{ c.source }}</span>
     <span class="tag">submission: {{ c.submission_id }}</span>

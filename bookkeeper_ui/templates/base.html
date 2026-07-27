@@ -17,8 +17,8 @@
      The Receipts link is period-agnostic (`href="/"`, no `?period=`) — the intake
      queue is all-periods; every OTHER link keeps threading `nav_period` (the Package
      link in particular is asserted with its `?period=`). #}
-  <nav>
-    <span class="brand">Bookkeeper</span>
+  <nav aria-label="Primary">
+    <span class="brand"><span class="glyph" aria-hidden="true">B</span>Bookkeeper</span>
     <a href="/">Receipts</a>
     <a href="/ui/import-files?period={{ nav_period }}">Import files</a>
     <a href="/ui/queue?period={{ nav_period }}">Confirm queue</a>
@@ -27,6 +27,11 @@
     <a href="/ui/close?period={{ nav_period }}">Close review</a>
     <a href="/ui/package?period={{ nav_period }}">Package</a>
     <a href="/ui/exports?period={{ nav_period }}">Exports</a>
+    {# The spacer pushes a trailing status-chip SLOT to the right. The slot is left
+       EMPTY here for backup #87 to fill with the live 3-state safe-signal chip (it
+       needs backup.status()); the retired local-first chip is deliberately NOT
+       re-added. #}
+    <span class="nav-spacer"></span>
   </nav>
   <main>
     {% block content %}{% endblock %}
