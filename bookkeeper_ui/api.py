@@ -72,6 +72,7 @@ from bookkeeper_ui.anomaly_reviews import (
     FileAnomalyReviewStore,
     derive_flag_id,
 )
+from bookkeeper_ui.backup import BackupService
 from bookkeeper_ui.candidates import (
     ACTION_CONFIRM,
     ACTION_REJECT,
@@ -258,6 +259,7 @@ def create_app(
     intake_drop_dir: str | Path | None = None,
     max_artifact_bytes: int | None = None,
     attribution_target_labels: dict[str, str] | None = None,
+    backup: BackupService | None = None,
 ) -> FastAPI:
     """Build the API over an injected config + the four #1/Slice-2 stores.
 
@@ -308,6 +310,16 @@ def create_app(
     so it is read app-side (`build_app_from_env` pulls it from the config JSON) and
     threaded straight through to `register_ui` — default `None` → an empty map, so the
     `<select>` falls back to the raw ids and pre-Slice-5 call sites are unchanged.
+
+    `backup` (Slice-6 · #85) is the **optional** `BackupService` (default `None` →
+    born-inert) that turns the data dir into a git repo the app versions off-machine.
+    Every banked business event (a confirm, a resolution, an ack, a waiver, a sign, an
+    export, a receipt filed, an import batch) fires one `await backup.bank(<semantic
+    msg>)` — the local commit is awaited (the durability floor) and the network push is
+    scheduled off the request path, so no handler ever waits on the network. Threaded
+    straight through to `register_ui` so the HTML twins bank through the *same* service.
+    When `backup is None` every `_bank` is a no-op, so the app behaves exactly as
+    pre-feature and every existing call site keeps working unchanged.
     """
     # The append-only export log lives beside the per-export folders, under the
     # injected export dir. Unwired → no export surface (the routes 503).
@@ -327,6 +339,17 @@ def create_app(
             "import → categorize → confirm/correct → read the categorized ledger."
         ),
     )
+
+    async def _bank(message: str) -> None:
+        """Fire one best-effort backup commit for a banked business event.
+
+        Born-inert: with no backup service wired (`backup is None`) this is a no-op, so
+        the app behaves exactly as pre-feature. When wired, `bank()` awaits the local
+        commit (the durability floor) then schedules the push off the request path — and
+        never raises, so a broken backup can never propagate into a write handler.
+        """
+        if backup is not None:
+            await backup.bank(message)
 
     @app.get("/health", summary="Liveness check")
     async def health() -> dict[str, str]:
@@ -362,6 +385,9 @@ def create_app(
 
         for transaction in transactions:
             await ledger_store.store(transaction)
+
+        # Bank the whole batch as ONE commit (not per row) — the import is one event.
+        await _bank(f"banked: import {len(transactions)} transactions")
 
         return ImportResultOut(
             imported=len(transactions),
@@ -441,6 +467,9 @@ def create_app(
             decided_at=datetime.now(timezone.utc),
         )
         await confirmation_store.record(confirmation)
+        await _bank(
+            f"banked: confirm {confirmation.transaction_id} as {confirmation.account}"
+        )
         return ConfirmationOut.from_model(confirmation)
 
     @app.get("/ledger", response_model=LedgerOut, summary="The categorized ledger")
@@ -650,6 +679,7 @@ def create_app(
             decided_at=datetime.now(timezone.utc),
         )
         await reconciliation_store.record(reconciliation)
+        await _bank(f"banked: reconcile {decision} {txn_id or stmt_id}")
         return ReconcileResolutionOut.from_model(reconciliation)
 
     @app.get(
@@ -822,6 +852,7 @@ def create_app(
             app_version=__version__,
         )
         await export_store.record(record)
+        await _bank(f"banked: export {period}")
         return ExportResultOut.from_record(record)
 
     @app.get(
@@ -1088,6 +1119,7 @@ def create_app(
             signed_at=datetime.now(timezone.utc),
         )
         await close_store.record(record)
+        await _bank(f"banked: signed close {request.period}")
         return CloseRecordOut.from_record(record)
 
     # --- Slice 5 · A: the intake port — the machine-facing half of receipt capture.
@@ -1326,6 +1358,7 @@ def create_app(
                 reject_reason=request.reject_reason,
             )
             await decisions.record(decision)
+            await _bank(f"banked: reject candidate {cid}")
             return CandidateResolutionOut(
                 candidate_id=cid,
                 action=ACTION_REJECT,
@@ -1416,6 +1449,10 @@ def create_app(
                 ),
             ) from exc
 
+        # Bank AFTER `apply_confirm` returns — the write core stays a pure leaf; the
+        # caller owns the backup commit for the receipt it just filed.
+        await _bank(f"banked: file receipt {vendor} {amount}")
+
         already = result.ledger_outcome == LEDGER_OUTCOME_ALREADY_PRESENT
         message = (
             "Confirmed — this transaction is already in the ledger (a duplicate of an "
@@ -1499,6 +1536,7 @@ def create_app(
         intake_drop_dir=intake_drop_dir,
         max_artifact_bytes=artifact_cap,
         attribution_target_labels=attribution_target_labels,
+        backup=backup,
     )
 
     return app
@@ -1525,6 +1563,11 @@ def build_app_from_env() -> FastAPI:
                                    ingests candidate `*.json` files from; default
                                    ``<data_dir>/intake_drop`` (so the running app always
                                    has the drop-scan mode enabled).
+    - ``BOOKKEEPER_UI_BACKUP`` — the git-backup engine (Slice-6): ``on`` (default) wires
+                                   a `BackupService` over the data dir, so every banked
+                                   write is committed (and pushed, per the consultant
+                                   runbook's `origin`); ``off`` passes `backup=None`,
+                                   leaving the app exactly as pre-feature.
 
     The wiring is deliberately thin: #3 (the UI) owns the real run surface. This
     exists so the API is runnable on its own for local development and the tests
@@ -1552,6 +1595,14 @@ def build_app_from_env() -> FastAPI:
     # Absent → an empty map, so the `<select>` renders the raw attribution ids.
     raw_config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     attribution_target_labels = raw_config.get("attribution_target_labels") or {}
+    # The git-backup engine, on by default — only an explicit `off` disables it (so a
+    # mis-set value never silently drops backups). `config_path` is snapshotted into the
+    # tree before each commit, so a clone of the data dir alone is `clone → run` restorable.
+    backup = (
+        BackupService(data_dir, config_path=config_path)
+        if os.environ.get("BOOKKEEPER_UI_BACKUP", "on").strip().lower() != "off"
+        else None
+    )
     return create_app(
         config=load_config(config_path),
         ledger_store=FileLedgerStore(data_dir / "ledger.jsonl"),
@@ -1570,4 +1621,5 @@ def build_app_from_env() -> FastAPI:
         intake_drop_dir=intake_drop_dir,
         max_artifact_bytes=max_artifact_bytes,
         attribution_target_labels=attribution_target_labels,
+        backup=backup,
     )
