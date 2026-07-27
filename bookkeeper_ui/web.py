@@ -100,6 +100,7 @@ from bookkeeper_ui.reconciliations import (
 )
 from bookkeeper_ui.schemas import (
     AnomalyOut,
+    BackupSignalOut,
     CandidateOut,
     CloseRecordOut,
     CloseReviewOut,
@@ -298,6 +299,20 @@ def register_ui(
         if backup is not None:
             await backup.bank(message)
 
+    async def _backup_signal() -> BackupSignalOut:
+        """The live backup safe-signal (#87) for a full-page render (born-safe LOUD default).
+
+        Every full-page handler injects the result as ``backup`` so base.html's global nav
+        chip renders the truthful 3-state signal off a per-call `status()` — never a cached
+        boolean. With no service wired (`backup is None`) this is the LOUD not-backed state,
+        exactly as a fresh install must read; `status()` is read-only and lock-free, so it
+        never delays a render or collides with an in-flight commit/push. A render that omits
+        `backup` still defaults to LOUD in the chip macro, so a missed context can never read
+        falsely green — this helper just makes the truthful signal the easy path.
+        """
+        status = await backup.status() if backup is not None else None
+        return BackupSignalOut.from_status(status)
+
     @app.get("/", response_class=HTMLResponse, summary="Capture home (the receipts landing)")
     async def home(request: Request) -> HTMLResponse:
         """The capture home: the extraction-review queue as the app's front door.
@@ -355,6 +370,10 @@ def register_ui(
                 # A3: gate the "scan drop folder" button + win-state prompt on the
                 # feature being wired — the MUST capture flow never depends on it.
                 "drop_dir_enabled": drop_dir_enabled,
+                # #87: the live safe-signal — the nav chip AND the front-door loud
+                # banner. Born-safe: a fresh install collapses to the LOUD not-backed
+                # state, so an unbacked-up machine screams on the landing by default.
+                "backup": await _backup_signal(),
             },
         )
 
@@ -381,7 +400,11 @@ def register_ui(
         return templates.TemplateResponse(
             request,
             "import.html",
-            {"default_period": period, "closed_banners": closed_banners},
+            {
+                "default_period": period,
+                "closed_banners": closed_banners,
+                "backup": await _backup_signal(),
+            },
         )
 
     @app.post("/ui/import", response_class=HTMLResponse, summary="Handle a transactions upload (htmx)")
@@ -546,6 +569,7 @@ def register_ui(
                 "closed": ledger.closed,
                 "signed_at": ledger.signed_at,
                 "signed_by": ledger.signed_by,
+                "backup": await _backup_signal(),
             },
         )
 
@@ -667,6 +691,7 @@ def register_ui(
                 "closed": record is not None,
                 "signed_at": record.signed_at.isoformat() if record is not None else None,
                 "signed_by": record.signed_by if record is not None else None,
+                "backup": await _backup_signal(),
             },
         )
 
@@ -856,6 +881,7 @@ def register_ui(
                 "closed": ledger.closed,
                 "signed_at": ledger.signed_at,
                 "signed_by": ledger.signed_by,
+                "backup": await _backup_signal(),
             },
         )
 
@@ -894,12 +920,18 @@ def register_ui(
             )
         except UnknownTaxRegime as exc:
             return templates.TemplateResponse(
-                request, "close.html", {"period": period, "error": str(exc)}
+                request,
+                "close.html",
+                {"period": period, "error": str(exc), "backup": await _backup_signal()},
             )
         return templates.TemplateResponse(
             request,
             "close.html",
-            {"period": period, "close": CloseReviewOut.from_review(review)},
+            {
+                "period": period,
+                "close": CloseReviewOut.from_review(review),
+                "backup": await _backup_signal(),
+            },
         )
 
     @app.post(
@@ -1174,12 +1206,14 @@ def register_ui(
             )
         except UnknownTaxRegime as exc:
             return templates.TemplateResponse(
-                request, "package.html", {"period": period, "error": str(exc)}
+                request,
+                "package.html",
+                {"period": period, "error": str(exc), "backup": await _backup_signal()},
             )
         return templates.TemplateResponse(
             request,
             "package.html",
-            {"period": period, "package": package},
+            {"period": period, "package": package, "backup": await _backup_signal()},
         )
 
     # --- Slice 4 · D: the exports listing + guarded download + the export action.
@@ -1232,7 +1266,9 @@ def register_ui(
             for record in reversed(records)  # newest-first (reverse of insertion order)
         ]
         return templates.TemplateResponse(
-            request, "exports.html", {"period": period, "exports": rows}
+            request,
+            "exports.html",
+            {"period": period, "exports": rows, "backup": await _backup_signal()},
         )
 
     @app.get(
@@ -1405,6 +1441,7 @@ def register_ui(
                 "pending": len(candidates),
                 "attribution_targets": config.attribution_targets,
                 "attribution_target_labels": intake_labels,
+                "backup": await _backup_signal(),
             },
         )
 
@@ -1519,6 +1556,7 @@ def register_ui(
                     "pending": pending,
                     "filed_today": filed_today,
                     "period": period,
+                    "backup": await _backup_signal(),
                 },
             )
 
@@ -1640,6 +1678,7 @@ def register_ui(
                 "period": period,
                 "confirm_period": period_of(v_date),
                 "ledger_outcome": result.ledger_outcome,
+                "backup": await _backup_signal(),
             },
         )
 

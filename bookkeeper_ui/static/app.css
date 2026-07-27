@@ -146,6 +146,44 @@ body {
   border: 1px solid var(--line-2); border-radius: var(--r-md); padding: 0.32rem 0.6rem;
 }
 .status-local .led { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+.status-local .count { font-weight: 500; letter-spacing: 0.06em; opacity: 0.85; }
+.status-local .check { font-weight: 700; }
+.status-local .ts { font-weight: 500; letter-spacing: 0.04em; opacity: 0.85; }
+
+/* #87 — the three state modifiers over the DS-1 base chip. backed-up is the ONLY
+   green (confirmed); pending is quiet amber (flagged); not-backed is the LOUD cool
+   danger token (the deliberate exception to B's calm) covering unconfigured /
+   never-backed / a freshness- or error-escalated pending. */
+.status-local.backed-up { color: var(--confirmed-2); background: var(--confirmed-tint); border-color: var(--confirmed-line); }
+.status-local.backed-up .led { background: var(--confirmed); }
+.status-local.pending { color: var(--flagged-2); background: var(--flagged-tint); border-color: var(--flagged-line); }
+.status-local.pending .led { background: var(--flagged); }
+.status-local.not-backed { color: var(--danger-2); background: var(--danger-tint); border-color: var(--danger-line); }
+.status-local.not-backed .led { background: var(--danger); box-shadow: 0 0 0 0 var(--danger); animation: led-nag 1.8s ease-out infinite; }
+/* The loud LED pulses to draw the eye — dropped entirely under reduced-motion. */
+@keyframes led-nag {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--danger) 55%, transparent); }
+  70% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--danger) 0%, transparent); }
+  100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--danger) 0%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .status-local.not-backed .led { animation: none; }
+}
+
+/* #87 — the page-level LOUD nag banner (capture home only). The danger token in the
+   banner idiom the closed-banner set, so an owner who reads no chip still cannot miss
+   that this machine is the only copy of their books. */
+.backup-banner.loud {
+  margin: 0 0 1.25rem;
+  padding: 0.95rem 1.15rem;
+  background: var(--danger-tint);
+  border: 1px solid var(--danger-line);
+  border-left: 4px solid var(--danger);
+  border-radius: var(--r-md);
+  color: var(--ink);
+}
+.backup-banner.loud strong { display: block; color: var(--danger-2); font-size: var(--t-lg); margin-bottom: 0.15rem; }
+.backup-banner.loud p { margin: 0; color: var(--ink-2); }
 
 /* --- Global chrome: the B instrument header -------------------------- */
 /* Teal glyph brand · mono-weight muted links · a[aria-current] accent · a

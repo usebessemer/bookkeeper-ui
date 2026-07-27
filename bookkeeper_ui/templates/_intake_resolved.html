@@ -11,9 +11,13 @@
    element — the pending counter's aria-live region + focus target (AC 21) — is
    preserved across resolves and the text change reliably announces, rather than being
    replaced by a fresh element. #}
+{% from "_backup_chip.html" import backup_chip %}
 <span id="intake-pending-count" hx-swap-oob="innerHTML">{{ pending }}</span>
 <span id="intake-pulse-count" hx-swap-oob="innerHTML">{{ pending }}</span>
 <span id="intake-filed-count" hx-swap-oob="innerHTML">{{ filed_today }}</span>
+{# #87: the banked confirm/reject just advanced HEAD past the pushed sha, so the live
+   nav safe-signal is now stale — push a fresh chip out-of-band alongside the pulse. #}
+{{ backup_chip(backup | default(none), oob=true) }}
 <div class="result ok">
   {% if action == "reject" %}
   <p><strong>Rejected.</strong> The ledger is untouched; the receipt and its
