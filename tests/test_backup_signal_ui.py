@@ -100,6 +100,10 @@ def test_pending_is_amber_with_the_honest_count_and_no_timestamp():
     assert sig.show_check is False
     assert sig.loud is False
     assert sig.last_push_time is None  # pending shows the count, not a (stale) green time
+    # Honest status, not activity (backup-spec §6, #88): "Not yet backed up", never
+    # "Backing up" — a quiet/offline-stalled pending has nothing actively in flight.
+    assert sig.label == "Not yet backed up"
+    assert "Backing up" not in sig.label
 
 
 def test_escalated_pending_becomes_loud_not_backed():
@@ -175,6 +179,8 @@ def test_chip_renders_the_three_state_tokens():
     assert "&check;" in backed  # the ✓ shows only here
     assert 'class="status-local pending"' in pending
     assert "4 unsaved" in pending  # the honest unpushed count
+    assert "Not yet backed up" in pending  # honest status readout, not "Backing up"
+    assert "Backing up" not in pending
     assert "&check;" not in pending
     assert 'class="status-local not-backed"' in loud
     assert "&check;" not in loud
