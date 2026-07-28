@@ -1221,7 +1221,9 @@ def register_ui(
     # log the JSON `GET /exports` reads (`export_store`), never a second reader. The
     # listing lets a human *see the log*; the download lets him *pull the local files*
     # (`FileResponse` from the local exports dir to the local browser — the entire
-    # transport story; nothing leaves the machine). The export action (`POST /ui/export`)
+    # transport story for this route: the download itself never transmits, and the
+    # package files are gitignored, so they don't even ride the owner's backup push —
+    # the one deliberate outbound path the app has). The export action (`POST /ui/export`)
     # is the human twin of B's JSON `POST /export`: it re-obtains the package from the
     # app's own stores and reuses B's `export_package` (no second write path).
 

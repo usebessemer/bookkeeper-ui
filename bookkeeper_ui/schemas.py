@@ -1530,8 +1530,12 @@ class BackupSignalOut(BaseModel):
                 unpushed_count=0, loud=False,
             )
         if status.state == STATE_PENDING and not status.escalated:
+            # Honest status, not activity: the label is "Not yet backed up" (backup-spec
+            # §6 — pending reads "N changes not yet backed up"), never "Backing up" — a quiet pending
+            # may be an offline stall with nothing actively in flight, and the chip must
+            # not overstate work. The honest count rides alongside in the `.count` span.
             return cls(
-                state="pending", css_class="pending", label="Backing up",
+                state="pending", css_class="pending", label="Not yet backed up",
                 show_check=False, last_push_time=None,
                 unpushed_count=status.unpushed_count, loud=False, reason="pending",
             )
