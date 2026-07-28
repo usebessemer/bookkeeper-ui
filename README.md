@@ -139,10 +139,11 @@ Interactive docs are at `/docs` when the server is running.
 uvicorn bookkeeper_ui.api:build_app_from_env --factory --reload
 ```
 
-Configured by env vars (both optional):
+Configured by env vars (all optional):
 
 - `BOOKKEEPER_UI_CONFIG` — path to the config JSON (default `examples/config.json`).
 - `BOOKKEEPER_UI_DATA_DIR` — dir for the ledger + statement + confirmation + reconciliation files (default `data`).
+- `BOOKKEEPER_UI_BACKUP` — the git-backup engine (default `on`; `off` disables it). It backs the data dir up to the client's own private GitHub repo; the consultant wires it once per client — see [Backup & restore runbook](docs/backup-runbook.md).
 
 A quick end-to-end pass with the sample data:
 
