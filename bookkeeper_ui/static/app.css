@@ -79,8 +79,11 @@
    to near-invisible on dark, so elevation is carried by --line/surface-step.
    Applied on OS-preference (unless a viewer forced light) AND on an explicit
    [data-theme="dark"] toggle, so a manual toggle wins in both directions;
-   [data-theme="light"] falls back to the base :root above. */
-@media (prefers-color-scheme: dark) {
+   [data-theme="light"] falls back to the base :root above.
+   Both ramps are scoped to `screen`: on paper the light :root tokens win, so
+   print is always dark-ink-on-white (dark tokens waste toner / print light-on-
+   white). See the @media print block at the foot. */
+@media screen and (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bg:#0d1419; --panel:#151d24; --panel-2:#1b242c;
     --ink:#e6ebef; --ink-2:#c4ccd3; --muted:#9aa6b1; --faint:#8a939c;
@@ -98,21 +101,23 @@
     --focus:0 0 0 3px rgba(52,169,189,0.35);
   }
 }
-:root[data-theme="dark"] {
-  --bg:#0d1419; --panel:#151d24; --panel-2:#1b242c;
-  --ink:#e6ebef; --ink-2:#c4ccd3; --muted:#9aa6b1; --faint:#8a939c;
-  --line:#2a343d; --line-2:#3a4650;
+@media screen {
+  :root[data-theme="dark"] {
+    --bg:#0d1419; --panel:#151d24; --panel-2:#1b242c;
+    --ink:#e6ebef; --ink-2:#c4ccd3; --muted:#9aa6b1; --faint:#8a939c;
+    --line:#2a343d; --line-2:#3a4650;
 
-  --accent:#34a9bd; --accent-2:#5cc3d4; --accent-tint:#12303a; --accent-line:#2f6b78;
-  --on-accent:#08222b;
+    --accent:#34a9bd; --accent-2:#5cc3d4; --accent-tint:#12303a; --accent-line:#2f6b78;
+    --on-accent:#08222b;
 
-  --proposed:#4bb8cf;  --proposed-2:#7fd4e6;  --proposed-tint:#12303a;  --proposed-line:#2f6b78;
-  --confirmed:#4fbf83; --confirmed-2:#6fd39a; --confirmed-tint:#123026; --confirmed-line:#2c6647;
-  --flagged:#e0a445;   --flagged-2:#edc07a;   --flagged-tint:#33260f;   --flagged-line:#6b511f;
-  --danger:#f28b8b;    --danger-2:#f6a9a9;    --danger-tint:#331a1c;    --danger-line:#663033;
+    --proposed:#4bb8cf;  --proposed-2:#7fd4e6;  --proposed-tint:#12303a;  --proposed-line:#2f6b78;
+    --confirmed:#4fbf83; --confirmed-2:#6fd39a; --confirmed-tint:#123026; --confirmed-line:#2c6647;
+    --flagged:#e0a445;   --flagged-2:#edc07a;   --flagged-tint:#33260f;   --flagged-line:#6b511f;
+    --danger:#f28b8b;    --danger-2:#f6a9a9;    --danger-tint:#331a1c;    --danger-line:#663033;
 
-  --e1:none; --e2:0 0 0 1px var(--line); --e3:0 8px 24px rgba(0,0,0,0.5);
-  --focus:0 0 0 3px rgba(52,169,189,0.35);
+    --e1:none; --e2:0 0 0 1px var(--line); --e3:0 8px 24px rgba(0,0,0,0.5);
+    --focus:0 0 0 3px rgba(52,169,189,0.35);
+  }
 }
 
 * { box-sizing: border-box; }
@@ -230,6 +235,48 @@ code { font-family: var(--mono); font-size: 0.92em; background: var(--panel-2); 
    .button / .open-full links set their own colour and win over this. */
 a { color: var(--accent); }
 a:hover { color: var(--accent-2); }
+
+/* --- Interaction: keyboard focus + motion ----------------------------- */
+/* A visible focus ring on EVERY interactive control. Inputs/selects already
+   carry the field-focus ring (border + --focus box-shadow, below); this adds
+   the accent outline to links, buttons, <summary>, checkboxes, and any scripted
+   [tabindex] control. :focus-visible keeps the ring off mouse clicks — and off
+   the programmatic aria-live focus targets (#intake-queue / #intake-pending-
+   count are moved-to via JS, which does not match :focus-visible, and their
+   id-level `outline:none` wins even if it did). */
+a:focus-visible,
+button:focus-visible,
+.button:focus-visible,
+.scan-drop-button:focus-visible,
+summary:focus-visible,
+input[type="checkbox"]:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The B --dur/--ease tokens, wired into interactive state changes at last.
+   Kept to compositor-cheap paint properties (no layout); dropped entirely under
+   prefers-reduced-motion, below. */
+a, button, .button, .scan-drop-button, summary,
+input[type="text"], input[type="file"], input[type="checkbox"], select {
+  transition: color var(--dur) var(--ease),
+              background-color var(--dur) var(--ease),
+              border-color var(--dur) var(--ease),
+              box-shadow var(--dur) var(--ease);
+}
+
+/* prefers-reduced-motion: honour the OS setting app-wide — near-zero every
+   transition and animation (covers the interactive transitions above; the
+   safe-signal LED nag is also killed by its own rule near the keyframes). */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
 
 /* --- Forms · inputs / selects / buttons ------------------------------- */
 .import-form {
@@ -676,3 +723,33 @@ tr.diverges { background: var(--flagged-tint); }
 }
 .privacy-panel svg { flex: none; color: var(--accent); }
 .privacy-panel strong { color: var(--ink-2); font-weight: 600; }
+
+/* --- Print: legible on paper, every column shown --------------------- */
+/* The dark ramps are scoped to @media screen, so print always renders the light
+   :root tokens (dark-ink-on-white). Here we release the horizontal scroll on the
+   wide package/reconciliation trails so no column clips at the page edge, flatten
+   elevation, and hide the interactive chrome that is meaningless on paper. The
+   on-screen overflow-x scroll containers are untouched. */
+@media print {
+  body { background: #fff; }
+
+  /* interactive / navigational chrome — nothing to do with on paper */
+  nav, .downstream-rail, .scan-drop-form, .backup-banner,
+  button, .button, .scan-drop-button { display: none !important; }
+
+  /* flatten elevation — shadows only muddy toner */
+  .card, .recon-item, .import-form, .matched-trail, .win-state,
+  table.ledger, table.matched,
+  .framework-checklist .check, .app-gates .gate { box-shadow: none !important; }
+
+  /* the wide package/reconciliation trail: print every column, no clip. On
+     screen it is a display:block overflow-x:auto scroller; on paper it lays out
+     as a full-width table and long cells wrap so nothing runs off the page. */
+  table.package-trail {
+    display: table; width: 100%; overflow-x: visible !important; font-size: var(--t-xs);
+  }
+  table.package-trail th, table.package-trail td { word-break: break-word; }
+
+  /* don't split a row, card, check, or gate across a page break */
+  tr, .card, .recon-item, .check, .gate, .anomaly-card, .blocker { break-inside: avoid; }
+}
