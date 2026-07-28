@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bookkeeper-ui"
-version = "0.7.0"
+version = "0.8.0"
 description = "Local, open-source thin UI for the Bessemer Bookkeeper agent — categorize-and-confirm, bank reconciliation, period close-review-and-sign, and accountant-package preview + export: file stores (ports) + import + config, the FastAPI read/write API, and the htmx trust-trail UI. Local-first; export writes local files only, no transmission."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -50,6 +50,10 @@ test = [
   "pytest-asyncio>=0.24.0",
   # httpx drives the ASGI app in-process for the end-to-end API tests.
   "httpx>=0.27",
+  # A per-test timeout so a hung test fails fast with a pinpointing traceback instead of
+  # stalling the whole `pytest` job (CI has no `timeout-minutes` on the run step). See the
+  # `timeout` setting under [tool.pytest.ini_options] and the conftest drain fixture.
+  "pytest-timeout>=2.3.0",
 ]
 
 [tool.setuptools]
@@ -67,3 +71,9 @@ bookkeeper_ui = ["templates/*.html", "static/*"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+# Fail-fast backstop (pytest-timeout): the whole suite runs in ~20s, so any single test
+# past 60s is hung, not slow. Without this a wedged async test (e.g. a background push
+# task straddling a per-test event loop's teardown on Linux) stalls the bare `pytest` job
+# indefinitely instead of failing with a stack trace that pinpoints it. The signal method
+# (default on POSIX) interrupts the wedged call in the main thread and fails just that test.
+timeout = 60

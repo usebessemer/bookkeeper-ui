@@ -63,6 +63,7 @@ from bookkeeper_ui.anomaly_reviews import (
     FileAnomalyReviewStore,
     derive_flag_id,
 )
+from bookkeeper_ui.backup import BackupService
 from bookkeeper_ui.candidates import (
     ACTION_CONFIRM,
     ACTION_REJECT,
@@ -99,6 +100,7 @@ from bookkeeper_ui.reconciliations import (
 )
 from bookkeeper_ui.schemas import (
     AnomalyOut,
+    BackupSignalOut,
     CandidateOut,
     CloseRecordOut,
     CloseReviewOut,
@@ -220,6 +222,7 @@ def register_ui(
     intake_drop_dir: str | Path | None = None,
     max_artifact_bytes: int | None = None,
     attribution_target_labels: dict[str, str] | None = None,
+    backup: BackupService | None = None,
 ) -> None:
     """Mount the HTML UI on `app`, reading through the same injected stores as #2.
 
@@ -267,6 +270,15 @@ def register_ui(
     config JSON in `build_app_from_env` — and is defaulted to `{}` in the template
     context. The confirmed value on the wire is always the opaque id string; the label
     map is presentation-only and never enters validation.
+
+    `backup` (Slice-6 · #85) is the **optional** `BackupService` (default `None` →
+    born-inert), threaded from `create_app` so these HTML twins bank through the *same*
+    service the JSON surface does — one commit per banked business event on Javed's
+    surface (a confirm, a reconcile resolution, an anomaly ack, a waiver, a sign, an
+    export, a receipt filed, an import batch). Each fires `await _bank(<semantic msg>)`:
+    the local commit is awaited (the durability floor) and the push is scheduled off the
+    request path, so a slow/failing push never delays an htmx response. With `backup is
+    None` every `_bank` is a no-op, so the UI behaves exactly as pre-feature.
     """
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -275,6 +287,31 @@ def register_ui(
     artifact_cap = (
         max_artifact_bytes if max_artifact_bytes is not None else DEFAULT_MAX_ARTIFACT_BYTES
     )
+
+    async def _bank(message: str) -> None:
+        """Fire one best-effort backup commit for a banked business event (born-inert).
+
+        With no backup service wired (`backup is None`) this is a no-op, so the HTML
+        surface behaves exactly as pre-feature. When wired, `bank()` awaits the local
+        commit (the durability floor) then schedules the push off the request path — and
+        never raises, so a broken backup can never break an htmx write.
+        """
+        if backup is not None:
+            await backup.bank(message)
+
+    async def _backup_signal() -> BackupSignalOut:
+        """The live backup safe-signal (#87) for a full-page render (born-safe LOUD default).
+
+        Every full-page handler injects the result as ``backup`` so base.html's global nav
+        chip renders the truthful 3-state signal off a per-call `status()` — never a cached
+        boolean. With no service wired (`backup is None`) this is the LOUD not-backed state,
+        exactly as a fresh install must read; `status()` is read-only and lock-free, so it
+        never delays a render or collides with an in-flight commit/push. A render that omits
+        `backup` still defaults to LOUD in the chip macro, so a missed context can never read
+        falsely green — this helper just makes the truthful signal the easy path.
+        """
+        status = await backup.status() if backup is not None else None
+        return BackupSignalOut.from_status(status)
 
     @app.get("/", response_class=HTMLResponse, summary="Capture home (the receipts landing)")
     async def home(request: Request) -> HTMLResponse:
@@ -333,6 +370,10 @@ def register_ui(
                 # A3: gate the "scan drop folder" button + win-state prompt on the
                 # feature being wired — the MUST capture flow never depends on it.
                 "drop_dir_enabled": drop_dir_enabled,
+                # #87: the live safe-signal — the nav chip AND the front-door loud
+                # banner. Born-safe: a fresh install collapses to the LOUD not-backed
+                # state, so an unbacked-up machine screams on the landing by default.
+                "backup": await _backup_signal(),
             },
         )
 
@@ -359,7 +400,11 @@ def register_ui(
         return templates.TemplateResponse(
             request,
             "import.html",
-            {"default_period": period, "closed_banners": closed_banners},
+            {
+                "default_period": period,
+                "closed_banners": closed_banners,
+                "backup": await _backup_signal(),
+            },
         )
 
     @app.post("/ui/import", response_class=HTMLResponse, summary="Handle a transactions upload (htmx)")
@@ -404,6 +449,9 @@ def register_ui(
 
         for transaction in transactions:
             await ledger_store.store(transaction)
+
+        # Bank the whole batch as ONE commit (not per row) — the import is one event.
+        await _bank(f"banked: import {len(transactions)} transactions")
 
         # Which periods the file actually landed in (by each row's own date) — the
         # convenience links, so a multi-period file is navigable and a typo'd
@@ -521,6 +569,7 @@ def register_ui(
                 "closed": ledger.closed,
                 "signed_at": ledger.signed_at,
                 "signed_by": ledger.signed_by,
+                "backup": await _backup_signal(),
             },
         )
 
@@ -583,6 +632,7 @@ def register_ui(
                 decided_at=datetime.now(timezone.utc),
             )
         )
+        await _bank(f"banked: confirm {transaction_id} as {account}")
 
         # Recompute how many still need a human, so the live counter and the
         # "all caught up" empty-state stay honest as the queue shrinks.
@@ -641,6 +691,7 @@ def register_ui(
                 "closed": record is not None,
                 "signed_at": record.signed_at.isoformat() if record is not None else None,
                 "signed_by": record.signed_by if record is not None else None,
+                "backup": await _backup_signal(),
             },
         )
 
@@ -759,6 +810,7 @@ def register_ui(
                 decided_at=datetime.now(timezone.utc),
             )
         )
+        await _bank(f"banked: reconcile {decision} {txn_id or stmt_id}")
 
         # Recompute the open-items count off the same projection, so the live
         # counter and the "all reconciled" empty state stay honest as cards leave.
@@ -829,6 +881,7 @@ def register_ui(
                 "closed": ledger.closed,
                 "signed_at": ledger.signed_at,
                 "signed_by": ledger.signed_by,
+                "backup": await _backup_signal(),
             },
         )
 
@@ -867,12 +920,18 @@ def register_ui(
             )
         except UnknownTaxRegime as exc:
             return templates.TemplateResponse(
-                request, "close.html", {"period": period, "error": str(exc)}
+                request,
+                "close.html",
+                {"period": period, "error": str(exc), "backup": await _backup_signal()},
             )
         return templates.TemplateResponse(
             request,
             "close.html",
-            {"period": period, "close": CloseReviewOut.from_review(review)},
+            {
+                "period": period,
+                "close": CloseReviewOut.from_review(review),
+                "backup": await _backup_signal(),
+            },
         )
 
     @app.post(
@@ -933,6 +992,7 @@ def register_ui(
             source=SOURCE_HUMAN,
         )
         await anomaly_review_store.record(review)
+        await _bank(f"banked: acknowledge anomaly {flag_id} ({period})")
 
         acknowledged = AnomalyOut(
             id=flag_id,
@@ -994,6 +1054,7 @@ def register_ui(
             note=note.strip() or None,
         )
         await waiver_store.record(waiver)
+        await _bank(f"banked: waive reconciliation {period}")
         return templates.TemplateResponse(
             request,
             "_reconciliation_gate.html",
@@ -1098,6 +1159,7 @@ def register_ui(
             signed_at=datetime.now(timezone.utc),
         )
         await close_store.record(record)
+        await _bank(f"banked: signed close {period}")
         return templates.TemplateResponse(
             request,
             "_close_signed.html",
@@ -1144,12 +1206,14 @@ def register_ui(
             )
         except UnknownTaxRegime as exc:
             return templates.TemplateResponse(
-                request, "package.html", {"period": period, "error": str(exc)}
+                request,
+                "package.html",
+                {"period": period, "error": str(exc), "backup": await _backup_signal()},
             )
         return templates.TemplateResponse(
             request,
             "package.html",
-            {"period": period, "package": package},
+            {"period": period, "package": package, "backup": await _backup_signal()},
         )
 
     # --- Slice 4 · D: the exports listing + guarded download + the export action.
@@ -1157,7 +1221,9 @@ def register_ui(
     # log the JSON `GET /exports` reads (`export_store`), never a second reader. The
     # listing lets a human *see the log*; the download lets him *pull the local files*
     # (`FileResponse` from the local exports dir to the local browser — the entire
-    # transport story; nothing leaves the machine). The export action (`POST /ui/export`)
+    # transport story for this route: the download itself never transmits, and the
+    # package files are gitignored, so they don't even ride the owner's backup push —
+    # the one deliberate outbound path the app has). The export action (`POST /ui/export`)
     # is the human twin of B's JSON `POST /export`: it re-obtains the package from the
     # app's own stores and reuses B's `export_package` (no second write path).
 
@@ -1202,7 +1268,9 @@ def register_ui(
             for record in reversed(records)  # newest-first (reverse of insertion order)
         ]
         return templates.TemplateResponse(
-            request, "exports.html", {"period": period, "exports": rows}
+            request,
+            "exports.html",
+            {"period": period, "exports": rows, "backup": await _backup_signal()},
         )
 
     @app.get(
@@ -1322,6 +1390,7 @@ def register_ui(
             app_version=__version__,
         )
         await export_store.record(record)
+        await _bank(f"banked: export {period}")
         return templates.TemplateResponse(
             request,
             "_export_result.html",
@@ -1374,6 +1443,7 @@ def register_ui(
                 "pending": len(candidates),
                 "attribution_targets": config.attribution_targets,
                 "attribution_target_labels": intake_labels,
+                "backup": await _backup_signal(),
             },
         )
 
@@ -1471,6 +1541,7 @@ def register_ui(
                     reject_reason=reject_reason.strip() or None,
                 )
             )
+            await _bank(f"banked: reject candidate {candidate_id}")
             pending = await _intake_pending_count(
                 candidate_store, candidate_decision_store
             )
@@ -1487,6 +1558,7 @@ def register_ui(
                     "pending": pending,
                     "filed_today": filed_today,
                     "period": period,
+                    "backup": await _backup_signal(),
                 },
             )
 
@@ -1587,6 +1659,10 @@ def register_ui(
                 },
             )
 
+        # Bank AFTER `apply_confirm` returns — the write core stays a pure leaf; the
+        # caller owns the backup commit for the receipt it just filed.
+        await _bank(f"banked: file receipt {v_vendor} {v_amount}")
+
         pending = await _intake_pending_count(candidate_store, candidate_decision_store)
         # "M filed today" is the pulse's second number — a confirm that filed a fresh row
         # bumps it, so recompute it OOB too (off the same `count_filed_today` the full
@@ -1604,6 +1680,7 @@ def register_ui(
                 "period": period,
                 "confirm_period": period_of(v_date),
                 "ledger_outcome": result.ledger_outcome,
+                "backup": await _backup_signal(),
             },
         )
 

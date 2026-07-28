@@ -1,117 +1,368 @@
-/* bookkeeper-ui — clean, legible styling for the thin UI. Deliberately plain:
-   the scope is "clean and legible", no framework, no build step. */
+/* bookkeeper-ui — Direction B design system ("Precision / Instrument").
+   Vanilla CSS: no framework, no build step, no webfont, no CDN (system fonts +
+   inline SVG only, offline).
+
+   DS-1 (#90) shipped the token layer, dark-mode ramp, the .mono/.eyebrow
+   utilities, and the .status-local base chip. DS-2 (#91) — this pass — restyles
+   every screen to B's idiom: it sweeps the borrowed GitHub-adjacent hexes to
+   trust-state tokens, adds the B components (instrument header, receipt-hero
+   card-strip / state-pill / suggest-block, privacy panel), and RETIRES the DS-1
+   compatibility aliases (--card/--ok/--warn/--err…) in favour of direct tokens.
+   Visual-language-only: no zone, control, hx target, field name, or copy-
+   semantic change — every asserted class/id/string is preserved. */
 
 :root {
-  --ink: #1f2328;
-  --muted: #656d76;
-  --line: #d0d7de;
-  --bg: #f6f8fa;
-  --card: #ffffff;
-  --accent: #0969da;
-  --ok: #1a7f37;
-  --ok-bg: #dafbe1;
-  --warn: #9a6700;
-  --warn-bg: #fff8c5;
-  --err: #cf222e;
-  --err-bg: #ffebe9;
+  /* ── surface / ink · cool neutral ─────────────────────────────── */
+  --bg:        #eef1f4;   /* cool page */
+  --panel:     #ffffff;   /* instrument panel / card */
+  --panel-2:   #f6f8fa;   /* inset: strips, table headers, trail */
+  --ink:       #0f1720;   /* cool near-black — headings */
+  --ink-2:     #2c3742;   /* body */
+  --muted:     #5b6773;   /* slate — secondary text (5.9:1 on panel, AA) */
+  --faint:     #636d78;   /* FIX 1 — tertiary (eyebrows, ids, trail keys) */
+  --line:      #dbe1e7;   /* hairline */
+  --line-2:    #c6cfd7;   /* stronger rule */
+
+  /* ── the one accent: signal teal (held) ───────────────────────── */
+  --accent:     #0e6f8e;  /* FIX 3 — bluer teal, hue 194.5° */
+  --accent-2:   #0a5461;  /* deep — hover / accent borders */
+  --accent-tint:#e2f0f4;  /* focus ring, suggest block fill */
+  --accent-line:#9fd0dd;
+  /* on-accent — the label colour that rides ON a filled accent surface. White in
+     light (5.70:1 on --accent); a dark ink in dark mode (the dark accent is bright,
+     so a white label would fail — this keeps filled buttons legible in both). */
+  --on-accent:  #ffffff;
+
+  /* ── trust-state palette ───────────────────────────────────────── */
+  /* proposed — machine suggested, awaiting you (bluer teal = --accent) */
+  --proposed:      #0e6f8e;  --proposed-2:   #0b5f7a;   /* FIX 2 — pill text */
+  --proposed-tint: #e2f0f4;  --proposed-line:#9fd0dd;
+  /* confirmed — the green win state (clearer green, 51° off proposed) */
+  --confirmed:     #1f7a43;  --confirmed-2:  #166b43;   /* FIX 3 + deep text */
+  --confirmed-tint:#e0f2ea;  --confirmed-line:#a6dcbf;
+  /* flagged — needs you / no suggestion (amber) */
+  --flagged:       #a85a12;  --flagged-2:    #8f4d10;   /* FIX 2 — pill text */
+  --flagged-tint:  #f7ebdb;  --flagged-line: #e6c79c;
+
+  /* ── danger — the ONE deliberate exception to B's calm ─────────── */
+  /* cool-toned, desaturated red re-toned to sit beside confirmed/flagged;
+     NOT the retired GitHub --err red. Consumed by backup #87 (loud
+     safe-signal chip + page banner). */
+  --danger:      #a3272e;  --danger-2:   #851f26;
+  --danger-tint: #f9e6e7;  --danger-line:#e6b9bb;
+
+  /* ── type ──────────────────────────────────────────────────────── */
+  --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --t-xs:0.7rem; --t-sm:0.8rem; --t-base:0.94rem; --t-lg:1.1rem; --t-xl:1.5rem; --t-2xl:2rem;
+  --lh-tight:1.2; --lh:1.55; --tracking-eyebrow:0.14em; --tracking-tight:-0.02em;
+
+  /* ── spacing scale ─────────────────────────────────────────────── */
+  --s0:0.2rem; --s1:0.35rem; --s2:0.7rem; --s3:1.1rem; --s4:1.6rem; --s5:2.4rem; --s6:3.2rem;
+
+  /* ── radius scale (crisp = precision) ──────────────────────────── */
+  --r-sm:3px; --r-md:4px; --r-lg:8px; --r:var(--r-md);   /* pills use --r-sm */
+
+  /* ── elevation (cool-toned, restrained) ────────────────────────── */
+  --e0:none;
+  --e1:0 1px 2px rgba(15,23,32,0.06);
+  --e2:0 2px 6px rgba(15,23,32,0.08), 0 1px 2px rgba(15,23,32,0.04);
+  --e3:0 8px 24px rgba(15,23,32,0.12);
+  --focus:0 0 0 3px var(--accent-tint);
+
+  /* ── motion ────────────────────────────────────────────────────── */
+  --dur:120ms; --ease:cubic-bezier(0.2,0.6,0.2,1);
+}
+
+/* ── dark-mode ramp ───────────────────────────────────────────────
+   Same hues, inverted lightness, desaturated one notch. Shadows collapse
+   to near-invisible on dark, so elevation is carried by --line/surface-step.
+   Applied on OS-preference (unless a viewer forced light) AND on an explicit
+   [data-theme="dark"] toggle, so a manual toggle wins in both directions;
+   [data-theme="light"] falls back to the base :root above.
+   Both ramps are scoped to `screen`: on paper the light :root tokens win, so
+   print is always dark-ink-on-white (dark tokens waste toner / print light-on-
+   white). See the @media print block at the foot. */
+@media screen and (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg:#0d1419; --panel:#151d24; --panel-2:#1b242c;
+    --ink:#e6ebef; --ink-2:#c4ccd3; --muted:#9aa6b1; --faint:#8a939c;
+    --line:#2a343d; --line-2:#3a4650;
+
+    --accent:#34a9bd; --accent-2:#5cc3d4; --accent-tint:#12303a; --accent-line:#2f6b78;
+    --on-accent:#08222b;
+
+    --proposed:#4bb8cf;  --proposed-2:#7fd4e6;  --proposed-tint:#12303a;  --proposed-line:#2f6b78;
+    --confirmed:#4fbf83; --confirmed-2:#6fd39a; --confirmed-tint:#123026; --confirmed-line:#2c6647;
+    --flagged:#e0a445;   --flagged-2:#edc07a;   --flagged-tint:#33260f;   --flagged-line:#6b511f;
+    --danger:#f28b8b;    --danger-2:#f6a9a9;    --danger-tint:#331a1c;    --danger-line:#663033;
+
+    --e1:none; --e2:0 0 0 1px var(--line); --e3:0 8px 24px rgba(0,0,0,0.5);
+    --focus:0 0 0 3px rgba(52,169,189,0.35);
+  }
+}
+@media screen {
+  :root[data-theme="dark"] {
+    --bg:#0d1419; --panel:#151d24; --panel-2:#1b242c;
+    --ink:#e6ebef; --ink-2:#c4ccd3; --muted:#9aa6b1; --faint:#8a939c;
+    --line:#2a343d; --line-2:#3a4650;
+
+    --accent:#34a9bd; --accent-2:#5cc3d4; --accent-tint:#12303a; --accent-line:#2f6b78;
+    --on-accent:#08222b;
+
+    --proposed:#4bb8cf;  --proposed-2:#7fd4e6;  --proposed-tint:#12303a;  --proposed-line:#2f6b78;
+    --confirmed:#4fbf83; --confirmed-2:#6fd39a; --confirmed-tint:#123026; --confirmed-line:#2c6647;
+    --flagged:#e0a445;   --flagged-2:#edc07a;   --flagged-tint:#33260f;   --flagged-line:#6b511f;
+    --danger:#f28b8b;    --danger-2:#f6a9a9;    --danger-tint:#331a1c;    --danger-line:#663033;
+
+    --e1:none; --e2:0 0 0 1px var(--line); --e3:0 8px 24px rgba(0,0,0,0.5);
+    --focus:0 0 0 3px rgba(52,169,189,0.35);
+  }
 }
 
 * { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
 
 body {
   margin: 0;
-  font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-  color: var(--ink);
+  font: var(--t-base)/var(--lh) var(--sans);
+  color: var(--ink-2);
   background: var(--bg);
 }
 
+/* --- DS-1 foundation: reusable utilities (ported from B) --------------- */
+/* Every amount, tax, date, id, and count renders .mono (tabular-nums) so
+   figures align — the core B trust cue. .eyebrow is the uppercase mono micro-
+   label. */
+.mono    { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.eyebrow { font: 700 var(--t-xs)/1 var(--mono); letter-spacing: var(--tracking-eyebrow);
+           text-transform: uppercase; color: var(--muted); }
+
+/* --- DS-1 foundation: the .status-local base chip --------------------- */
+/* B's nav instrument-readout idiom (mono uppercase + LED dot), shipped as the
+   structural HOOK backup #87 extends. Deliberately NEUTRAL, not the mockup's
+   green: an optimistic/green default would contradict the safe-signal design.
+   #87 owns the three state modifiers (.backed-up/.pending/.not-backed), the
+   context-less-defaults-to-loud rule, and the page-level banner — NOT here. */
+.status-local {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  font: 700 var(--t-xs)/1 var(--mono); letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--muted); background: var(--panel-2);
+  border: 1px solid var(--line-2); border-radius: var(--r-md); padding: 0.32rem 0.6rem;
+}
+.status-local .led { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+.status-local .count { font-weight: 500; letter-spacing: 0.06em; opacity: 0.85; }
+.status-local .check { font-weight: 700; }
+.status-local .ts { font-weight: 500; letter-spacing: 0.04em; opacity: 0.85; }
+
+/* #87 — the three state modifiers over the DS-1 base chip. backed-up is the ONLY
+   green (confirmed); pending is quiet amber (flagged); not-backed is the LOUD cool
+   danger token (the deliberate exception to B's calm) covering unconfigured /
+   never-backed / a freshness- or error-escalated pending. */
+.status-local.backed-up { color: var(--confirmed-2); background: var(--confirmed-tint); border-color: var(--confirmed-line); }
+.status-local.backed-up .led { background: var(--confirmed); }
+.status-local.pending { color: var(--flagged-2); background: var(--flagged-tint); border-color: var(--flagged-line); }
+.status-local.pending .led { background: var(--flagged); }
+.status-local.not-backed { color: var(--danger-2); background: var(--danger-tint); border-color: var(--danger-line); }
+.status-local.not-backed .led { background: var(--danger); box-shadow: 0 0 0 0 var(--danger); animation: led-nag 1.8s ease-out infinite; }
+/* The loud LED pulses to draw the eye — dropped entirely under reduced-motion. */
+@keyframes led-nag {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--danger) 55%, transparent); }
+  70% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--danger) 0%, transparent); }
+  100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--danger) 0%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .status-local.not-backed .led { animation: none; }
+}
+
+/* #87 — the page-level LOUD nag banner (capture home only). The danger token in the
+   banner idiom the closed-banner set, so an owner who reads no chip still cannot miss
+   that this machine is the only copy of their books. */
+.backup-banner.loud {
+  margin: 0 0 1.25rem;
+  padding: 0.95rem 1.15rem;
+  background: var(--danger-tint);
+  border: 1px solid var(--danger-line);
+  border-left: 4px solid var(--danger);
+  border-radius: var(--r-md);
+  color: var(--ink);
+}
+.backup-banner.loud strong { display: block; color: var(--danger-2); font-size: var(--t-lg); margin-bottom: 0.15rem; }
+.backup-banner.loud p { margin: 0; color: var(--ink-2); }
+
+/* --- Global chrome: the B instrument header -------------------------- */
+/* Teal glyph brand · mono-weight muted links · a[aria-current] accent · a
+   hairline --line-2 rule. The .nav-spacer pushes a trailing status-chip SLOT to
+   the right — left EMPTY here for backup #87 to fill with the live 3-state
+   safe-signal chip (it needs backup.status(); the retired local-first chip is
+   not re-added). */
 nav {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 1.25rem;
-  align-items: baseline;
-  padding: 0.9rem 1.5rem;
-  background: var(--card);
-  border-bottom: 1px solid var(--line);
+  padding: 0.7rem 1.6rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line-2);
 }
-nav .brand { font-weight: 700; margin-right: 0.5rem; }
-nav a { color: var(--accent); text-decoration: none; }
-nav a:hover { text-decoration: underline; }
+nav .brand {
+  display: flex; align-items: center; gap: 0.5rem;
+  font-weight: 700; font-size: 1.02rem; letter-spacing: var(--tracking-tight);
+  color: var(--ink);
+}
+nav .brand .glyph {
+  width: 20px; height: 20px; border-radius: var(--r-md);
+  background: var(--accent); color: var(--on-accent);
+  display: inline-grid; place-items: center; font: 700 12px var(--mono);
+}
+nav a { color: var(--muted); text-decoration: none; font-size: var(--t-sm); font-weight: 500; }
+nav a:hover { color: var(--ink); }
+nav a[aria-current] { color: var(--accent); font-weight: 700; }
+nav .nav-spacer { margin-left: auto; }
 
 main {
-  max-width: 780px;
+  max-width: 1000px;
   margin: 0 auto;
-  padding: 1.5rem;
+  padding: var(--s5) 1.6rem 3rem;
 }
 
-h1 { font-size: 1.5rem; margin: 0.5rem 0 0.75rem; }
+h1 { font-size: var(--t-2xl); font-weight: 700; letter-spacing: var(--tracking-tight); color: var(--ink); margin: 0.4rem 0 0.75rem; }
+h1 .qualifier { font: 500 var(--t-sm) var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--faint); }
 .lead { color: var(--muted); margin-top: 0; }
-code { background: var(--bg); padding: 0.05rem 0.3rem; border-radius: 4px; }
+code { font-family: var(--mono); font-size: 0.92em; background: var(--panel-2); padding: 0.05rem 0.35rem; border-radius: var(--r-sm); }
+/* In-content links → the signal teal. The retired GitHub palette's link-blue
+   masked the absence of a base rule; on B it must be the accent. The nav / rail /
+   .button / .open-full links set their own colour and win over this. */
+a { color: var(--accent); }
+a:hover { color: var(--accent-2); }
 
-/* --- Import form ------------------------------------------------------- */
+/* --- Interaction: keyboard focus + motion ----------------------------- */
+/* A visible focus ring on EVERY interactive control. Inputs/selects already
+   carry the field-focus ring (border + --focus box-shadow, below); this adds
+   the accent outline to links, buttons, <summary>, checkboxes, and any scripted
+   [tabindex] control. :focus-visible keeps the ring off mouse clicks — and off
+   the programmatic aria-live focus targets (#intake-queue / #intake-pending-
+   count are moved-to via JS, which does not match :focus-visible, and their
+   id-level `outline:none` wins even if it did). */
+a:focus-visible,
+button:focus-visible,
+.button:focus-visible,
+.scan-drop-button:focus-visible,
+summary:focus-visible,
+input[type="checkbox"]:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The B --dur/--ease tokens, wired into interactive state changes at last.
+   Kept to compositor-cheap paint properties (no layout); dropped entirely under
+   prefers-reduced-motion, below. */
+a, button, .button, .scan-drop-button, summary,
+input[type="text"], input[type="file"], input[type="checkbox"], select {
+  transition: color var(--dur) var(--ease),
+              background-color var(--dur) var(--ease),
+              border-color var(--dur) var(--ease),
+              box-shadow var(--dur) var(--ease);
+}
+
+/* prefers-reduced-motion: honour the OS setting app-wide — near-zero every
+   transition and animation (covers the interactive transitions above; the
+   safe-signal LED nag is also killed by its own rule near the keyframes). */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* --- Forms · inputs / selects / buttons ------------------------------- */
 .import-form {
   display: grid;
   gap: 1rem;
   max-width: 460px;
   padding: 1.25rem;
-  background: var(--card);
-  border: 1px solid var(--line);
-  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-lg);
+  box-shadow: var(--e1);
 }
-.import-form label { display: grid; gap: 0.35rem; font-weight: 600; }
+.import-form label { display: grid; gap: 0.35rem; font-weight: 600; color: var(--ink-2); }
 .import-form small { font-weight: 400; color: var(--muted); }
 input[type="text"], input[type="file"], select {
   font: inherit;
-  padding: 0.45rem 0.55rem;
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  background: #fff;
+  color: var(--ink);
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-md);
+  background: var(--panel);
+}
+input[type="text"]:focus, input[type="file"]:focus, select:focus {
+  outline: none; border-color: var(--accent); box-shadow: var(--focus);
+}
+/* B's CSS-gradient chevron — no webfont, no inline SVG per select. */
+select {
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+                    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 18px) 55%, calc(100% - 13px) 55%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 2rem;
 }
 
 button {
   font: inherit;
   font-weight: 600;
-  padding: 0.5rem 0.95rem;
-  border: 1px solid var(--accent);
-  border-radius: 7px;
+  padding: 0.5rem 1.1rem;
+  border: 1px solid var(--accent-2);
+  border-radius: var(--r-md);
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   cursor: pointer;
 }
-button:hover { filter: brightness(1.05); }
-.actions .pick button { background: #fff; color: var(--accent); }
+button:hover { background: var(--accent-2); }
+/* Secondary / pick-and-save button — white fill, teal text/border. */
+.actions .pick button { background: var(--panel); color: var(--accent); border-color: var(--accent); }
+.actions .pick button:hover { background: var(--accent-tint); }
 
 .button {
   display: inline-block;
-  padding: 0.5rem 0.95rem;
-  border-radius: 7px;
+  padding: 0.5rem 1.1rem;
+  border: 1px solid var(--accent-2);
+  border-radius: var(--r-md);
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   text-decoration: none;
   font-weight: 600;
 }
+.button:hover { background: var(--accent-2); }
 
-/* --- Import result ----------------------------------------------------- */
-.result { margin-top: 1.25rem; padding: 1rem 1.15rem; border-radius: 9px; }
-.result.ok { background: var(--ok-bg); border: 1px solid #aceebb; }
-.result.error { background: var(--err-bg); border: 1px solid #ffc1bc; }
-.result .detected { color: var(--muted); font-size: 0.9rem; }
+/* --- Import / generic result banner ----------------------------------- */
+.result { margin-top: 1.25rem; padding: 1rem 1.15rem; border: 1px solid var(--line); border-radius: var(--r-lg); }
+.result.ok { background: var(--confirmed-tint); border-color: var(--confirmed-line); }
+.result.error { background: var(--danger-tint); border-color: var(--danger-line); }
+.result .detected { color: var(--muted); font-size: var(--t-sm); }
 
 /* --- Confirm queue cards ---------------------------------------------- */
 #queue { display: grid; gap: 1rem; }
 .card {
   padding: 1rem 1.15rem;
-  background: var(--card);
-  border: 1px solid var(--line);
+  background: var(--panel);
+  border: 1px solid var(--line-2);
   border-left: 4px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--r-md);
+  box-shadow: var(--e1);
 }
-.card.proposed { border-left-color: var(--accent); }
-.card.flagged { border-left-color: var(--warn); }
+.card.proposed { border-left-color: var(--proposed); }
+.card.flagged { border-left-color: var(--flagged); }
 
 .txn { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.6rem; }
-.txn .date { color: var(--muted); font-variant-numeric: tabular-nums; }
-.txn .vendor { font-weight: 700; font-size: 1.05rem; }
-.txn .amount { margin-left: auto; font-weight: 700; font-variant-numeric: tabular-nums; }
+.txn .date { color: var(--muted); font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.txn .vendor { font-weight: 700; font-size: 1.05rem; color: var(--ink); }
+.txn .amount { margin-left: auto; font-weight: 700; font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--ink); }
 .txn .desc { flex-basis: 100%; margin: 0.1rem 0 0; color: var(--muted); }
 
 .trail { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; margin: 0.85rem 0; }
@@ -119,239 +370,311 @@ button:hover { filter: brightness(1.05); }
 .tag {
   display: inline-block;
   padding: 0.15rem 0.55rem;
-  border-radius: 999px;
-  font-size: 0.82rem;
-  font-weight: 600;
-  border: 1px solid var(--line);
-  background: var(--bg);
+  border-radius: var(--r-sm);
+  font: 600 var(--t-xs) var(--mono);
+  letter-spacing: 0.02em;
+  border: 1px solid var(--line-2);
+  background: var(--panel-2);
+  color: var(--muted);
 }
-.tag.account { background: #ddf4ff; border-color: #b6e3ff; color: #0a3069; }
-.tag.confidence { background: #fff; color: var(--muted); }
+/* proposed-family chips (account / rule that fired) — mono, teal-tinted. */
+.tag.account { background: var(--proposed-tint); border-color: var(--proposed-line); color: var(--proposed-2); }
+.tag.confidence { background: var(--panel-2); border-color: var(--line); color: var(--muted); }
 .tag.source { text-transform: none; }
-.tag.source-owner-rule { background: #fbefff; border-color: #e9c8ff; color: #6639ba; }
-.tag.source-chart-match { background: var(--bg); color: var(--muted); }
-.tag.needs { background: var(--warn-bg); border-color: #eddf8f; color: var(--warn); }
+.tag.source-owner-rule { background: var(--accent-tint); border-color: var(--accent-line); color: var(--accent-2); }
+.tag.source-chart-match { background: var(--panel-2); border-color: var(--line); color: var(--muted); }
+.tag.needs { background: var(--flagged-tint); border-color: var(--flagged-line); color: var(--flagged-2); }
 .reason { margin: 0.5rem 0 0; color: var(--muted); }
 
-.actions { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 1rem; }
+.actions { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 1rem; margin-top: 0.85rem; }
 .actions .pick { display: flex; align-items: flex-end; gap: 0.5rem; }
-.actions .pick label { display: grid; gap: 0.25rem; font-size: 0.85rem; color: var(--muted); }
+.actions .pick label { display: grid; gap: 0.25rem; font-size: var(--t-sm); color: var(--muted); }
 
-/* --- Ledger table ------------------------------------------------------ */
-table.ledger { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+/* --- Tables (ledger / matched / package-trail) ------------------------ */
+table.ledger { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line-2); border-radius: var(--r-md); overflow: hidden; }
 table.ledger th, table.ledger td { text-align: left; padding: 0.55rem 0.75rem; border-bottom: 1px solid var(--line); }
-table.ledger th { background: var(--bg); font-size: 0.85rem; color: var(--muted); }
+table.ledger th { background: var(--panel-2); font: 700 var(--t-xs) var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--faint); }
 table.ledger tr:last-child td { border-bottom: none; }
-table.ledger .amount { text-align: right; font-variant-numeric: tabular-nums; }
+table.ledger .amount { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+table.ledger td code { font-size: var(--t-xs); }
 
-.empty-state { padding: 1.25rem; background: var(--card); border: 1px dashed var(--line); border-radius: 10px; color: var(--muted); }
+.empty-state { padding: 1.25rem; background: var(--panel); border: 1px dashed var(--line-2); border-radius: var(--r-md); color: var(--muted); }
 
 /* --- Reconcile queue --------------------------------------------------- */
 .recon-config { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.5rem 0 1.25rem; }
-.recon-config .tag.window { background: #ddf4ff; border-color: #b6e3ff; color: #0a3069; }
-.recon-config .tag.floor { background: var(--bg); color: var(--muted); }
-.recon-config .tag.floor.inert { background: var(--warn-bg); border-color: #eddf8f; color: var(--warn); font-weight: 400; }
+.recon-config .tag.window { background: var(--proposed-tint); border-color: var(--proposed-line); color: var(--proposed-2); }
+.recon-config .tag.floor { background: var(--panel-2); border-color: var(--line); color: var(--muted); }
+.recon-config .tag.floor.inert { background: var(--flagged-tint); border-color: var(--flagged-line); color: var(--flagged-2); font-weight: 500; text-transform: none; }
 
 #reconcile-queue { display: grid; gap: 1rem; }
-.recon-item { padding: 1rem 1.15rem; background: var(--card); border: 1px solid var(--line); border-left: 4px solid var(--line); border-radius: 10px; }
+.recon-item { padding: 1rem 1.15rem; background: var(--panel); border: 1px solid var(--line-2); border-left: 4px solid var(--line); border-radius: var(--r-md); box-shadow: var(--e1); }
 .recon-item.to-confirm { border-left-color: var(--accent); }
-.recon-item.gap.amount_mismatch { border-left-color: var(--err); }
-.recon-item.gap.unmatched_in_ledger, .recon-item.gap.unmatched_on_statement { border-left-color: var(--warn); }
+.recon-item.gap.amount_mismatch { border-left-color: var(--danger); }
+.recon-item.gap.unmatched_in_ledger, .recon-item.gap.unmatched_on_statement { border-left-color: var(--flagged); }
 
 .sides { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
-.side { padding: 0.6rem 0.75rem; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem; }
-.side .side-label { flex-basis: 100%; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
-.side .date { color: var(--muted); font-variant-numeric: tabular-nums; }
-.side .vendor, .side .ref { font-weight: 700; }
-.side .amount { margin-left: auto; font-weight: 700; font-variant-numeric: tabular-nums; }
-.side .desc { flex-basis: 100%; margin: 0.1rem 0 0; color: var(--muted); font-size: 0.9rem; }
+.side { padding: 0.6rem 0.75rem; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r-md); display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem; }
+.side .side-label { flex-basis: 100%; font: 700 var(--t-xs)/1 var(--mono); text-transform: uppercase; letter-spacing: 0.08em; color: var(--faint); }
+.side .date { color: var(--muted); font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.side .vendor, .side .ref { font-weight: 700; color: var(--ink); }
+.side .amount { margin-left: auto; font-weight: 700; font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--ink); }
+.side .desc { flex-basis: 100%; margin: 0.1rem 0 0; color: var(--muted); font-size: var(--t-sm); }
 
 .recon-item .trail { margin: 0.75rem 0 0.25rem; align-items: baseline; }
-.tag.similarity { background: #fff; color: var(--muted); }
-.similarity-note { color: var(--muted); font-size: 0.82rem; }
+.tag.similarity { background: var(--panel-2); border-color: var(--line); color: var(--muted); }
+.similarity-note { color: var(--muted); font-size: var(--t-sm); }
 .gap-head { margin-bottom: 0.6rem; }
-.tag.kind { background: var(--warn-bg); border-color: #eddf8f; color: var(--warn); }
-.recon-item.gap.amount_mismatch .tag.kind { background: var(--err-bg); border-color: #ffc1bc; color: var(--err); }
-.recon-item .delta { margin: 0.6rem 0 0; font-weight: 600; font-variant-numeric: tabular-nums; }
-.recon-item .disclaimer { margin: 0.6rem 0 0; color: var(--muted); font-size: 0.85rem; font-style: italic; }
-.recon-item .actions label { display: grid; gap: 0.25rem; font-size: 0.85rem; color: var(--muted); }
+.tag.kind { background: var(--flagged-tint); border-color: var(--flagged-line); color: var(--flagged-2); }
+.recon-item.gap.amount_mismatch .tag.kind { background: var(--danger-tint); border-color: var(--danger-line); color: var(--danger-2); }
+.recon-item .delta { margin: 0.6rem 0 0; font-weight: 600; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.recon-item .disclaimer { margin: 0.6rem 0 0; color: var(--muted); font-size: var(--t-sm); font-style: italic; }
+.recon-item .actions label { display: grid; gap: 0.25rem; font-size: var(--t-sm); color: var(--muted); }
+/* Reject / not-the-same-charge — white fill, amber text, amber line. */
+form.reject button[type="submit"], button.reject {
+  background: var(--panel); color: var(--flagged); border-color: var(--flagged-line);
+}
+form.reject button[type="submit"]:hover, button.reject:hover { background: var(--flagged-tint); }
 
-.matched-trail { margin-top: 1.5rem; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 0.5rem 1rem; }
-.matched-trail summary { cursor: pointer; font-weight: 600; padding: 0.4rem 0; }
+.matched-trail { margin-top: 1.5rem; background: var(--panel); border: 1px solid var(--line-2); border-radius: var(--r-md); padding: 0.5rem 1rem; box-shadow: var(--e1); }
+.matched-trail summary { cursor: pointer; font-weight: 600; padding: 0.4rem 0; color: var(--ink-2); }
 table.matched { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
 table.matched th, table.matched td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--line); }
-table.matched th { font-size: 0.82rem; color: var(--muted); }
-table.matched .amount { text-align: right; font-variant-numeric: tabular-nums; }
+table.matched th { font: 700 var(--t-xs) var(--mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--faint); }
+table.matched .amount { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
 
 .resolved-trail { margin-top: 1.5rem; }
-.resolved-trail h2 { font-size: 1.1rem; }
+.resolved-trail h2 { font-size: var(--t-lg); }
 .resolved-trail ul { list-style: none; padding: 0; display: grid; gap: 0.4rem; }
-.resolved-trail li { padding: 0.5rem 0.75rem; background: var(--card); border: 1px solid var(--line); border-radius: 8px; }
+.resolved-trail li { padding: 0.5rem 0.75rem; background: var(--panel); border: 1px solid var(--line-2); border-radius: var(--r-md); }
 .resolved-trail .note { color: var(--muted); }
-.resolved-trail .ts { color: var(--muted); font-size: 0.8rem; font-variant-numeric: tabular-nums; margin-left: 0.4rem; }
-.tag.status-confirmed { background: var(--ok-bg); border-color: #aceebb; color: var(--ok); }
-.tag.status-rejected { background: var(--err-bg); border-color: #ffc1bc; color: var(--err); }
-.tag.status-gap_acknowledged { background: var(--bg); color: var(--muted); }
+.resolved-trail .ts { color: var(--muted); font-family: var(--mono); font-size: var(--t-xs); font-variant-numeric: tabular-nums; margin-left: 0.4rem; }
+.tag.status-confirmed { background: var(--confirmed-tint); border-color: var(--confirmed-line); color: var(--confirmed-2); }
+.tag.status-rejected { background: var(--danger-tint); border-color: var(--danger-line); color: var(--danger-2); }
+.tag.status-gap_acknowledged { background: var(--panel-2); border-color: var(--line); color: var(--muted); }
 
 /* --- Closed-period banner --------------------------------------------- */
 .closed-banner {
   margin: 0 0 1.25rem;
   padding: 0.85rem 1.15rem;
-  background: var(--ok-bg);
-  border: 1px solid #aceebb;
-  border-left: 4px solid var(--ok);
-  border-radius: 10px;
+  background: var(--confirmed-tint);
+  border: 1px solid var(--confirmed-line);
+  border-left: 4px solid var(--confirmed);
+  border-radius: var(--r-md);
   color: var(--ink);
 }
-.closed-banner strong { color: var(--ok); }
+.closed-banner strong { color: var(--confirmed-2); }
 
 /* --- Close-review screen ---------------------------------------------- */
 #close-screen section { margin: 1.75rem 0; }
-#close-screen h2 { font-size: 1.2rem; margin: 0 0 0.5rem; }
-#close-screen h3 { font-size: 1rem; margin: 1rem 0 0.4rem; }
+#close-screen h2 { font-size: var(--t-xl); margin: 0 0 0.5rem; color: var(--ink); }
+#close-screen h3 { font-size: var(--t-lg); margin: 1rem 0 0.4rem; color: var(--ink); }
 
 .framework-checklist, .app-gates { list-style: none; padding: 0; display: grid; gap: 0.6rem; }
 .framework-checklist .check, .app-gates .gate {
   padding: 0.6rem 0.85rem;
-  background: var(--card);
-  border: 1px solid var(--line);
+  background: var(--panel);
+  border: 1px solid var(--line-2);
   border-left: 4px solid var(--line);
-  border-radius: 9px;
+  border-radius: var(--r-md);
 }
-.check.met, .gate.met { border-left-color: var(--ok); }
-.check.unmet, .gate.unmet { border-left-color: var(--err); }
-.check .mark, .gate .mark { font-weight: 600; margin-left: 0.5rem; }
-.check.met .mark, .gate.met .mark { color: var(--ok); }
-.check.unmet .mark, .gate.unmet .mark { color: var(--err); }
+.check.met, .gate.met { border-left-color: var(--confirmed); }
+.check.unmet, .gate.unmet { border-left-color: var(--danger); }
+.check .mark, .gate .mark { font-weight: 700; margin-left: 0.5rem; }
+.check.met .mark, .gate.met .mark { color: var(--confirmed-2); }
+.check.unmet .mark, .gate.unmet .mark { color: var(--danger-2); }
 .check .reason { margin: 0.35rem 0 0; }
-.tag.check-name, .tag.gate-name { background: #ddf4ff; border-color: #b6e3ff; color: #0a3069; }
-.tag.status-ready { background: var(--ok-bg); border-color: #aceebb; color: var(--ok); }
-.tag.status-blocked { background: var(--err-bg); border-color: #ffc1bc; color: var(--err); }
+.tag.check-name, .tag.gate-name { background: var(--accent-tint); border-color: var(--accent-line); color: var(--accent-2); text-transform: none; }
+.tag.status-ready { background: var(--confirmed-tint); border-color: var(--confirmed-line); color: var(--confirmed-2); }
+.tag.status-blocked { background: var(--danger-tint); border-color: var(--danger-line); color: var(--danger-2); }
 
-.blockers .blocker { padding: 0.5rem 0.75rem; background: var(--card); border: 1px solid var(--line); border-radius: 8px; }
-.blockers .item { display: block; margin-top: 0.25rem; color: var(--muted); font-size: 0.9rem; }
-.app-gates .gate .detail { color: var(--muted); margin-left: 0.5rem; font-size: 0.9rem; }
+.blockers .blocker { padding: 0.5rem 0.75rem; background: var(--panel); border: 1px solid var(--line-2); border-radius: var(--r-md); }
+.blockers .item { display: block; margin-top: 0.25rem; color: var(--muted); font-size: var(--t-sm); }
+.app-gates .gate .detail { color: var(--muted); margin-left: 0.5rem; font-size: var(--t-sm); }
 
-.app-policy { padding: 1rem 1.15rem; background: var(--bg); border: 1px dashed var(--line); border-radius: 10px; }
+.app-policy { padding: 1rem 1.15rem; background: var(--panel-2); border: 1px dashed var(--line-2); border-radius: var(--r-md); }
 
-.anomaly-card.open { border-left-color: var(--warn); }
-.anomaly-card.acknowledged { border-left-color: var(--ok); }
+.anomaly-card.open { border-left-color: var(--flagged); }
+.anomaly-card.acknowledged { border-left-color: var(--confirmed); }
 .anomaly-head { display: flex; gap: 0.4rem; margin-bottom: 0.4rem; }
-.tag.status-acknowledged { background: var(--ok-bg); border-color: #aceebb; color: var(--ok); }
+.tag.status-acknowledged { background: var(--confirmed-tint); border-color: var(--confirmed-line); color: var(--confirmed-2); }
 .anomaly-card .implicated { list-style: none; padding: 0; margin: 0.5rem 0; display: grid; gap: 0.3rem; }
 .anomaly-card .implicated li { display: flex; gap: 0.6rem; align-items: baseline; }
-.anomaly-card .implicated .amount { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 700; }
+.anomaly-card .implicated .amount { margin-left: auto; font-family: var(--mono); font-variant-numeric: tabular-nums; font-weight: 700; }
 .anomaly-card .ack-trail { color: var(--muted); margin: 0.5rem 0 0; }
-.anomaly-card .acknowledge label, .waive label, .sign-form label { display: grid; gap: 0.25rem; font-size: 0.85rem; color: var(--muted); margin: 0.5rem 0; }
+.anomaly-card .acknowledge label, .waive label, .sign-form label { display: grid; gap: 0.25rem; font-size: var(--t-sm); color: var(--muted); margin: 0.5rem 0; }
 
 #reconciliation-gate { margin-top: 0.6rem; }
 #reconciliation-gate .waive { margin-top: 0.5rem; }
 
-.close-signed .signed-head strong { color: var(--ok); }
+.close-signed .signed-head strong { color: var(--confirmed-2); }
 .close-signed .signed-section { margin: 1.5rem 0; }
 .sign-form { display: grid; gap: 0.5rem; max-width: 420px; }
 .sign-form .sign-hint { color: var(--muted); }
-.sign-button:disabled { background: var(--muted); border-color: var(--muted); cursor: not-allowed; filter: none; }
-.prior-note { color: var(--muted); font-size: 0.9rem; }
-.empty-state.inert { background: var(--warn-bg); border-color: #eddf8f; color: var(--warn); }
+.sign-button:disabled { background: var(--muted); border-color: var(--muted); color: var(--panel); cursor: not-allowed; }
+.sign-button:disabled:hover { background: var(--muted); }
+.prior-note { color: var(--muted); font-size: var(--t-sm); }
+.empty-state.inert { background: var(--flagged-tint); border-color: var(--flagged-line); color: var(--flagged-2); }
 .sign-refusal ul { margin: 0.4rem 0 0; }
 
 /* --- Package preview (Slice 4 · C) ------------------------------------ */
 .package-status { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.6rem; }
 .package-status p { margin: 0.35rem 0; }
-.tag.status-proposed { background: var(--ok-bg); border-color: #aceebb; color: var(--ok); }
-.package-blocked .unmet-close { font-weight: 600; color: var(--err); }
+/* A package is PROPOSED, never auto-published — proposed reads in the ACCENT
+   treatment, not the confirmed green (proposed ≠ confirmed). This wins over the
+   banner's .result.ok green via the equal-specificity compound below. */
+.result.package-proposed, .package-status.package-proposed { background: var(--proposed-tint); border-color: var(--proposed-line); }
+.tag.status-proposed { background: var(--proposed-tint); border-color: var(--proposed-line); color: var(--proposed-2); }
+.package-blocked .unmet-close { font-weight: 600; color: var(--danger-2); }
 
-.basis { font-variant-numeric: tabular-nums; }
+.basis { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 
-.divergence-banner { background: var(--warn-bg); border: 1px solid #eddf8f; color: var(--warn); }
+.divergence-banner { background: var(--flagged-tint); border: 1px solid var(--flagged-line); color: var(--ink-2); }
 
 .package-entries, .package-tax, .package-reconciliation, .package-export, .package-summary { margin: 1.75rem 0; }
-.package-entries h2, .package-tax h2, .package-reconciliation h2, .package-export h2, .package-summary h2 { font-size: 1.2rem; margin: 0 0 0.5rem; }
+.package-entries h2, .package-tax h2, .package-reconciliation h2, .package-export h2, .package-summary h2 { font-size: var(--t-xl); margin: 0 0 0.5rem; color: var(--ink); }
 table.package-trail { display: block; overflow-x: auto; }
 table.package-trail .confidence-suppressed { color: var(--muted); }
-.tag.source-human { background: var(--ok-bg); border-color: #aceebb; color: var(--ok); }
-tr.diverges { background: var(--warn-bg); }
-.tag.diverges-badge { background: var(--warn-bg); border-color: #eddf8f; color: var(--warn); margin-left: 0.4rem; }
+.tag.source-human { background: var(--confirmed-tint); border-color: var(--confirmed-line); color: var(--confirmed-2); }
+tr.diverges { background: var(--flagged-tint); }
+.tag.diverges-badge { background: var(--flagged-tint); border-color: var(--flagged-line); color: var(--flagged-2); margin-left: 0.4rem; }
 
 .export-form { display: grid; gap: 0.6rem; max-width: 460px; }
-.export-form .ack-label { display: flex; align-items: baseline; gap: 0.4rem; font-size: 0.9rem; color: var(--muted); }
+.export-form .ack-label { display: flex; align-items: baseline; gap: 0.4rem; font-size: var(--t-sm); color: var(--muted); }
 .export-form .export-hint { color: var(--muted); }
 .export-form .ack:not(:checked) ~ .export-button { opacity: 0.55; }
 
 /* --- Ledger reconciliation fold --------------------------------------- */
 .reconcile-summary { color: var(--muted); margin: 0 0 1rem; }
-.recon-badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.8rem; border: 1px solid var(--line); background: var(--bg); color: var(--muted); }
-.recon-badge.recon-matched, .recon-badge.recon-confirmed { background: var(--ok-bg); border-color: #aceebb; color: var(--ok); }
-.recon-badge.recon-gap_open, .recon-badge.recon-to_confirm { background: var(--warn-bg); border-color: #eddf8f; color: var(--warn); }
-.recon-badge.recon-rejected { background: var(--err-bg); border-color: #ffc1bc; color: var(--err); }
+.recon-badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: var(--r-sm); font: 600 var(--t-xs) var(--mono); border: 1px solid var(--line-2); background: var(--panel-2); color: var(--muted); }
+.recon-badge.recon-matched, .recon-badge.recon-confirmed { background: var(--confirmed-tint); border-color: var(--confirmed-line); color: var(--confirmed-2); }
+.recon-badge.recon-gap_open, .recon-badge.recon-to_confirm { background: var(--flagged-tint); border-color: var(--flagged-line); color: var(--flagged-2); }
+.recon-badge.recon-rejected { background: var(--danger-tint); border-color: var(--danger-line); color: var(--danger-2); }
 
-/* --- Slice 5 · B: the extraction-review (intake) queue ---------------- */
-#intake-queue { display: grid; gap: 1rem; outline: none; }
+/* --- Slice 5 · B: the extraction-review (intake) receipt-hero queue ---- */
+#intake-queue { display: grid; gap: var(--s3); outline: none; }
 #intake-pending-count { font-weight: 700; color: var(--ink); outline: none; }
-.card.intake { border-left-color: var(--accent); }
+
+/* The receipt-hero card: a sealed instrument panel — a header strip, the two-pane
+   receipt|fields body, and a mono trust trail, in one bordered unit. State reads
+   from the strip pill + the border, not a left stripe (so .card.intake resets the
+   confirm-queue card's border-left). */
+.card.intake {
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-md);
+}
+.card.intake.flagged { border-color: var(--flagged-line); }
+
+/* Instrument header strip — card id · vendor · state pill · amount, aligned. */
+.card-strip {
+  display: flex; align-items: center; gap: 0.75rem;
+  padding: 0.55rem 1.1rem; border-bottom: 1px solid var(--line);
+  background: var(--panel-2);
+}
+.card-strip .card-id { font: 600 var(--t-xs) var(--mono); letter-spacing: 0.06em; color: var(--faint); }
+.card-strip .vendor-label { font-weight: 700; color: var(--ink); }
+.card-strip .amount-label { margin-left: auto; font: 700 var(--t-lg) var(--mono); font-variant-numeric: tabular-nums; color: var(--ink); }
+.state-pill {
+  font: 700 var(--t-xs)/1 var(--mono); letter-spacing: 0.1em; text-transform: uppercase;
+  padding: 0.28rem 0.6rem; border-radius: var(--r-sm); white-space: nowrap;
+  color: var(--proposed-2); background: var(--proposed-tint); border: 1px solid var(--proposed-line);
+}
+.card.intake.flagged .state-pill { color: var(--flagged-2); background: var(--flagged-tint); border-color: var(--flagged-line); }
+
 /* The receipt artifact ALONGSIDE the extracted fields — the human judges the
-   extraction against the source. Two columns on wide screens; stacked on narrow. */
-.intake-grid { display: grid; grid-template-columns: minmax(0, 260px) minmax(0, 1fr); gap: 1.25rem; align-items: start; }
-@media (max-width: 620px) { .intake-grid { grid-template-columns: 1fr; } }
-.intake-grid .artifact { display: grid; gap: 0.4rem; justify-items: start; }
-.intake-grid .artifact img { max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
-.intake-grid .artifact .open-full { font-size: 0.85rem; color: var(--accent); text-decoration: none; }
-.intake-grid .artifact .open-full:hover { text-decoration: underline; }
-.intake-grid .fields { display: grid; gap: 0.75rem; }
-.intake-confirm, .intake-reject { display: grid; gap: 0.6rem; }
-.intake-confirm label, .intake-reject label { display: grid; gap: 0.25rem; font-size: 0.85rem; color: var(--muted); }
-.intake-confirm input, .intake-confirm select, .intake-reject input { max-width: 100%; }
-.intake-confirm .reason.suggested { margin: 0.15rem 0; color: var(--muted); font-size: 0.9rem; }
-.intake-confirm .confirm { justify-self: start; }
-.intake-reject { margin-top: 0.5rem; padding-top: 0.75rem; border-top: 1px dashed var(--line); }
-.intake-reject .reject { justify-self: start; background: #fff; color: var(--err); border-color: #ffc1bc; }
-.trail.intake-trail { margin-top: 0.85rem; }
+   extraction against the source. Two seamless panes on wide screens; stacked on
+   narrow. */
+.intake-grid { display: grid; grid-template-columns: 248px minmax(0, 1fr); gap: 0; align-items: stretch; }
+@media (max-width: 720px) { .intake-grid { grid-template-columns: 1fr; } }
+.intake-grid .artifact { padding: var(--s3); border-right: 1px solid var(--line); background: var(--panel-2); display: grid; gap: 0.6rem; justify-items: center; align-content: start; }
+@media (max-width: 720px) { .intake-grid .artifact { border-right: none; border-bottom: 1px solid var(--line); } }
+.intake-grid .artifact img { max-width: 100%; height: auto; border: 1px solid var(--line-2); border-radius: var(--r-sm); background: #fff; }  /* #fff — receipt paper surface, not a palette hex */
+.artifact .open-full { font: 600 var(--t-xs) var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--accent); text-decoration: none; }
+.artifact .open-full:hover { text-decoration: underline; }
+.intake-grid .fields { padding: var(--s3) var(--s4); display: grid; gap: var(--s3); }
+.intake-confirm, .intake-reject { display: grid; gap: var(--s2); }
+.intake-confirm label, .intake-reject label { display: grid; gap: 0.3rem; font-size: var(--t-xs); font-weight: 700; letter-spacing: 0.02em; color: var(--muted); }
+/* the mono numeric row — amount · tax · date side by side (collapses on narrow). */
+.intake-confirm .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--s2); }
+@media (max-width: 520px) { .intake-confirm .grid3 { grid-template-columns: 1fr 1fr; } }
+.intake-confirm input, .intake-confirm select, .intake-reject input { max-width: 100%; font-weight: 400; }
+/* money / tax / date read mono tabular so figures align (the B trust cue). */
+.intake-confirm input[inputmode="decimal"], .intake-confirm input[name="date"] { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.intake-confirm .confirm { justify-self: start; padding: 0.55rem 1.5rem; }
+.intake-reject { margin-top: 0.2rem; padding-top: var(--s3); border-top: 1px dashed var(--line); }
+.intake-reject .reject { justify-self: start; }
+
+/* The tinted suggested-job block — reason line ABOVE Confirm, no confidence bar.
+   Honest-absence flips it to the flagged tone (no reason line rendered). */
+.suggest-block { display: grid; gap: var(--s2); padding: var(--s3); background: var(--accent-tint); border: 1px solid var(--accent-line); border-radius: var(--r-md); }
+.suggest-block.flagged { background: var(--flagged-tint); border-color: var(--flagged-line); }
+.suggest-block .cap-suggest { font: 700 var(--t-xs)/1 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--accent-2); }
+.suggest-block.flagged .cap-suggest { color: var(--flagged-2); }
+.suggest-block label { font-weight: 400; color: var(--ink-2); }
+.reason.suggested { margin: 0; font-size: var(--t-sm); color: var(--ink-2); }
+/* Graft 1 — C's warmer plain-language state line under the suggest block; the B
+   header pill stays the fast-scan triage element. A small state dot, then the
+   language. Honest-absence keeps its own copy + the flagged dot. */
+.state-language { display: flex; align-items: center; gap: 0.45rem; margin: 0; font-size: var(--t-sm); color: var(--muted); }
+.state-language .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--proposed); flex: none; }
+.suggest-block.flagged .state-language .dot { background: var(--flagged); }
+
+/* the quiet trust trail — mono chips, hairline-separated, on the inset strip. */
+.trail.intake-trail { display: flex; flex-wrap: wrap; gap: 0; margin: 0; padding: 0.55rem 1.1rem; border-top: 1px solid var(--line); background: var(--panel-2); }
+.trail.intake-trail .tag { border: none; background: none; padding: 0.1rem 0.85rem; font: 500 var(--t-xs) var(--mono); color: var(--muted); text-transform: none; letter-spacing: 0; }
+.trail.intake-trail .tag + .tag { border-left: 1px solid var(--line); }
 
 /* --- Slice 5 · B+: the capture-home landing --------------------------- */
-/* Zone A — the capture pulse. One honest line: the call-to-action count + the
-   day's stored tally. The muted secondary uses --muted on --bg (~4.7:1, WCAG AA)
-   so "quiet" stays legible. */
+/* Zone A — the capture pulse. Restyled in place (the spans keep their ids/classes
+   for the OOB refresh + the honest-counts assertions): a bordered instrument
+   readout, big mono numeral for the to-review count, mono tally for filed-today.
+   Honest counts-only rule unchanged — no %, no bar, no roll-up. */
 .capture-pulse {
-  display: flex;
+  display: inline-flex;
   flex-wrap: wrap;
   align-items: baseline;
-  gap: 0.6rem;
-  margin: 0 0 1.25rem;
-  font-size: 1.05rem;
+  gap: 0.4rem 0.75rem;
+  margin: 0 0 var(--s4);
+  padding: 0.7rem 1.15rem;
+  background: var(--panel);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-md);
+  font-size: var(--t-base);
 }
-.capture-pulse .pulse-count { font-size: 1.6rem; font-weight: 700; color: var(--accent); }
-.capture-pulse .pulse-primary { font-weight: 600; }
-.capture-pulse .pulse-sep { color: var(--muted); }
-.capture-pulse .pulse-secondary { color: var(--muted); }
-.capture-pulse .pulse-filed { font-weight: 700; color: var(--ink); }
+.capture-pulse .pulse-primary { display: inline-flex; align-items: baseline; gap: 0.4rem; font-weight: 600; color: var(--ink-2); }
+.capture-pulse .pulse-count { font: 700 var(--t-2xl)/1 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; color: var(--accent); }
+.capture-pulse .pulse-sep { color: var(--line-2); }
+.capture-pulse .pulse-secondary { display: inline-flex; align-items: baseline; gap: 0.4rem; color: var(--muted); }
+.capture-pulse .pulse-filed { font: 700 var(--t-lg)/1 var(--mono); font-variant-numeric: tabular-nums; color: var(--ink-2); }
 
 /* The hero queue heading. The pending counter is the aria-live focus target the
    post-swap hook moves focus to (AC 21). */
-.queue-heading { font-size: 1.05rem; font-weight: 600; color: var(--ink); margin: 0 0 1rem; }
-.queue-heading #intake-pending-count { font-weight: 700; color: var(--accent); outline: none; }
+.queue-heading { font-size: var(--t-lg); font-weight: 600; color: var(--ink); margin: 0 0 var(--s3); }
+.queue-heading #intake-pending-count { font-family: var(--mono); font-weight: 700; color: var(--accent); outline: none; }
 
-/* The win state (H3) — a win, not a blank. */
+/* The win state (H3) — the confirmed treatment: a win, not a blank. */
 .win-state {
-  padding: 1.5rem 1.6rem;
-  background: var(--ok-bg);
-  border: 1px solid #aceebb;
-  border-radius: 12px;
+  margin-top: var(--s3);
+  padding: var(--s4);
+  background: var(--panel);
+  border: 1px solid var(--confirmed-line);
+  border-radius: var(--r-md);
   text-align: center;
 }
-.win-state h2 { margin: 0 0 0.4rem; font-size: 1.3rem; color: var(--ok); }
-.win-state .win-tally { margin: 0 0 1rem; color: var(--ink); }
+.win-state .eyebrow { color: var(--confirmed-2); }
+.win-state h2 { margin: 0.35rem 0 0.3rem; font-size: var(--t-xl); color: var(--confirmed-2); }
+.win-state .win-tally { margin: 0 0 1rem; color: var(--muted); font-family: var(--mono); }
 
 /* --- A3: the offline drop-scan affordance ------------------------------- */
 /* A quieter, secondary control — subordinate to the primary capture/categorize
-   actions. Shown while reviewing (under the queue) and in the win state (gated on
-   the drop-dir feature being wired). */
+   actions. Shown while reviewing (under the queue) and in the win state. */
 .scan-drop-form { margin-top: 1.25rem; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.6rem; }
 .win-state .scan-drop-form { justify-content: center; margin-top: 0.5rem; }
 .scan-drop-button {
   display: inline-block;
   padding: 0.45rem 0.9rem;
-  border-radius: 7px;
+  border-radius: var(--r-md);
   background: transparent;
   border: 1px solid var(--accent);
   color: var(--accent);
@@ -359,23 +682,74 @@ tr.diverges { background: var(--warn-bg); }
   font-weight: 600;
   cursor: pointer;
 }
-.scan-drop-form .scan-hint { color: var(--muted); font-size: 0.85rem; }
-.scan-errors-label { margin: 0.75rem 0 0.35rem; font-size: 0.9rem; color: var(--muted); }
-.scan-errors { margin: 0; padding-left: 1.2rem; font-size: 0.9rem; }
+.scan-drop-button:hover { background: var(--accent-tint); }
+.scan-drop-form .scan-hint { color: var(--muted); font-size: var(--t-sm); }
+.scan-errors-label { margin: 0.75rem 0 0.35rem; font-size: var(--t-sm); color: var(--muted); }
+.scan-errors { margin: 0; padding-left: 1.2rem; font-size: var(--t-sm); }
 .scan-errors li { margin: 0.15rem 0; }
 
-/* The subordinate downstream rail — flat + discoverable, visibly quieter than the
-   review queue it sits below. */
+/* The subordinate downstream rail — flat mono links, a --line-2 top rule, and a
+   mono rail-label eyebrow: discoverable but visibly quieter than the review queue. */
 .downstream-rail {
   display: flex;
   flex-wrap: wrap;
-  align-items: baseline;
-  gap: 1rem;
-  margin-top: 2rem;
-  padding-top: 1rem;
-  border-top: 1px solid var(--line);
-  font-size: 0.92rem;
+  align-items: center;
+  gap: 0.3rem;
+  margin-top: var(--s5);
+  padding-top: var(--s2);
+  border-top: 1px solid var(--line-2);
+  font-size: var(--t-sm);
 }
-.downstream-rail .rail-label { color: var(--muted); font-weight: 600; }
-.downstream-rail a { color: var(--accent); text-decoration: none; }
-.downstream-rail a:hover { text-decoration: underline; }
+.downstream-rail .rail-label { font: 700 var(--t-xs) var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); padding-right: 0.7rem; }
+.downstream-rail a { color: var(--muted); text-decoration: none; padding: 0 0.7rem; }
+.downstream-rail a + a { border-left: 1px solid var(--line); }
+.downstream-rail a:hover { color: var(--accent); }
+
+/* Graft 2 — C's full-width privacy panel, ownership-reconciled copy. Visual
+   treatment owned here (DS-2); the copy string is coordinated with backup #88 (the
+   global sweep) and must match. Retires B's terse "nothing leaves this machine". */
+.privacy-panel {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  margin-top: var(--s4);
+  padding: var(--s3) var(--s4);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  color: var(--muted);
+  font-size: var(--t-sm);
+  line-height: var(--lh);
+}
+.privacy-panel svg { flex: none; color: var(--accent); }
+.privacy-panel strong { color: var(--ink-2); font-weight: 600; }
+
+/* --- Print: legible on paper, every column shown --------------------- */
+/* The dark ramps are scoped to @media screen, so print always renders the light
+   :root tokens (dark-ink-on-white). Here we release the horizontal scroll on the
+   wide package/reconciliation trails so no column clips at the page edge, flatten
+   elevation, and hide the interactive chrome that is meaningless on paper. The
+   on-screen overflow-x scroll containers are untouched. */
+@media print {
+  body { background: #fff; }
+
+  /* interactive / navigational chrome — nothing to do with on paper */
+  nav, .downstream-rail, .scan-drop-form, .backup-banner,
+  button, .button, .scan-drop-button { display: none !important; }
+
+  /* flatten elevation — shadows only muddy toner */
+  .card, .recon-item, .import-form, .matched-trail, .win-state,
+  table.ledger, table.matched,
+  .framework-checklist .check, .app-gates .gate { box-shadow: none !important; }
+
+  /* the wide package/reconciliation trail: print every column, no clip. On
+     screen it is a display:block overflow-x:auto scroller; on paper it lays out
+     as a full-width table and long cells wrap so nothing runs off the page. */
+  table.package-trail {
+    display: table; width: 100%; overflow-x: visible !important; font-size: var(--t-xs);
+  }
+  table.package-trail th, table.package-trail td { word-break: break-word; }
+
+  /* don't split a row, card, check, or gate across a page break */
+  tr, .card, .recon-item, .check, .gate, .anomaly-card, .blocker { break-inside: avoid; }
+}

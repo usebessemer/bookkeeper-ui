@@ -2,6 +2,7 @@
    `nav_period` carries the current period across the nav links; it falls back to
    the import form's default so the links work from the import screen too. #}
 {% set nav_period = period | default(default_period | default("2026-Q2")) %}
+{% from "_backup_chip.html" import backup_chip %}
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -17,8 +18,8 @@
      The Receipts link is period-agnostic (`href="/"`, no `?period=`) — the intake
      queue is all-periods; every OTHER link keeps threading `nav_period` (the Package
      link in particular is asserted with its `?period=`). #}
-  <nav>
-    <span class="brand">Bookkeeper</span>
+  <nav aria-label="Primary">
+    <span class="brand"><span class="glyph" aria-hidden="true">B</span>Bookkeeper</span>
     <a href="/">Receipts</a>
     <a href="/ui/import-files?period={{ nav_period }}">Import files</a>
     <a href="/ui/queue?period={{ nav_period }}">Confirm queue</a>
@@ -27,6 +28,12 @@
     <a href="/ui/close?period={{ nav_period }}">Close review</a>
     <a href="/ui/package?period={{ nav_period }}">Package</a>
     <a href="/ui/exports?period={{ nav_period }}">Exports</a>
+    {# The spacer pushes the trailing status-chip to the right. #87 fills the slot
+       with the live 3-state safe-signal chip off `backup` (a BackupSignalOut every
+       full-page handler injects); a render that omits it defaults to the LOUD state
+       (born-safe — see the macro). The retired local-first chip is NOT re-added. #}
+    <span class="nav-spacer"></span>
+    {{ backup_chip(backup | default(none)) }}
   </nav>
   <main>
     {% block content %}{% endblock %}
